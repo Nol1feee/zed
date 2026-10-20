@@ -26,6 +26,9 @@ response, so callers must reconcile the token.
 `write-reconcile-crash` applies before returning an error and exits on every reconcile.
 `prepare-pending` holds preparation until FILE.release exists and remains
 responsive to cancellation and shutdown while waiting.
+`discard-pending` records its disk effect, then waits for FILE.release before replying.
+`persistent-write-unknown` persists synthetic state across fixture restarts and
+rejects reconcile until FILE.reconcile exists.
 """
 import argparse
 import json
@@ -45,9 +48,11 @@ SCENARIOS = ("normal", "reply-eof", "crash", "error", "pending", "malformed",
              "changing-slow-content", "pending-refresh",
              "writable", "write-error", "write-invalid-result", "write-unknown", "write-reconcile-crash", "prepare-pending",
              "v2-read-only", "v2-no-file-operations", "v2-stage-only",
-             "v2-contradictory", "v1-writable", "invalid-token")
+             "v2-contradictory", "v1-writable", "invalid-token",
+             "discard-pending", "persistent-write-unknown")
 WRITABLE_SCENARIOS = {"writable", "write-error", "write-invalid-result", "write-unknown", "write-reconcile-crash",
-                      "prepare-pending", "v2-stage-only", "invalid-token"}
+                      "prepare-pending", "v2-stage-only", "invalid-token",
+                      "discard-pending", "persistent-write-unknown"}
 SEND_LOCK = threading.Lock()
 
 
@@ -125,19 +130,29 @@ def main():
     file_states = {}
     operations = {}
     apply_count = 0
+    saved_operations = Path(str(args.events) + ".operations.json") if args.events else None
+    if args.scenario == "persistent-write-unknown" and saved_operations and saved_operations.is_file():
+        saved = json.loads(saved_operations.read_text())
+        file_states, operations, apply_count = saved["files"], saved["operations"], saved["count"]
+
+    def persist_operations():
+        if args.scenario == "persistent-write-unknown" and saved_operations:
+            temporary = saved_operations.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"files": file_states, "operations": operations, "count": apply_count}))
+            temporary.replace(saved_operations)
 
     def file_state(path):
         marker = Path(str(args.events) + ".state") if args.events else None
         revision = marker.read_text() if marker and marker.is_file() else ""
-        generation, staged = file_states.get(path, (0, False))
-        return revision, generation, staged
+        index, disk = file_states.get(path, ("head", "working"))
+        return [revision, index, disk]
 
-    def release_preparation(identifier, token):
+    def release_reply(identifier, result, event):
         marker = Path(str(args.events) + ".release") if args.events else None
         while marker is None or not marker.is_file():
             time.sleep(0.01)
-        record("prepare-released", id=identifier)
-        reply(identifier, {"operationToken": token})
+        record(event, id=identifier)
+        reply(identifier, result)
 
     while (message := read_message()) is not None:
         method, identifier = message.get("method"), message.get("id")
@@ -168,7 +183,7 @@ def main():
             version, capabilities = 1, {"readOnly": True}
             if args.scenario in WRITABLE_SCENARIOS or args.scenario.startswith("v2-"):
                 version = 2
-                capabilities = {"readOnly": False, "fileOperations": ["stage", "unstage"]}
+                capabilities = {"readOnly": False, "fileOperations": ["stage", "unstage", "discard"]}
                 if args.scenario == "v2-read-only":
                     capabilities = {"readOnly": True}
                 elif args.scenario == "v2-no-file-operations":
@@ -254,7 +269,7 @@ def main():
                 continue
             path, operation = params.get("path"), params.get("operation")
             if (params.get("repositoryId") != "fixture-repository" or not isinstance(path, str)
-                    or not path or operation not in ("stage", "unstage")
+                    or not path or operation not in ("stage", "unstage", "discard")
                     or args.scenario == "v2-stage-only" and operation != "stage"):
                 reply(identifier, error={"code": -32602, "message": "Invalid file operation"})
                 continue
@@ -264,8 +279,8 @@ def main():
                                      "before": file_state(path), "after": None}
                 if args.scenario == "prepare-pending":
                     record("prepare-held", id=identifier, path=path)
-                    threading.Thread(target=release_preparation,
-                                     args=(identifier, token), daemon=True).start()
+                    threading.Thread(target=release_reply,
+                                     args=(identifier, {"operationToken": token}, "prepare-released"), daemon=True).start()
                 else:
                     reply(identifier, {"operationToken": "" if args.scenario == "invalid-token" else token})
                 continue
@@ -274,7 +289,7 @@ def main():
             if method == "vcs/reconcileFileOperation" and args.scenario == "write-reconcile-crash":
                 record("reconcile-crashed", id=identifier)
                 return 23
-            if method == "vcs/reconcileFileOperation" and args.scenario == "write-unknown":
+            if method == "vcs/reconcileFileOperation" and args.scenario in ("write-unknown", "persistent-write-unknown"):
                 marker = Path(str(args.events) + ".reconcile") if args.events else None
                 if marker is None or not marker.is_file():
                     reply(identifier, error={"code": -32046, "message": "Reconciliation unavailable",
@@ -290,12 +305,24 @@ def main():
             elif method == "vcs/reconcileFileOperation":
                 outcome = "notApplied"
             else:
-                file_states[path] = (state[1] + 1, operation == "stage")
+                if operation == "stage":
+                    file_states[path] = (state[2], state[2])
+                elif operation == "unstage":
+                    file_states[path] = ("head", state[2])
+                else:
+                    file_states[path] = (state[1], state[1])
                 prepared["after"] = file_state(path)
                 apply_count += 1
+                persist_operations()
                 record("file-operation-applied", path=path, operation=operation,
-                       count=apply_count, staged=operation == "stage")
-                if args.scenario in ("write-error", "write-unknown", "write-reconcile-crash"):
+                       count=apply_count, staged=file_states[path][0] != "head",
+                       disk=file_states[path][1])
+                if args.scenario == "discard-pending" and operation == "discard":
+                    record("apply-held", id=identifier, path=path)
+                    threading.Thread(target=release_reply,
+                                     args=(identifier, {"outcome": "applied"}, "apply-released"), daemon=True).start()
+                    continue
+                if args.scenario in ("write-error", "write-unknown", "write-reconcile-crash", "persistent-write-unknown"):
                     reply(identifier, error={"code": -32045, "message": "Apply acknowledgement lost",
                                              "data": {"kind": "outcomeUnknown"}})
                     continue

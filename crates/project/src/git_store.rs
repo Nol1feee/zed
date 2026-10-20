@@ -2152,17 +2152,55 @@ impl GitStore {
         Some(repo.read(cx).status_for_path(&repo_path)?.status)
     }
 
-    pub fn checkpoint(&self, cx: &mut App) -> Task<Result<GitStoreCheckpoint>> {
-        let mut work_directory_abs_paths = Vec::new();
-        let mut checkpoints = Vec::new();
-        for repository in self.repositories.values() {
-            repository.update(cx, |repository, _| {
-                work_directory_abs_paths.push(repository.snapshot.work_directory_abs_path.clone());
-                checkpoints.push(repository.checkpoint().map(|checkpoint| checkpoint?));
-            });
-        }
+    fn check_git_destructive_operation(&self, path: Arc<Path>, cx: &App) -> Task<Result<()>> {
+        self.project
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .and_then(|project| project.read(cx).vcs_store().cloned())
+            .map(|store| store.read(cx).check_git_destructive_operation(path, cx))
+            .unwrap_or_else(|| Task::ready(Ok(())))
+    }
 
+    fn check_checkpoint_support(&self, cx: &App) -> Task<Result<()>> {
+        let paths = self
+            .worktree_store
+            .read(cx)
+            .worktrees()
+            .map(|worktree| worktree.read(cx).abs_path())
+            .chain(
+                self.repositories
+                    .values()
+                    .map(|repository| repository.read(cx).snapshot.work_directory_abs_path.clone()),
+            )
+            .collect::<HashSet<_>>();
+        let checks = paths
+            .into_iter()
+            .map(|path| self.check_git_destructive_operation(path, cx))
+            .collect::<Vec<_>>();
         cx.background_executor().spawn(async move {
+            for check in checks {
+                check
+                    .await
+                    .context("Git checkpoints are unavailable for this external VCS project")?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn checkpoint(&self, cx: &mut App) -> Task<Result<GitStoreCheckpoint>> {
+        let guard = self.check_checkpoint_support(cx);
+        let repositories = self.repositories.values().cloned().collect::<Vec<_>>();
+        cx.spawn(async move |cx| {
+            guard.await?;
+            let mut work_directory_abs_paths = Vec::new();
+            let mut checkpoints = Vec::new();
+            for repository in repositories {
+                repository.update(cx, |repository, _| {
+                    work_directory_abs_paths
+                        .push(repository.snapshot.work_directory_abs_path.clone());
+                    checkpoints.push(repository.checkpoint().map(|checkpoint| checkpoint?));
+                });
+            }
             let checkpoints = future::try_join_all(checkpoints).await?;
             Ok(GitStoreCheckpoint {
                 checkpoints_by_work_dir_abs_path: work_directory_abs_paths
@@ -2178,22 +2216,29 @@ impl GitStore {
         checkpoint: GitStoreCheckpoint,
         cx: &mut App,
     ) -> Task<Result<()>> {
+        let guard = self.check_checkpoint_support(cx);
         let repositories_by_work_dir_abs_path = self
             .repositories
             .values()
-            .map(|repo| (repo.read(cx).snapshot.work_directory_abs_path.clone(), repo))
+            .map(|repo| {
+                (
+                    repo.read(cx).snapshot.work_directory_abs_path.clone(),
+                    repo.clone(),
+                )
+            })
             .collect::<HashMap<_, _>>();
-
-        let mut tasks = Vec::new();
-        for (work_dir_abs_path, checkpoint) in checkpoint.checkpoints_by_work_dir_abs_path {
-            if let Some(repository) = repositories_by_work_dir_abs_path.get(&work_dir_abs_path) {
-                let restore = repository.update(cx, |repository, _| {
-                    repository.restore_checkpoint(checkpoint)
-                });
-                tasks.push(async move { restore.await? });
+        cx.spawn(async move |cx| {
+            guard.await?;
+            let mut tasks = Vec::new();
+            for (work_dir_abs_path, checkpoint) in checkpoint.checkpoints_by_work_dir_abs_path {
+                if let Some(repository) = repositories_by_work_dir_abs_path.get(&work_dir_abs_path)
+                {
+                    let restore = repository.update(cx, |repository, _| {
+                        repository.restore_checkpoint(checkpoint)
+                    });
+                    tasks.push(async move { restore.await? });
+                }
             }
-        }
-        cx.background_spawn(async move {
             future::try_join_all(tasks).await?;
             Ok(())
         })
@@ -9575,8 +9620,23 @@ impl Repository {
         )
     }
 
+    pub fn check_worktree_operation(&self, path: PathBuf, cx: &App) -> Task<Result<()>> {
+        let Some(store) = self.git_store.upgrade() else {
+            return Task::ready(Err(anyhow!("Git repository owner was released")));
+        };
+        let store = store.read(cx);
+        let source =
+            store.check_git_destructive_operation(self.work_directory_abs_path.clone(), cx);
+        let target = store.check_git_destructive_operation(path.into(), cx);
+        cx.background_executor().spawn(async move {
+            source.await?;
+            target.await
+        })
+    }
+
     pub fn remove_worktree(&mut self, path: PathBuf, force: bool) -> oneshot::Receiver<Result<()>> {
         let id = self.id;
+        let git_store = self.git_store.clone();
         let repository_anchor_path: Arc<Path> = self.linked_worktree_anchor_path().into();
         self.send_job(
             "remove_worktree",
@@ -9584,25 +9644,21 @@ impl Repository {
             move |repo, cx| async move {
                 match repo {
                     RepositoryState::Local(LocalRepositoryState { backend, fs, .. }) => {
-                        // When forcing, delete the worktree directory ourselves before
-                        // invoking git. `git worktree remove` can remove the admin
-                        // metadata in `.git/worktrees/<name>` but fail to delete the
-                        // working directory (it continues past directory-removal errors),
-                        // leaving an orphaned folder on disk. Deleting first guarantees
-                        // the directory is gone, and `git worktree remove --force`
-                        // tolerates a missing working tree while cleaning up the admin
-                        // entry. We keep this inside the `Local` arm so that for remote
-                        // projects the deletion runs on the remote machine (where the
-                        // `GitRemoveWorktree` RPC is handled against the local repo on
-                        // the headless server) using its own filesystem.
-                        //
-                        // After a successful removal, also delete any empty ancestor
-                        // directories between the worktree path and the configured
-                        // base directory used when creating linked worktrees.
-                        //
-                        // Non-force removals are left untouched before git runs:
-                        // `git worktree remove` must see the dirty working tree to
-                        // refuse the operation.
+                        let guard = cx.update(|cx| {
+                            let store = git_store
+                                .upgrade()
+                                .context("Git repository owner was released")?;
+                            Ok::<_, anyhow::Error>(
+                                store
+                                    .read(cx)
+                                    .check_git_destructive_operation(path.clone().into(), cx),
+                            )
+                        })?;
+                        guard.await?;
+                        backend.remove_worktree(path.clone(), force).await?;
+
+                        // Only clean up a remaining directory after the backend has
+                        // accepted removal. A refusal must leave checkout data intact.
                         if force {
                             fs.remove_dir(
                                 &path,
@@ -9616,8 +9672,6 @@ impl Repository {
                                 format!("failed to delete worktree directory '{}'", path.display())
                             })?;
                         }
-
-                        backend.remove_worktree(path.clone(), force).await?;
 
                         let managed_worktree_base = cx.update(|cx| {
                             let setting = &ProjectSettings::get_global(cx).git.worktree_directory;
@@ -11498,6 +11552,40 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    #[gpui::test]
+    async fn force_remove_preserves_directory_when_backend_rejects_target(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/repo", json!({".git": {}})).await;
+        fs.insert_tree("/external-checkout", json!({"uncommitted.txt": "keep me"}))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new("/repo")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .repositories(cx)
+                .values()
+                .next()
+                .expect("Git repository")
+                .clone()
+        });
+        let result = repository
+            .update(cx, |repository, _| {
+                repository.remove_worktree(PathBuf::from("/external-checkout"), true)
+            })
+            .await
+            .expect("removal response");
+        assert!(result.is_err());
+        assert_eq!(
+            fs.load(Path::new("/external-checkout/uncommitted.txt"))
+                .await
+                .unwrap(),
+            "keep me"
+        );
     }
 
     type TestPasswordPrompt = (

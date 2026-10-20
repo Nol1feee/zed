@@ -527,7 +527,7 @@ pub async fn await_and_rollback_on_failure(
         PathBuf,
         futures::channel::oneshot::Receiver<anyhow::Result<()>>,
     )>,
-    fs: Arc<dyn Fs>,
+    _fs: Arc<dyn Fs>,
     cx: &mut AsyncWindowContext,
 ) -> anyhow::Result<Vec<PathBuf>> {
     let mut created_paths: Vec<PathBuf> = Vec::new();
@@ -602,20 +602,12 @@ pub async fn await_and_rollback_on_failure(
         }
 
         if git_remove_failed {
-            if let Err(fs_err) = fs
-                .remove_dir(
-                    &path,
-                    fs::RemoveOptions {
-                        recursive: true,
-                        ignore_if_not_exists: true,
-                    },
-                )
-                .await
-            {
-                let msg = format!("{}: failed to remove directory: {fs_err}", path.display());
-                log::error!("{}", msg);
-                rollback_failures.push(msg);
-            }
+            // The failed backend operation may have rejected ownership or left
+            // an unknown outcome; direct deletion would bypass that decision.
+            rollback_failures.push(format!(
+                "{}: backend cleanup failed; checkout preserved for reconciliation",
+                path.display()
+            ));
         }
     }
     let mut error_message = format!("Failed to create worktree: {err}");
@@ -1438,6 +1430,54 @@ mod tests {
             WorkspaceSettings::register(cx);
             TaskStore::init(None);
         });
+    }
+
+    #[gpui::test]
+    async fn failed_create_rollback_preserves_unowned_directory(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/repo", json!({".git": {}})).await;
+        fs.insert_tree("/external-checkout", json!({"uncommitted.txt": "keep me"}))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new("/repo")], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .repositories(cx)
+                .values()
+                .next()
+                .expect("Git repository")
+                .clone()
+        });
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        sender
+            .send(Err(anyhow!("creation rejected")))
+            .expect("creation receiver");
+        let rollback_fs = fs.clone();
+        let result = multi_workspace
+            .update_in(cx, |_, window, cx| {
+                cx.spawn_in(window, async move |_, mut cx| {
+                    await_and_rollback_on_failure(
+                        vec![(repository, PathBuf::from("/external-checkout"), receiver)],
+                        rollback_fs,
+                        &mut cx,
+                    )
+                    .await
+                })
+            })
+            .await;
+        let error = result.expect_err("failed creation");
+        assert!(error.to_string().contains("preserved for reconciliation"));
+        assert_eq!(
+            fs.load(Path::new("/external-checkout/uncommitted.txt"))
+                .await
+                .unwrap(),
+            "keep me"
+        );
     }
 
     fn install_counting_provider_and_worktree_hook(

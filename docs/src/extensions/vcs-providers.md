@@ -10,7 +10,7 @@ and comparison contents to Zed's native source-control UI. Git keeps its existin
 backend. A provider does not emulate Git or create `.git` metadata.
 
 The API is local. Protocol 1 is read-only; protocol 2 can explicitly enable
-selected-file staging and unstaging. Restore, commit, branch changes, checkout
+selected-file staging, unstaging, and discarding unstaged changes. Commit, branch changes, checkout
 creation/removal, agent archive, and remote transport are not provided.
 Read-only capabilities constrain Zed's calls; they are not an operating-system
 sandbox for the provider executable. Zed requires workspace trust before invoking
@@ -83,7 +83,7 @@ Protocol 1 cannot advertise file operations. A protocol 2 provider opts in with:
   "serverInfo": { "name": "Example", "version": "2" },
   "capabilities": {
     "readOnly": false,
-    "fileOperations": ["stage", "unstage"]
+    "fileOperations": ["stage", "unstage", "discard"]
   }
 }
 ```
@@ -94,11 +94,15 @@ file operations; contradictory capabilities are rejected.
 
 ### Selected-file operations
 
-The Source Control panel shows Stage File and Unstage File for the selected
+The Source Control panel shows Stage File, Unstage File, and Discard Unstaged for the selected
 ordinary file. Unsupported actions are disabled. Zed checks workspace trust,
 provider ownership, and open buffers before preparation and again before applying
 the operation. Save or revert unsaved edits and resolve disk conflicts first.
 File operations do not enable hunk actions in the editor.
+Discard restores the working file to its staged version and preserves staged
+changes. Zed prepares the operation before asking for confirmation, so a file
+changed while the confirmation is open cannot be discarded using newer,
+unreviewed state.
 
 | Method                       | Parameters                          | Result             |
 | ---------------------------- | ----------------------------------- | ------------------ |
@@ -106,7 +110,7 @@ File operations do not enable hunk actions in the editor.
 | `vcs/applyFileOperation`     | Same fields plus `operationToken`   | `{outcome}`        |
 | `vcs/reconcileFileOperation` | Same fields plus `operationToken`   | `{outcome}`        |
 
-`operation` is `stage` or `unstage`. Preparation is read-only. The provider
+`operation` is `stage`, `unstage`, or `discard`. Preparation is read-only. The provider
 returns an opaque, nonempty token of at most 4 KiB that binds the repository,
 scope, exact file, operation, expected state and desired result. The provider must
 check the expected state again before writing, serialize conflicting operations
@@ -127,8 +131,10 @@ Timeout, cancellation, process exit and malformed replies do not establish that
 an operation failed to write. Zed reconciles the same token after an apply error.
 If reconciliation also fails, further writes are blocked for that repository
 until Refresh resolves the outcome. Closing the initiating panel does not cancel
-its in-flight reconciliation. Recovery across a full Zed process crash is not
-implemented by this experimental host yet.
+its in-flight reconciliation. Before applying an operation, Zed persists its token
+in the current user profile. An unresolved operation remains blocked across
+provider reconnects, folder reopening, and Zed restarts until reconciliation
+establishes its outcome.
 
 ### Repositories and scopes
 

@@ -12,6 +12,7 @@ use gpui::{
     Task, WeakEntity,
 };
 use language::{Buffer, BufferEvent};
+use serde::{Deserialize, Serialize};
 use settings::WorktreeId;
 use util::{ResultExt, rel_path::RelPath};
 use vcs::{
@@ -25,6 +26,10 @@ use crate::{
     trusted_worktrees::TrustedWorktrees,
     worktree_store::{WorktreeStore, WorktreeStoreEvent},
 };
+
+#[path = "vcs_operation_journal.rs"]
+mod operation_journal;
+use operation_journal::OperationJournal;
 
 #[derive(Clone)]
 struct Registration {
@@ -138,20 +143,29 @@ struct Session {
     notification_task: Option<Task<()>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 struct PendingFileOperation {
     path: String,
     operation: FileOperation,
     token: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 struct FileOperationScope {
     extension_id: Arc<str>,
     provider_id: Arc<str>,
     repository_id: String,
     root_uri: String,
     scope_uri: String,
+}
+
+pub struct VcsPreparedFileOperation {
+    key: VcsRepositoryId,
+    scope: FileOperationScope,
+    path: String,
+    operation: FileOperation,
+    token: String,
+    connection: Arc<ProviderConnection>,
 }
 
 struct DiffState {
@@ -207,6 +221,7 @@ pub struct VcsStore {
     poll_task: Option<Task<()>>,
     errors: HashMap<SessionKey, SharedString>,
     file_operation_running: bool,
+    operation_journal: Arc<OperationJournal>,
     pending_file_operations: HashMap<FileOperationScope, PendingFileOperation>,
     file_operation_errors: HashMap<VcsRepositoryId, SharedString>,
     _subscriptions: Vec<Subscription>,
@@ -265,6 +280,7 @@ impl VcsStore {
         if let Some(trust) = TrustedWorktrees::try_get_global(cx) {
             subscriptions.push(cx.subscribe(&trust, |this, _, _, cx| this.schedule_discovery(cx)));
         }
+        let operation_journal = OperationJournal::global(fs.clone(), cx);
         let mut store = Self {
             project,
             worktrees,
@@ -280,6 +296,7 @@ impl VcsStore {
             poll_task: None,
             errors: HashMap::default(),
             file_operation_running: false,
+            operation_journal,
             pending_file_operations: HashMap::default(),
             file_operation_errors: HashMap::default(),
             _subscriptions: subscriptions,
@@ -400,7 +417,11 @@ impl VcsStore {
         let fs = self.fs.clone();
         let environment = self.environment.clone();
         let task_key = key.clone();
+        let operation_journal = self.operation_journal.clone();
         let task = cx.spawn(async move |this, cx| {
+            if let Err(error) = operation_journal.load().await {
+                log::warn!("VCS recovery journal is unavailable: {error:#}");
+            }
             let result: Result<Option<(Arc<ProviderConnection>, Vec<RepositoryDescriptor>)>> =
                 async {
                     let markers = registration
@@ -985,8 +1006,11 @@ impl VcsStore {
     }
 
     pub fn file_operation_unresolved(&self, key: &VcsRepositoryId) -> bool {
-        self.file_operation_scope(key)
-            .is_some_and(|scope| self.pending_file_operations.contains_key(&scope))
+        self.file_operation_scope(key).is_some_and(|scope| {
+            self.operation_journal
+                .pending(&scope)
+                .map_or(true, |pending| pending.is_some())
+        })
     }
 
     pub fn file_operation_error(&self, key: &VcsRepositoryId) -> Option<SharedString> {
@@ -1073,21 +1097,17 @@ impl VcsStore {
         Ok((repository.connection.clone(), root))
     }
 
-    pub fn run_file_operation(
+    pub fn prepare_file_operation(
         &mut self,
         key: VcsRepositoryId,
         path: String,
         operation: FileOperation,
         cx: &mut Context<Self>,
-    ) -> Task<Result<()>> {
+    ) -> Task<Result<VcsPreparedFileOperation>> {
         let result = (|| {
             ensure!(
                 !self.file_operation_running,
                 "Another VCS file operation is running"
-            );
-            ensure!(
-                !self.file_operation_unresolved(&key),
-                "The previous operation has an unknown outcome; refresh to reconcile it"
             );
             let (connection, root) = self.check_file_operation(&key, &path, operation, cx)?;
             let scope = self
@@ -1099,41 +1119,107 @@ impl VcsStore {
             Ok(result) => result,
             Err(error) => return Task::ready(Err(error)),
         };
-        self.file_operation_running = true;
-        self.file_operation_errors.remove(&key);
-        self.notify(cx);
         let fs = self.fs.clone();
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        // Keep reconciliation alive if the initiating panel or its waiter closes.
+        let journal = self.operation_journal.clone();
         cx.spawn(async move |this, cx| {
-            let mut settled = true;
+            journal.load().await?;
+            ensure!(
+                journal.pending(&scope)?.is_none(),
+                "The previous operation has an unknown outcome; refresh to reconcile it"
+            );
+            let metadata = scoped_metadata(&root, &path, &fs)
+                .await?
+                .context("The selected file no longer exists")?;
+            ensure!(
+                !metadata.is_dir && !metadata.is_symlink,
+                "File operations require an ordinary file"
+            );
+            let prepared = connection
+                .prepare_file_operation(key.repository_id.clone(), path.clone(), operation)
+                .await?;
+            this.update(cx, |this, cx| {
+                let (current, _) = this.check_file_operation(&key, &path, operation, cx)?;
+                ensure!(
+                    Arc::ptr_eq(&current, &connection),
+                    "VCS provider changed while preparing the operation"
+                );
+                anyhow::Ok(())
+            })??;
+            Ok(VcsPreparedFileOperation {
+                key,
+                scope,
+                path,
+                operation,
+                token: prepared.operation_token,
+                connection,
+            })
+        })
+    }
+
+    pub fn apply_prepared_file_operation(
+        &mut self,
+        prepared: VcsPreparedFileOperation,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let result = self
+            .check_prepared_file_operation(&prepared, cx)
+            .and_then(|()| {
+                ensure!(
+                    !self.file_operation_running,
+                    "Another VCS file operation is running"
+                );
+                ensure!(
+                    !self.file_operation_unresolved(&prepared.key),
+                    "The previous operation has an unknown outcome; refresh to reconcile it"
+                );
+                Ok(())
+            });
+        if let Err(error) = result {
+            return Task::ready(Err(error));
+        }
+        self.file_operation_running = true;
+        self.file_operation_errors.remove(&prepared.key);
+        self.notify(cx);
+        let journal = self.operation_journal.clone();
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        // Persist before dispatch; the detached operation retains its recovery owner
+        // when the confirming panel or its waiter closes.
+        cx.spawn(async move |this, cx| {
+            let pending = PendingFileOperation {
+                path: prepared.path.clone(),
+                operation: prepared.operation,
+                token: prepared.token.clone(),
+            };
             let result: Result<()> = async {
-                let metadata = scoped_metadata(&root, &path, &fs).await?
-                    .context("The selected file no longer exists")?;
-                ensure!(!metadata.is_dir && !metadata.is_symlink, "File operations require an ordinary file");
-                let prepared = connection.prepare_file_operation(
-                    key.repository_id.clone(), path.clone(), operation,
-                ).await?;
-                this.update(cx, |this, cx| {
-                    let (current, _) = this.check_file_operation(&key, &path, operation, cx)?;
-                    ensure!(Arc::ptr_eq(&current, &connection), "VCS provider changed while preparing the operation");
-                    this.pending_file_operations.insert(scope.clone(), PendingFileOperation {
-                        path: path.clone(), operation, token: prepared.operation_token.clone(),
-                    });
-                    anyhow::Ok(())
-                })??;
-                settled = false;
-                let outcome = match connection.apply_file_operation(
-                    key.repository_id.clone(), path.clone(), operation, prepared.operation_token.clone(),
+                journal.record(prepared.scope.clone(), pending.clone()).await?;
+                let checked = this.update(cx, |this, cx| {
+                    this.pending_file_operations.insert(prepared.scope.clone(), pending.clone());
+                    this.check_prepared_file_operation(&prepared, cx)
+                }).and_then(|result| result);
+                if let Err(error) = checked {
+                    journal.clear(&prepared.scope, &prepared.token).await?;
+                    return Err(error);
+                }
+                let outcome = match prepared.connection.apply_file_operation(
+                    prepared.key.repository_id.clone(), prepared.path.clone(),
+                    prepared.operation, prepared.token.clone(),
                 ).await {
                     Ok(result) => result.outcome,
-                    Err(error) => connection.reconcile_file_operation(
-                        key.repository_id.clone(), path.clone(), operation, prepared.operation_token,
+                    Err(error) => prepared.connection.reconcile_file_operation(
+                        prepared.key.repository_id.clone(), prepared.path.clone(),
+                        prepared.operation, prepared.token.clone(),
                     ).await.with_context(|| format!(
                         "File operation outcome is unknown ({error:#}); refresh to reconcile before retrying"
                     ))?.outcome,
                 };
-                settled = true;
+                journal.clear(&prepared.scope, &prepared.token).await.context(
+                    "File operation completed, but its recovery record could not be cleared; refresh to reconcile",
+                )?;
+                if outcome == FileOperationOutcome::Applied && prepared.operation == FileOperation::Discard {
+                    this.update(cx, |this, cx| {
+                        this.check_discarded_buffer(&prepared.key, &prepared.path, cx)
+                    })??;
+                }
                 match outcome {
                     FileOperationOutcome::Applied => Ok(()),
                     FileOperationOutcome::NotApplied => bail!("The file operation was not applied"),
@@ -1142,14 +1228,14 @@ impl VcsStore {
             }.await;
             this.update(cx, |this, cx| {
                 this.file_operation_running = false;
-                if settled {
-                    this.pending_file_operations.remove(&scope);
+                if journal.pending(&prepared.scope).is_ok_and(|pending| pending.is_none()) {
+                    this.pending_file_operations.remove(&prepared.scope);
                 }
                 if let Err(error) = &result {
-                    this.file_operation_errors.insert(key.clone(), format!("{error:#}").into());
+                    this.file_operation_errors.insert(prepared.key.clone(), format!("{error:#}").into());
                 }
-                if connection.is_alive() {
-                    this.refresh_with_reason(&key, RefreshReason::Explicit, cx);
+                if prepared.connection.is_alive() {
+                    this.refresh_with_reason(&prepared.key, RefreshReason::Explicit, cx);
                 }
                 this.notify(cx);
             }).log_err();
@@ -1164,6 +1250,84 @@ impl VcsStore {
         })
     }
 
+    fn check_prepared_file_operation(
+        &mut self,
+        prepared: &VcsPreparedFileOperation,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let (connection, _) =
+            self.check_file_operation(&prepared.key, &prepared.path, prepared.operation, cx)?;
+        ensure!(
+            Arc::ptr_eq(&connection, &prepared.connection)
+                && self.file_operation_scope(&prepared.key).as_ref() == Some(&prepared.scope),
+            "VCS provider or scope changed after preparing the operation"
+        );
+        Ok(())
+    }
+
+    fn check_discarded_buffer(&self, key: &VcsRepositoryId, path: &str, cx: &App) -> Result<()> {
+        let Some(project) = self.project.upgrade() else {
+            return Ok(());
+        };
+        let project_path = ProjectPath {
+            worktree_id: key.worktree_id,
+            path: Arc::from(RelPath::from_unix_str(path)?),
+        };
+        for buffer in project.read(cx).buffer_store().read(cx).buffers() {
+            let buffer = buffer.read(cx);
+            if buffer.project_path(cx).as_ref() == Some(&project_path) {
+                ensure!(
+                    !buffer.is_dirty() && !buffer.has_conflict(),
+                    "Discard was applied on disk; edits made in the buffer during the operation were preserved. Review them before saving."
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn run_file_operation(
+        &mut self,
+        key: VcsRepositoryId,
+        path: String,
+        operation: FileOperation,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if self.file_operation_running {
+            return Task::ready(Err(anyhow!("Another VCS file operation is running")));
+        }
+        let prepare = self.prepare_file_operation(key.clone(), path, operation, cx);
+        self.file_operation_running = true;
+        self.notify(cx);
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        cx.spawn(async move |this, cx| {
+            let prepared = prepare.await;
+            let result = match this.update(cx, |this, cx| {
+                this.file_operation_running = false;
+                match prepared {
+                    Ok(prepared) => this.apply_prepared_file_operation(prepared, cx),
+                    Err(error) => {
+                        this.file_operation_errors
+                            .insert(key, format!("{error:#}").into());
+                        this.notify(cx);
+                        Task::ready(Err(error))
+                    }
+                }
+            }) {
+                Ok(task) => task.await,
+                Err(error) => Err(error),
+            };
+            if sender.send(result).is_err() {
+                log::debug!("VCS file operation waiter closed");
+            }
+        })
+        .detach();
+        cx.spawn(async move |_, _| {
+            receiver
+                .await
+                .context("VCS file operation was interrupted")?
+        })
+    }
+
     fn reconcile_file_operation(&mut self, key: &VcsRepositoryId, cx: &mut Context<Self>) {
         if self.file_operation_running {
             return;
@@ -1171,9 +1335,17 @@ impl VcsStore {
         let Some(scope) = self.file_operation_scope(key) else {
             return;
         };
-        let Some(pending) = self.pending_file_operations.get(&scope).cloned() else {
-            return;
+        let pending = match self.operation_journal.pending(&scope) {
+            Ok(Some(pending)) => pending,
+            Ok(None) => return,
+            Err(error) => {
+                self.file_operation_errors
+                    .insert(key.clone(), format!("{error:#}").into());
+                return;
+            }
         };
+        self.pending_file_operations
+            .insert(scope.clone(), pending.clone());
         let Some(repository) = self.repositories.get(key) else {
             return;
         };
@@ -1182,20 +1354,30 @@ impl VcsStore {
             return;
         }
         let key = key.clone();
+        let journal = self.operation_journal.clone();
         self.file_operation_running = true;
         self.notify(cx);
         cx.spawn(async move |this, cx| {
-            let result = connection.reconcile_file_operation(
-                key.repository_id.clone(), pending.path, pending.operation, pending.token,
-            ).await;
+            let result: Result<FileOperationOutcome> = async {
+                let result = connection.reconcile_file_operation(
+                    key.repository_id.clone(), pending.path.clone(), pending.operation, pending.token.clone(),
+                ).await?;
+                journal.clear(&scope, &pending.token).await?;
+                Ok(result.outcome)
+            }.await;
             this.update(cx, |this, cx| {
                 this.file_operation_running = false;
                 match result {
-                    Ok(result) => {
+                    Ok(outcome) => {
                         this.pending_file_operations.remove(&scope);
-                        match result.outcome {
+                        match outcome {
                             FileOperationOutcome::Applied => {
                                 this.file_operation_errors.remove(&key);
+                                if pending.operation == FileOperation::Discard
+                                    && let Err(error) = this.check_discarded_buffer(&key, &pending.path, cx)
+                                {
+                                    this.file_operation_errors.insert(key.clone(), format!("{error:#}").into());
+                                }
                             }
                             FileOperationOutcome::NotApplied => {
                                 this.file_operation_errors.insert(key.clone(),
@@ -1277,6 +1459,19 @@ impl VcsStore {
     }
 
     pub fn check_git_initialization(&self, path: Arc<Path>, cx: &App) -> Task<Result<()>> {
+        self.check_git_operation(path, false, cx)
+    }
+
+    pub fn check_git_destructive_operation(&self, path: Arc<Path>, cx: &App) -> Task<Result<()>> {
+        self.check_git_operation(path, true, cx)
+    }
+
+    fn check_git_operation(
+        &self,
+        path: Arc<Path>,
+        external_markers_first: bool,
+        cx: &App,
+    ) -> Task<Result<()>> {
         let markers: Vec<Vec<String>> = GlobalRegistry::global(cx)
             .0
             .read(cx)
@@ -1297,14 +1492,18 @@ impl VcsStore {
         let fs = self.fs.clone();
         cx.background_executor().spawn(async move {
             for ancestor in path.ancestors() {
-                if fs.metadata(&ancestor.join(".git")).await?.is_some() { return Ok(()); }
+                if !external_markers_first && fs.metadata(&ancestor.join(".git")).await?.is_some() { return Ok(()); }
                 for provider_markers in &markers {
                     for marker in provider_markers {
                         ensure!(!marker.is_empty() && marker != "." && marker != ".." && !marker.contains(['/', '\\', '\0']), "invalid VCS repository marker");
                         if fs.metadata(&ancestor.join(marker)).await?.is_some() {
-                            bail!("The folder has an external VCS repository marker; Git initialization is unavailable");
+                            let operation = if external_markers_first { "mutation" } else { "initialization" };
+                            bail!("The folder has an external VCS repository marker; Git {operation} is unavailable");
                         }
                     }
+                }
+                if external_markers_first && fs.metadata(&ancestor.join(".git")).await?.is_some() {
+                    return Ok(());
                 }
             }
             Ok(())

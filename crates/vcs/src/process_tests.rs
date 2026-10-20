@@ -497,7 +497,11 @@ async fn file_operations_are_denied_before_dispatch_without_the_capability(
             initialized.protocol_version,
             if scenario == "normal" { 1 } else { 2 }
         );
-        for operation in [FileOperation::Stage, FileOperation::Unstage] {
+        for operation in [
+            FileOperation::Stage,
+            FileOperation::Unstage,
+            FileOperation::Discard,
+        ] {
             if scenario == "v2-stage-only" && operation == FileOperation::Stage {
                 continue;
             }

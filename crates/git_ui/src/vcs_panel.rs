@@ -8,8 +8,8 @@ use anyhow::Result;
 use editor::{Editor, EditorSettings, SplittableEditor};
 use gpui::{
     Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyBinding, ScrollStrategy, Subscription, UniformListScrollHandle, WeakEntity, Window, actions,
-    uniform_list,
+    KeyBinding, PromptLevel, ScrollStrategy, Subscription, UniformListScrollHandle, WeakEntity,
+    Window, actions, uniform_list,
 };
 use language::{Buffer, Capability};
 use multi_buffer::MultiBuffer;
@@ -40,6 +40,8 @@ actions!(
         StageFile,
         /// Unstages the selected file through its external version-control provider.
         UnstageFile,
+        /// Discards the selected file's unstaged changes while preserving staged changes.
+        DiscardFile,
     ]
 );
 
@@ -184,6 +186,7 @@ pub struct VcsPanel {
     selected: Option<usize>,
     scroll_handle: UniformListScrollHandle,
     error: Option<SharedString>,
+    preparing_operation: bool,
     opened: HashMap<(VcsRepositoryId, String), WeakEntity<SplittableEditor>>,
     _subscription: Option<Subscription>,
 }
@@ -220,6 +223,7 @@ impl VcsPanel {
             selected: None,
             scroll_handle: UniformListScrollHandle::new(),
             error: None,
+            preparing_operation: false,
             opened: HashMap::new(),
             _subscription: subscription,
         };
@@ -314,6 +318,74 @@ impl VcsPanel {
         self.run_file_operation(FileOperation::Unstage, cx);
     }
 
+    fn discard_file(&mut self, _: &DiscardFile, window: &mut Window, cx: &mut Context<Self>) {
+        if self.preparing_operation {
+            return;
+        }
+        let Some(row) = self.selected_file().cloned() else {
+            return;
+        };
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let Some(repository) = self
+            .repositories
+            .iter()
+            .find(|repository| repository.key == row.repository)
+        else {
+            return;
+        };
+        let detail = format!(
+            "Project: {}\nScope: {}\nThe working file will be restored to its staged version. Staged changes will be preserved.",
+            repository.descriptor.display_name, repository.descriptor.scope_uri,
+        );
+        self.error = None;
+        self.preparing_operation = true;
+        let preparation = store.update(cx, |store, cx| {
+            store.prepare_file_operation(
+                row.repository,
+                row.path.clone(),
+                FileOperation::Discard,
+                cx,
+            )
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result: Result<()> = async {
+                let prepared = preparation.await?;
+                let answer = this
+                    .update_in(cx, |_, window, cx| {
+                        window.prompt(
+                            PromptLevel::Warning,
+                            &format!("Discard unstaged changes to {}?", row.path),
+                            Some(&detail),
+                            &["Discard Unstaged Changes", "Cancel"],
+                            cx,
+                        )
+                    })?
+                    .await?;
+                if answer == 0 {
+                    store
+                        .update(cx, |store, cx| {
+                            store.apply_prepared_file_operation(prepared, cx)
+                        })
+                        .await?;
+                }
+                Ok(())
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                this.preparing_operation = false;
+                if let Err(error) = result {
+                    this.error = Some(format!("{error:#}").into());
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn selected_file(&self) -> Option<&Row> {
         self.rows.get(self.selected?).filter(|row| {
             row.change
@@ -323,6 +395,9 @@ impl VcsPanel {
     }
 
     fn run_file_operation(&mut self, operation: FileOperation, cx: &mut Context<Self>) {
+        if self.preparing_operation {
+            return;
+        }
         let Some(row) = self.selected_file().cloned() else {
             return;
         };
@@ -546,10 +621,11 @@ impl Render for VcsPanel {
             .as_ref()
             .map(|store| store.read(cx).errors())
             .unwrap_or_default();
-        let operation_running = self
-            .store
-            .as_ref()
-            .is_some_and(|store| store.read(cx).file_operation_running());
+        let operation_running = self.preparing_operation
+            || self
+                .store
+                .as_ref()
+                .is_some_and(|store| store.read(cx).file_operation_running());
         let file_actions = self.selected_file().map(|row| {
             let unresolved = self
                 .store
@@ -589,6 +665,17 @@ impl Render for VcsPanel {
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.run_file_operation(FileOperation::Unstage, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("vcs-discard-file", "Discard Unstaged")
+                                .disabled(
+                                    operation_running
+                                        || unresolved
+                                        || !operations.contains(&FileOperation::Discard),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.discard_file(&DiscardFile, window, cx);
                                 })),
                         ),
                 )
@@ -685,6 +772,7 @@ impl Render for VcsPanel {
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::stage_file))
             .on_action(cx.listener(Self::unstage_file))
+            .on_action(cx.listener(Self::discard_file))
             .child(
                 h_flex()
                     .p_2()

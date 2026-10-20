@@ -1574,3 +1574,531 @@ async fn slow_background_refresh_reveals_progress_and_preserves_failures(cx: &mu
     });
     fixture.store.update(cx, |store, cx| store.stop_all(cx));
 }
+
+#[gpui::test]
+async fn new_store_restores_durable_unknown_operation_before_accepting_writes(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "durable-operation",
+        fixture.directory.path(),
+        "persistent-write-unknown",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| {
+                store.run_file_operation(
+                    repository.key.clone(),
+                    "src/example.txt".into(),
+                    FileOperation::Stage,
+                    cx,
+                )
+            })
+            .await
+            .is_err()
+    );
+    let journal_path = paths::data_dir().join("vcs/pending-file-operations.json");
+    let saved: serde_json::Value =
+        serde_json::from_str(&fixture.fs.load(&journal_path).await.unwrap()).unwrap();
+    assert_eq!(saved["operations"].as_array().unwrap().len(), 1);
+    stop(&fixture, cx).await;
+
+    let restored = fixture.store.update(cx, |store, cx| {
+        let (project, worktrees, git, environment, fs) = (
+            store.project.clone(),
+            store.worktrees.clone(),
+            store.git.clone(),
+            store.environment.clone(),
+            store.fs.clone(),
+        );
+        cx.new(|cx| {
+            let mut store = VcsStore::new(project, worktrees, git, environment, fs.clone(), cx);
+            store.operation_journal = Arc::new(OperationJournal::new(fs, journal_path.clone()));
+            store
+        })
+    });
+    cx.condition(&restored, |store, _| {
+        store
+            .repositories()
+            .first()
+            .is_some_and(|repository| repository.snapshot.is_some())
+            && !store.file_operation_running()
+    })
+    .await;
+    let restored_key = restored.read_with(cx, |store, _| store.repositories()[0].key.clone());
+    assert!(restored.read_with(cx, |store, _| {
+        store.file_operation_unresolved(&restored_key)
+    }));
+    let error = restored
+        .update(cx, |store, cx| {
+            store.run_file_operation(
+                restored_key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Unstage,
+                cx,
+            )
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown"));
+    let events_path = fixture.directory.path().join("durable-operation.jsonl");
+    std::fs::write(events_path.with_extension("jsonl.reconcile"), "ready").unwrap();
+    restored.update(cx, |store, cx| store.refresh_all(cx));
+    cx.condition(&restored, |store, _| {
+        !store.file_operation_running() && !store.file_operation_unresolved(&restored_key)
+    })
+    .await;
+    let saved: serde_json::Value =
+        serde_json::from_str(&fixture.fs.load(&journal_path).await.unwrap()).unwrap();
+    assert_eq!(saved["operations"], json!([]));
+    let events = std::fs::read_to_string(events_path).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"method\": \"vcs/applyFileOperation\""))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"event\": \"file-operation-applied\""))
+            .count(),
+        1
+    );
+    let connections: Vec<_> = restored.read_with(cx, |store, _| {
+        store
+            .sessions
+            .values()
+            .filter_map(|session| session.connection.clone())
+            .collect()
+    });
+    for connection in connections {
+        connection.shutdown().await.unwrap();
+    }
+    restored.update(cx, |store, cx| store.stop_all(cx));
+}
+
+#[gpui::test]
+async fn prepared_discard_rejects_changes_during_confirmation(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("confirmed-discard", fixture.directory.path(), "writable").register(cx);
+    let repository = ready(&fixture, cx).await;
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_file_operation(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Discard,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        !fixture
+            .store
+            .read_with(cx, |store, _| store.file_operation_running())
+    );
+    let events_path = fixture.directory.path().join("confirmed-discard.jsonl");
+    std::fs::write(
+        events_path.with_extension("jsonl.state"),
+        "changed during confirmation",
+    )
+    .unwrap();
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.apply_prepared_file_operation(prepared, cx)
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("changed"));
+
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_file_operation(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Discard,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    let buffer = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "new unsaved edit\n")], None, cx)
+    });
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.apply_prepared_file_operation(prepared, cx)
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unsaved"));
+    let events = std::fs::read_to_string(events_path).unwrap();
+    assert!(!events.contains("file-operation-applied"));
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"method\": \"vcs/applyFileOperation\""))
+            .count(),
+        1
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn discard_preserves_edits_made_after_dispatch(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("dirty-discard", fixture.directory.path(), "discard-pending")
+        .register(cx);
+    let repository = ready(&fixture, cx).await;
+    let buffer = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let task = fixture.store.update(cx, |store, cx| {
+        store.run_file_operation(
+            repository.key.clone(),
+            "src/example.txt".into(),
+            FileOperation::Discard,
+            cx,
+        )
+    });
+    let events_path = fixture.directory.path().join("dirty-discard.jsonl");
+    provider_event(events_path.clone(), "apply-held").await;
+    let journal_path = paths::data_dir().join("vcs/pending-file-operations.json");
+    let saved: serde_json::Value =
+        serde_json::from_str(&fixture.fs.load(&journal_path).await.unwrap()).unwrap();
+    assert_eq!(saved["operations"][0]["pending"]["operation"], "discard");
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "edit after dispatch\n")], None, cx)
+    });
+    let edited = buffer.read_with(cx, |buffer, _| buffer.text());
+    fixture
+        .fs
+        .insert_file(
+            fixture.directory.path().join("src/example.txt"),
+            b"restored index text\n".to_vec(),
+        )
+        .await;
+    std::fs::write(events_path.with_extension("jsonl.release"), "release").unwrap();
+    let error = task.await.unwrap_err();
+    assert!(error.to_string().contains("preserved"), "{error:#}");
+    assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), edited);
+    assert!(buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+    assert!(!fixture.store.read_with(cx, |store, _| {
+        store.file_operation_unresolved(&repository.key)
+    }));
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn discarded_clean_buffer_reloads_through_the_existing_file_watcher(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("clean-discard", fixture.directory.path(), "discard-pending")
+        .register(cx);
+    let repository = ready(&fixture, cx).await;
+    let buffer = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let task = fixture.store.update(cx, |store, cx| {
+        store.run_file_operation(
+            repository.key.clone(),
+            "src/example.txt".into(),
+            FileOperation::Discard,
+            cx,
+        )
+    });
+    let events_path = fixture.directory.path().join("clean-discard.jsonl");
+    provider_event(events_path.clone(), "apply-held").await;
+    fixture
+        .fs
+        .insert_file(
+            fixture.directory.path().join("src/example.txt"),
+            b"restored index text\n".to_vec(),
+        )
+        .await;
+    cx.condition(&buffer, |buffer, _| {
+        buffer.text() == "restored index text\n"
+    })
+    .await;
+    assert!(!buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+    std::fs::write(events_path.with_extension("jsonl.release"), "release").unwrap();
+    task.await.unwrap();
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn destructive_git_guard_checks_external_markers_before_same_directory_git(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    let git = fixture.store.read_with(cx, |store, _| store.git.clone());
+    let empty_checkpoint = git.update(cx, |git, cx| git.checkpoint(cx)).await.unwrap();
+    fixture
+        .fs
+        .insert_tree(
+            fixture.directory.path().join("nested"),
+            json!({".git": {}, "file.txt": "Git content"}),
+        )
+        .await;
+    FixtureExtension::new("destructive-guard", fixture.directory.path(), "normal").register(cx);
+    assert!(git.update(cx, |git, cx| git.checkpoint(cx)).await.is_err());
+    assert!(
+        git.update(cx, |git, cx| git.restore_checkpoint(empty_checkpoint, cx))
+            .await
+            .is_err()
+    );
+    fixture
+        .fs
+        .create_dir(&fixture.directory.path().join(".git"))
+        .await
+        .unwrap();
+    let same_directory = fixture.store.read_with(cx, |store, cx| {
+        store.check_git_destructive_operation(Arc::from(fixture.directory.path()), cx)
+    });
+    assert!(
+        same_directory
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("external VCS")
+    );
+    let nested = fixture.store.read_with(cx, |store, cx| {
+        store
+            .check_git_destructive_operation(Arc::from(fixture.directory.path().join("nested")), cx)
+    });
+    nested.await.expect("genuine nested Git remains allowed");
+    let initialization = fixture.store.read_with(cx, |store, cx| {
+        store.check_git_initialization(Arc::from(fixture.directory.path()), cx)
+    });
+    initialization
+        .await
+        .expect("initialization keeps its existing Git-first behavior");
+}
+
+#[gpui::test]
+async fn recovery_write_failure_prevents_apply_dispatch(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "journal-write-failure",
+        fixture.directory.path(),
+        "writable",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    let journal_path = paths::data_dir().join("vcs/pending-file-operations.json");
+    fixture.fs.create_dir(&journal_path).await.unwrap();
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_file_operation(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                cx,
+            )
+        })
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("journal"));
+    let events =
+        std::fs::read_to_string(fixture.directory.path().join("journal-write-failure.jsonl"))
+            .unwrap();
+    assert!(events.contains("vcs/prepareFileOperation"));
+    assert!(!events.contains("vcs/applyFileOperation"));
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn nested_external_marker_blocks_git_checkpoint_and_worktree_operations(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    fixture
+        .fs
+        .remove_file(
+            &fixture.directory.path().join(".fixture-vcs"),
+            fs::RemoveOptions::default(),
+        )
+        .await
+        .unwrap();
+    let git = fixture.store.read_with(cx, |store, _| store.git.clone());
+    let empty_checkpoint = git.update(cx, |git, cx| git.checkpoint(cx)).await.unwrap();
+    let nested_path = fixture.directory.path().join("nested");
+    let clean_path = fixture.directory.path().join("clean-git");
+    for path in [&nested_path, &clean_path] {
+        fixture
+            .fs
+            .insert_tree(
+                path,
+                json!({".git": {}, "file.txt": "original Git content\n"}),
+            )
+            .await;
+    }
+    let mut opened_buffers = Vec::new();
+    for path in [&nested_path, &clean_path] {
+        opened_buffers.push(
+            fixture
+                .project
+                .update(cx, |project, cx| {
+                    project.open_local_buffer(path.join("file.txt"), cx)
+                })
+                .await
+                .unwrap(),
+        );
+    }
+    fixture
+        .project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    assert_eq!(
+        fixture
+            .project
+            .read_with(cx, |project, cx| project.worktrees(cx).count()),
+        1
+    );
+    cx.condition(&git, |git, _| git.repositories().len() == 2)
+        .await;
+    FixtureExtension::new(
+        "nested-destructive-guard",
+        fixture.directory.path(),
+        "normal",
+    )
+    .register(cx);
+    let (nested_repository, clean_repository) = git.read_with(cx, |git, cx| {
+        let repository_for = |path: &Path| {
+            git.repositories()
+                .values()
+                .find(|repository| {
+                    repository
+                        .read(cx)
+                        .snapshot()
+                        .work_directory_abs_path
+                        .as_ref()
+                        == path
+                })
+                .unwrap()
+                .clone()
+        };
+        (repository_for(&nested_path), repository_for(&clean_path))
+    });
+    let genuine_checkpoint = git
+        .update(cx, |git, cx| git.checkpoint(cx))
+        .await
+        .expect("genuine nested Git supports checkpoints with a provider registered");
+    git.update(cx, |git, cx| {
+        git.restore_checkpoint(genuine_checkpoint.clone(), cx)
+    })
+    .await
+    .expect("genuine nested Git supports checkpoint restoration");
+    clean_repository
+        .read_with(cx, |repository, cx| {
+            repository.check_worktree_operation(clean_path.clone(), cx)
+        })
+        .await
+        .expect("clean source and target remain allowed");
+
+    fixture
+        .fs
+        .insert_file(nested_path.join(".fixture-vcs"), Vec::new())
+        .await;
+    fixture
+        .fs
+        .insert_file(
+            nested_path.join("file.txt"),
+            b"keep current nested content\n".to_vec(),
+        )
+        .await;
+    assert!(git.update(cx, |git, cx| git.checkpoint(cx)).await.is_err());
+    assert!(
+        git.update(cx, |git, cx| git.restore_checkpoint(empty_checkpoint, cx))
+            .await
+            .is_err()
+    );
+    assert!(
+        git.update(cx, |git, cx| git.restore_checkpoint(genuine_checkpoint, cx))
+            .await
+            .is_err()
+    );
+    let target_guard = clean_repository.read_with(cx, |repository, cx| {
+        repository.check_worktree_operation(nested_path.clone(), cx)
+    });
+    assert!(
+        target_guard
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("external VCS")
+    );
+    let source_guard = nested_repository.read_with(cx, |repository, cx| {
+        repository.check_worktree_operation(clean_path.clone(), cx)
+    });
+    assert!(
+        source_guard
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("external VCS")
+    );
+    clean_repository
+        .read_with(cx, |repository, cx| {
+            repository.check_worktree_operation(clean_path.clone(), cx)
+        })
+        .await
+        .expect("unrelated genuine Git stays allowed");
+    assert!(
+        fixture
+            .fs
+            .metadata(&fixture.directory.path().join(".fixture-vcs"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .fs
+            .metadata(&nested_path.join(".fixture-vcs"))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        fixture
+            .fs
+            .load(&nested_path.join("file.txt"))
+            .await
+            .unwrap(),
+        "keep current nested content\n"
+    );
+    stop(&fixture, cx).await;
+}

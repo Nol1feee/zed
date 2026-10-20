@@ -41,6 +41,7 @@ impl ProviderCapabilities {
 pub enum FileOperation {
     Stage,
     Unstage,
+    Discard,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
