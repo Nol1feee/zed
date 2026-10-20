@@ -125,6 +125,8 @@ pub fn worktree_create_targets(
 /// open files, agent panel draft) is inherited by the destination.
 enum WorktreeOperation {
     Create,
+    ProviderCreate,
+    ProviderOpen,
     Switch,
 }
 
@@ -755,6 +757,21 @@ fn create_worktree_workspace_inner(
 ) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
     let project = workspace.project().clone();
 
+    if let Some(store) = project.read(cx).vcs_store().cloned() {
+        let repositories = store.read(cx).repositories();
+        if !repositories.is_empty() {
+            return create_provider_checkout_workspace(
+                workspace,
+                store,
+                repositories,
+                action,
+                activate,
+                window,
+                cx,
+            );
+        }
+    }
+
     if project.read(cx).repositories(cx).is_empty() {
         return Task::ready(Err(anyhow!(
             "create_worktree: no git repository in the project"
@@ -1136,7 +1153,171 @@ async fn do_switch_worktree(
     .await
 }
 
-/// Core workspace opening logic shared by both create and switch flows.
+pub fn open_provider_checkout_workspace(
+    workspace: &mut Workspace,
+    repository: &project::vcs_store::VcsRepositorySnapshot,
+    checkout: &vcs::CheckoutDescriptor,
+    created: bool,
+    activate: bool,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) -> Task<anyhow::Result<Entity<Workspace>>> {
+    let paths = provider_checkout_paths(repository, checkout);
+    let (source, target) = match paths {
+        Ok(paths) => paths,
+        Err(error) => return Task::ready(Err(error)),
+    };
+    let previous_state = workspace.capture_state_for_worktree_switch(window, None, cx);
+    let workspace_handle = workspace.weak_handle();
+    let window_handle = window.window_handle().downcast::<MultiWorkspace>();
+    workspace.set_active_worktree_creation(Some(checkout.name.clone().into()), !created, cx);
+    cx.spawn_in(window, async move |_, cx| {
+        let result = open_worktree_workspace(
+            vec![target.clone()],
+            vec![(source, target)],
+            Vec::new(),
+            false,
+            previous_state,
+            workspace_handle.clone(),
+            window_handle,
+            None,
+            if created {
+                WorktreeOperation::ProviderCreate
+            } else {
+                WorktreeOperation::ProviderOpen
+            },
+            activate,
+            cx,
+        )
+        .await;
+        if result.is_err() {
+            workspace_handle
+                .update(cx, |workspace, cx| {
+                    workspace.set_active_worktree_creation(None, false, cx)
+                })
+                .log_err();
+        }
+        result
+    })
+}
+
+fn provider_checkout_paths(
+    repository: &project::vcs_store::VcsRepositorySnapshot,
+    checkout: &vcs::CheckoutDescriptor,
+) -> anyhow::Result<(PathBuf, PathBuf)> {
+    anyhow::ensure!(
+        checkout.owned,
+        "This checkout is not owned by this provider session"
+    );
+    anyhow::ensure!(
+        matches!(
+            checkout.state,
+            vcs::CheckoutState::Mounted | vcs::CheckoutState::Busy
+        ),
+        "The checkout is not mounted"
+    );
+    anyhow::ensure!(
+        checkout.preparation == vcs::CheckoutPreparation::Ready,
+        "Checkout preparation is incomplete; retry Prepare for the existing checkout"
+    );
+    let source = vcs::local_path(&repository.descriptor.scope_uri)?;
+    let target = vcs::local_path(&checkout.scope_uri)?;
+    let root = vcs::local_path(&checkout.root_uri)?;
+    anyhow::ensure!(
+        target.starts_with(root),
+        "Provider scope is outside its checkout"
+    );
+    Ok((source, target))
+}
+
+fn create_provider_checkout_workspace(
+    workspace: &mut Workspace,
+    store: Entity<project::vcs_store::VcsStore>,
+    repositories: Vec<project::vcs_store::VcsRepositorySnapshot>,
+    action: &zed_actions::CreateWorktree,
+    activate: bool,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) -> Task<anyhow::Result<CreatedWorktreeWorkspace>> {
+    let preparation = (|| {
+        let project = workspace.project().read(cx);
+        anyhow::ensure!(
+            project.is_local() && !project.is_via_collab(),
+            "Provider checkout creation requires a local project"
+        );
+        anyhow::ensure!(
+            repositories.len() == 1
+                && project.visible_worktrees(cx).count() == 1
+                && project.repositories(cx).is_empty(),
+            "Provider checkout creation requires one local provider scope with no Git repositories in the project"
+        );
+        anyhow::ensure!(
+            workspace.active_worktree_creation().label.is_none(),
+            "A checkout operation is already in progress"
+        );
+        let repository = repositories
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("No provider repository"))?;
+        anyhow::ensure!(
+            store
+                .read(cx)
+                .checkout_operations(&repository.key)
+                .contains(&vcs::CheckoutOperationKind::Create),
+            "The provider does not support creating owned checkouts here"
+        );
+        let base = match &action.branch_target {
+            NewWorktreeBranchTarget::CurrentBranch => repository
+                .repository_state
+                .as_ref()
+                .and_then(|state| state.current_branch.as_ref())
+                .map(|branch| branch.name.clone())
+                .ok_or_else(|| {
+                    anyhow!("Current provider branch is unavailable; refresh source control")
+                })?,
+            NewWorktreeBranchTarget::ExistingBranch { name } => name.clone(),
+            NewWorktreeBranchTarget::RemoteBranch { .. } => {
+                anyhow::bail!("Choose a provider branch or revision in the Checkouts picker")
+            }
+        };
+        let name = action
+            .worktree_name
+            .clone()
+            .or_else(|| worktree_names::generate_worktree_name(&[], &mut rand::rng()))
+            .ok_or_else(|| anyhow!("Could not generate a checkout name"))?;
+        let operation = vcs::CheckoutOperation::Create {
+            name: name.clone(),
+            branch: name,
+            base,
+        };
+        let preparation = store.update(cx, |store, cx| {
+            store.prepare_checkout_operation(repository.key.clone(), operation, cx)
+        });
+        anyhow::Ok((repository, preparation))
+    })();
+    let (repository, preparation) = match preparation {
+        Ok(value) => value,
+        Err(error) => return Task::ready(Err(error)),
+    };
+    workspace.set_active_worktree_creation(Some("checkout".into()), false, cx);
+    cx.spawn_in(window, async move |workspace, cx| {
+        let result = async {
+            let prepared = preparation.await?;
+            let result = store.update(cx, |store, cx| store.apply_prepared_checkout_operation(prepared, cx)).await?;
+            let checkout = result.checkout.ok_or_else(|| anyhow!("Provider did not return the created checkout"))?;
+            let opened = workspace.update_in(cx, |workspace, window, cx| open_provider_checkout_workspace(workspace, &repository, &checkout, true, activate, window, cx))?.await?;
+            anyhow::Ok(CreatedWorktreeWorkspace { workspace: opened, consolidated_worktrees: false })
+        }.await;
+        if let Err(error) = &result {
+            workspace.update(cx, |workspace, cx| {
+                workspace.set_active_worktree_creation(None, false, cx);
+                show_error_toast(cx.entity(), "checkout create", anyhow!("{error:#}. Any created checkout is retained; use Checkouts to inspect or retry preparation."), cx);
+            }).log_err();
+        }
+        result
+    })
+}
+
 /// Returns the newly opened workspace entity so callers can do post-open
 /// work (e.g., the `create_thread` agent tool spawns a thread inside it).
 async fn open_worktree_workspace(
@@ -1155,9 +1336,25 @@ async fn open_worktree_workspace(
     let window_handle = window_handle
         .ok_or_else(|| anyhow!("No window handle available for workspace creation"))?;
 
+    if matches!(
+        operation,
+        WorktreeOperation::ProviderCreate | WorktreeOperation::ProviderOpen
+    ) {
+        let source = workspace
+            .upgrade()
+            .ok_or_else(|| anyhow!("Source workspace closed before opening the checkout"))?;
+        window_handle.update(cx, |multi_workspace, window, cx| {
+            multi_workspace.add(source, window, cx);
+        })?;
+    }
+
     let focused_dock = previous_state.focused_dock;
 
-    let is_creating_new_worktree = matches!(operation, WorktreeOperation::Create);
+    let is_creating_new_worktree = matches!(
+        operation,
+        WorktreeOperation::Create | WorktreeOperation::ProviderCreate
+    );
+    let run_git_creation_hooks = matches!(operation, WorktreeOperation::Create);
 
     // When `activate` is false the new workspace is opened in the background
     // (e.g. the agent's `create_thread` tool), so it should be a clean
@@ -1363,7 +1560,9 @@ async fn open_worktree_workspace(
             new_workspace.update(cx, |workspace, cx| {
                 // Run create-worktree setup hooks regardless of foreground vs
                 // background — the worktree was created either way.
-                workspace.run_create_worktree_tasks(window, cx);
+                if run_git_creation_hooks {
+                    workspace.run_create_worktree_tasks(window, cx);
+                }
 
                 if activate && let Some(dock_position) = focused_dock {
                     let dock = workspace.dock_at_position(dock_position);
@@ -1746,6 +1945,164 @@ mod tests {
         assert!(
             !has_modal,
             "security modal should not show for a linked worktree created from a trusted main worktree"
+        );
+    }
+
+    #[gpui::test]
+    async fn provider_checkout_create_retains_source_without_git_hooks(cx: &mut TestAppContext) {
+        assert_provider_checkout_retains_source(cx, true).await;
+    }
+
+    #[gpui::test]
+    async fn provider_checkout_open_retains_source_without_git_hooks(cx: &mut TestAppContext) {
+        assert_provider_checkout_retains_source(cx, false).await;
+    }
+
+    async fn assert_provider_checkout_retains_source(cx: &mut TestAppContext, created: bool) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn Fs>::set_global(fs.clone(), cx));
+        let hook = r#"[{"label":"legacy repair","command":"echo","hooks":["create_worktree"]}]"#;
+        fs.insert_tree("/source", json!({"app": {"file.txt": "source"}}))
+            .await;
+        fs.insert_tree(
+            "/target",
+            json!({"app": {"file.txt": "target", ".zed": {"tasks.json": hook}}}),
+        )
+        .await;
+        let project = Project::test(fs, [Path::new("/source/app")], cx).await;
+        cx.update(|cx| {
+            project::DisableAiSettings::override_global(
+                project::DisableAiSettings { disable_ai: true },
+                cx,
+            );
+        });
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .visible_worktrees(cx)
+                .next()
+                .expect("source worktree")
+                .read(cx)
+                .id()
+        });
+        let repository = project::vcs_store::VcsRepositorySnapshot {
+            key: project::vcs_store::VcsRepositoryId {
+                worktree_id,
+                extension_id: "fixture".into(),
+                provider_id: "fixture".into(),
+                repository_id: "source".into(),
+            },
+            descriptor: vcs::RepositoryDescriptor {
+                id: "source".into(),
+                root_uri: "file:///source".into(),
+                scope_uri: "file:///source/app".into(),
+                display_name: "Source".into(),
+                baselines: vec![vcs::Baseline {
+                    id: "working".into(),
+                    label: "Working".into(),
+                }],
+            },
+            selected_baseline: "working".into(),
+            snapshot: None,
+            loading: false,
+            show_loading: false,
+            error: None,
+            repository_state: None,
+            repository_state_error: None,
+            checkouts: None,
+            checkout_error: None,
+            checkout_loading: false,
+        };
+        let checkout = vcs::CheckoutDescriptor {
+            id: "target".into(),
+            name: "Target".into(),
+            root_uri: "file:///target".into(),
+            scope_uri: "file:///target/app".into(),
+            branch: Some("topic".into()),
+            state: vcs::CheckoutState::Mounted,
+            owned: true,
+            operations: vec![vcs::CheckoutOperationKind::Open],
+            unavailable_reason: None,
+            preparation: vcs::CheckoutPreparation::Ready,
+            preparation_error: None,
+        };
+        let labels = Arc::new(Mutex::new(Vec::new()));
+        let labels_for_observer = labels.clone();
+        let _subscription = cx.update(|cx| {
+            cx.observe_new(move |workspace: &mut Workspace, _, _| {
+                workspace.set_terminal_provider(CountingTerminalProvider {
+                    spawned_task_labels: labels_for_observer.clone(),
+                });
+            })
+        });
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let source =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            assert!(!multi_workspace.multi_workspace_enabled(cx));
+            assert!(!multi_workspace.is_workspace_retained(&source));
+        });
+        let task = source.update_in(cx, |workspace, window, cx| {
+            open_provider_checkout_workspace(
+                workspace,
+                &repository,
+                &checkout,
+                created,
+                true,
+                window,
+                cx,
+            )
+        });
+        let opened = task.await.expect("provider checkout opens");
+        cx.run_until_parked();
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            assert!(multi_workspace.is_workspace_retained(&source));
+            assert!(
+                multi_workspace
+                    .workspaces()
+                    .any(|workspace| workspace == &source)
+            );
+        });
+        assert_eq!(
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace
+                .workspace()
+                .entity_id()),
+            opened.entity_id()
+        );
+        assert_eq!(
+            opened.read_with(cx, |workspace, cx| workspace
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .unwrap()
+                .read(cx)
+                .abs_path()
+                .to_path_buf()),
+            PathBuf::from("/target/app")
+        );
+        assert!(
+            labels.lock().unwrap().is_empty(),
+            "provider creation must not run Git repair hooks"
+        );
+        cx.update(|_, cx| {
+            install_counting_provider_and_worktree_hook(
+                &opened,
+                &labels,
+                Path::new("/source/app"),
+                hook,
+                cx,
+            )
+        });
+        opened.update_in(cx, |workspace, window, cx| {
+            workspace.run_create_worktree_tasks(window, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            labels.lock().unwrap().as_slice(),
+            ["legacy repair"],
+            "the hook exists and can run only when explicitly requested"
         );
     }
 

@@ -7227,6 +7227,7 @@ dependencies = [
  "ui",
  "unindent",
  "util",
+ "vcs",
  "watch",
  "workspace",
  "zed_actions",

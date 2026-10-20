@@ -66,9 +66,15 @@ impl ProjectEnvironment {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_cli_environment_for_test(&mut self, environment: HashMap<String, String>) {
+        self.cli_environment = Some(environment);
+    }
+
     /// Returns the inherited CLI environment, if this project was opened from the Zed CLI.
     pub(crate) fn get_cli_environment(&self) -> Option<HashMap<String, String>> {
-        if cfg!(any(test, feature = "test-support")) {
+        // Real-process tests can supply an explicit environment; other tests stay isolated.
+        if cfg!(any(test, feature = "test-support")) && self.cli_environment.is_none() {
             return Some(HashMap::default());
         }
         if let Some(mut env) = self.cli_environment.clone() {

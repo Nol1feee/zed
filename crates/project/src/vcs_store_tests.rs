@@ -568,6 +568,399 @@ async fn file_operation_unknown_outcome_requires_reconciliation_before_retry(
 }
 
 #[gpui::test]
+async fn repository_commit_uses_cached_state_and_rejects_a_changed_index(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "repository-commit",
+        fixture.directory.path(),
+        "repository-operations",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    assert_eq!(
+        repository.repository_state.as_ref().unwrap().staged_paths,
+        ["src/example.txt"]
+    );
+    let operation = RepositoryOperation::Commit {
+        message: "Commit staged content".into(),
+    };
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_repository_operation(repository.key.clone(), operation.clone(), cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(prepared.affected_paths(), ["src/example.txt"]);
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_file_operation(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.apply_prepared_repository_operation(prepared, cx)
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("checkout changed"));
+    ready(&fixture, cx).await;
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_repository_operation(repository.key.clone(), operation, cx)
+        })
+        .await
+        .unwrap();
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.apply_prepared_repository_operation(prepared, cx)
+        })
+        .await
+        .unwrap();
+    let updated = ready(&fixture, cx).await;
+    assert!(updated.repository_state.unwrap().staged_paths.is_empty());
+    assert_eq!(
+        fixture
+            .fs
+            .load(&fixture.directory.path().join("src/example.txt"))
+            .await
+            .unwrap(),
+        "working text\n"
+    );
+    let events =
+        std::fs::read_to_string(fixture.directory.path().join("repository-commit.jsonl")).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"event\": \"repository-operation-applied\""))
+            .count(),
+        1
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn branch_switch_refuses_dirty_buffers_and_another_open_project(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "repository-switch",
+        fixture.directory.path(),
+        "repository-clean",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    let operation = RepositoryOperation::SwitchBranch {
+        branch_id: "topic".into(),
+    };
+    let buffer = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "unsaved\n")], None, cx)
+    });
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_repository_operation(repository.key.clone(), operation.clone(), cx)
+        })
+        .await
+        .err()
+        .expect("dirty buffer blocks branch switch");
+    assert!(error.to_string().contains("unsaved"));
+    drop(buffer);
+    cx.run_until_parked();
+    let other = Project::test(fixture.fs.clone(), [fixture.directory.path()], cx).await;
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_repository_operation(repository.key.clone(), operation, cx)
+        })
+        .await
+        .err()
+        .expect("another open project blocks branch switch");
+    assert!(error.to_string().contains("other projects"));
+    let events =
+        std::fs::read_to_string(fixture.directory.path().join("repository-switch.jsonl")).unwrap();
+    assert!(!events.contains("vcs/prepareRepositoryOperation"));
+    drop(other);
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn unknown_repository_operation_blocks_file_writes_until_reconciled(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "repository-unknown",
+        fixture.directory.path(),
+        "repository-unknown",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_repository_operation(
+                repository.key.clone(),
+                RepositoryOperation::Commit {
+                    message: "Saved intent".into(),
+                },
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| {
+                store.apply_prepared_repository_operation(prepared, cx)
+            })
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unknown")
+    );
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| {
+                store.run_file_operation(
+                    repository.key.clone(),
+                    "src/example.txt".into(),
+                    FileOperation::Stage,
+                    cx,
+                )
+            })
+            .await
+            .is_err()
+    );
+    let events = fixture.directory.path().join("repository-unknown.jsonl");
+    std::fs::write(events.with_extension("jsonl.reconcile"), "ready").unwrap();
+    fixture.store.update(cx, |store, cx| store.refresh_all(cx));
+    cx.condition(&fixture.store, |store, _| {
+        !store.file_operation_running() && !store.repository_operation_unresolved(&repository.key)
+    })
+    .await;
+    let events = std::fs::read_to_string(events).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"method\": \"vcs/applyRepositoryOperation\""))
+            .count(),
+        1
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn another_store_cannot_recover_an_intent_before_its_owner_dispatches(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("active-owner", fixture.directory.path(), "write-unknown").register(cx);
+    let repository = ready(&fixture, cx).await;
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_file_operation(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    let journal = fixture
+        .store
+        .read_with(cx, |store, _| store.operation_journal.clone());
+    let owner = journal
+        .record(
+            prepared.scope.clone(),
+            PendingFileOperation {
+                path: prepared.path.clone(),
+                operation: prepared.operation,
+                token: prepared.token.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let parts = fixture.store.read_with(cx, |store, _| {
+        (
+            store.project.clone(),
+            store.worktrees.clone(),
+            store.git.clone(),
+            store.environment.clone(),
+        )
+    });
+    let refresher =
+        cx.new(|cx| VcsStore::new(parts.0, parts.1, parts.2, parts.3, fixture.fs.clone(), cx));
+    cx.condition(&refresher, |store, _| {
+        store
+            .repositories()
+            .iter()
+            .any(|repository| repository.snapshot.is_some() && !repository.loading)
+    })
+    .await;
+    refresher.update(cx, |store, cx| store.refresh_all(cx));
+    cx.condition(&refresher, |store, _| {
+        !store
+            .repositories()
+            .iter()
+            .any(|repository| repository.loading)
+    })
+    .await;
+    let events_path = fixture.directory.path().join("active-owner.jsonl");
+    assert!(
+        !std::fs::read_to_string(&events_path)
+            .unwrap()
+            .contains("vcs/reconcileFileOperation")
+    );
+    assert!(journal.pending(&prepared.scope).unwrap().is_some());
+    assert!(
+        prepared
+            .connection
+            .apply_file_operation(
+                prepared.key.repository_id,
+                prepared.path,
+                prepared.operation,
+                prepared.token,
+            )
+            .await
+            .is_err()
+    );
+    drop(owner);
+    assert!(journal.pending(&prepared.scope).unwrap().is_some());
+    let connections = refresher.read_with(cx, |store, _| {
+        store
+            .sessions
+            .values()
+            .filter_map(|session| session.connection.clone())
+            .collect::<Vec<_>>()
+    });
+    for connection in connections {
+        connection.shutdown().await.unwrap();
+    }
+    refresher.update(cx, |store, cx| store.stop_all(cx));
+    std::fs::write(events_path.with_extension("jsonl.reconcile"), "ready").unwrap();
+    fixture.store.update(cx, |store, cx| store.refresh_all(cx));
+    cx.condition(&fixture.store, |store, _| {
+        !store.file_operation_running() && !store.file_operation_unresolved(&repository.key)
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(events_path)
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("\"method\": \"vcs/applyFileOperation\""))
+            .count(),
+        1
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn prepared_branch_switch_is_rejected_after_git_takes_scope_ownership(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "branch-takeover",
+        fixture.directory.path(),
+        "repository-clean",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_repository_operation(
+                repository.key.clone(),
+                RepositoryOperation::SwitchBranch {
+                    branch_id: "topic".into(),
+                },
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    // Hold the provider view stale so the apply guard, not eventual rediscovery, must reject.
+    fixture
+        .store
+        .update(cx, |store, _| store._subscriptions.clear());
+    fixture
+        .fs
+        .insert_tree(fixture.directory.path().join(".git"), json!({}))
+        .await;
+    let _buffer = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    fixture
+        .project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    fixture.store.read_with(cx, |store, cx| {
+        assert!(store.repositories.contains_key(&repository.key));
+        assert!(
+            store
+                .git
+                .read(cx)
+                .repository_and_path_for_project_path(
+                    &ProjectPath {
+                        worktree_id: fixture.worktree_id,
+                        path: Arc::from(RelPath::empty()),
+                    },
+                    cx
+                )
+                .is_some(),
+            "Git ownership must be discovered before apply"
+        );
+    });
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.apply_prepared_repository_operation(prepared, cx)
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("provider")
+            || error.to_string().contains("closed")
+            || error.to_string().contains("ownership"),
+        "{error:#}"
+    );
+    assert!(
+        !std::fs::read_to_string(fixture.directory.path().join("branch-takeover.jsonl"))
+            .unwrap()
+            .contains("vcs/applyRepositoryOperation")
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
 async fn unresolved_file_operation_survives_worktree_identity_change(cx: &mut TestAppContext) {
     let fixture = fixture(cx, false).await;
     trust(&fixture, cx);
@@ -1791,7 +2184,11 @@ async fn discard_preserves_edits_made_after_dispatch(cx: &mut TestAppContext) {
     let journal_path = paths::data_dir().join("vcs/pending-file-operations.json");
     let saved: serde_json::Value =
         serde_json::from_str(&fixture.fs.load(&journal_path).await.unwrap()).unwrap();
-    assert_eq!(saved["operations"][0]["pending"]["operation"], "discard");
+    assert_eq!(saved["version"], 2);
+    assert_eq!(
+        saved["operations"][0]["pending"]["request"]["operation"],
+        "discard"
+    );
     buffer.update(cx, |buffer, cx| {
         buffer.edit([(0..0, "edit after dispatch\n")], None, cx)
     });
@@ -2101,4 +2498,1035 @@ async fn nested_external_marker_blocks_git_checkpoint_and_worktree_operations(
         "keep current nested content\n"
     );
     stop(&fixture, cx).await;
+}
+
+async fn checkout_catalog_ready(
+    fixture: &Fixture,
+    cx: &mut TestAppContext,
+) -> Arc<CheckoutCatalog> {
+    cx.condition(&fixture.store, |store, _| {
+        store.repositories().first().is_some_and(|repository| {
+            repository.checkouts.is_some() && !repository.checkout_loading
+        })
+    })
+    .await;
+    fixture.store.read_with(cx, |store, _| {
+        store.repositories()[0].checkouts.clone().unwrap()
+    })
+}
+
+#[gpui::test]
+async fn readonly_checkout_catalog_is_cached_and_unavailable_entries_are_not_mutated(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "readonly-checkouts",
+        fixture.directory.path(),
+        "checkout-read-only",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    let catalog = checkout_catalog_ready(&fixture, cx).await;
+    assert_eq!(catalog.checkouts.len(), 5);
+    assert!(
+        catalog
+            .checkouts
+            .iter()
+            .any(|checkout| !checkout.owned && checkout.state == CheckoutState::Missing)
+    );
+    assert!(fixture.store.read_with(cx, |store, _| {
+        store.checkout_catalog_available(&repository.key)
+    }));
+    assert!(fixture.store.read_with(cx, |store, _| {
+        store.checkout_operations(&repository.key).is_empty()
+    }));
+    for _ in 0..8 {
+        fixture.store.update(cx, |store, cx| store.notify(cx));
+    }
+    cx.run_until_parked();
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store.prepare_checkout_operation(
+                repository.key.clone(),
+                CheckoutOperation::Open {
+                    checkout_id: "fixture-checkout".into()
+                },
+                cx,
+            ))
+            .await
+            .is_err()
+    );
+    let events =
+        std::fs::read_to_string(fixture.directory.path().join("readonly-checkouts.jsonl")).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"method\": \"vcs/listCheckouts\""))
+            .count(),
+        1
+    );
+    assert!(!events.contains("vcs/prepareCheckoutOperation"));
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn checkout_lifecycle_retains_identity_and_busy_target_blocks_apply(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("checkout-lifecycle", fixture.directory.path(), "checkouts").register(cx);
+    let repository = ready(&fixture, cx).await;
+    let catalog = checkout_catalog_ready(&fixture, cx).await;
+    for checkout_id in ["foreign-checkout", "missing-checkout", "busy-checkout"] {
+        assert!(
+            fixture
+                .store
+                .update(cx, |store, cx| store.prepare_checkout_operation(
+                    repository.key.clone(),
+                    CheckoutOperation::Remove {
+                        checkout_id: checkout_id.into()
+                    },
+                    cx,
+                ))
+                .await
+                .is_err()
+        );
+    }
+    for operation in [
+        CheckoutOperation::Open {
+            checkout_id: "unmounted-checkout".into(),
+        },
+        CheckoutOperation::Suspend {
+            checkout_id: "unmounted-checkout".into(),
+        },
+        CheckoutOperation::Open {
+            checkout_id: "unmounted-checkout".into(),
+        },
+        CheckoutOperation::Remove {
+            checkout_id: "unmounted-checkout".into(),
+        },
+    ] {
+        let expected = operation.checkout_id().unwrap().to_owned();
+        let prepared = fixture
+            .store
+            .update(cx, |store, cx| {
+                store.prepare_checkout_operation(repository.key.clone(), operation, cx)
+            })
+            .await
+            .unwrap();
+        let result = fixture
+            .store
+            .update(cx, |store, cx| {
+                store.apply_prepared_checkout_operation(prepared, cx)
+            })
+            .await
+            .unwrap();
+        if let Some(checkout) = result.checkout {
+            assert_eq!(checkout.id, expected);
+        }
+        checkout_catalog_ready(&fixture, cx).await;
+    }
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_checkout_operation(
+                repository.key.clone(),
+                CheckoutOperation::Suspend {
+                    checkout_id: "fixture-checkout".into(),
+                },
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    let target = catalog
+        .checkouts
+        .iter()
+        .find(|checkout| checkout.id == "fixture-checkout")
+        .unwrap();
+    let scope = vcs::local_path(&target.scope_uri).unwrap();
+    fixture
+        .fs
+        .insert_tree(&scope, json!({"keep.txt": "Target data"}))
+        .await;
+    open_worktree(&fixture, &scope, cx).await;
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.apply_prepared_checkout_operation(prepared, cx)
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Close"));
+    assert_eq!(
+        fixture.fs.load(&scope.join("keep.txt")).await.unwrap(),
+        "Target data"
+    );
+    let events =
+        std::fs::read_to_string(fixture.directory.path().join("checkout-lifecycle.jsonl")).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"event\": \"checkout-operation-applied\""))
+            .count(),
+        4
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn checkout_unknown_recovers_from_picker_refresh_without_duplicate_creation(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "unknown-checkout",
+        fixture.directory.path(),
+        "checkout-unknown",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    checkout_catalog_ready(&fixture, cx).await;
+    let operation = CheckoutOperation::Create {
+        name: "new-checkout".into(),
+        branch: "topic".into(),
+        base: "main".into(),
+    };
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_checkout_operation(repository.key.clone(), operation.clone(), cx)
+        })
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store
+                .apply_prepared_checkout_operation(prepared, cx))
+            .await
+            .is_err()
+    );
+    assert!(fixture.store.read_with(cx, |store, _| {
+        store.repository_operation_unresolved(&repository.key)
+    }));
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store.prepare_checkout_operation(
+                repository.key.clone(),
+                operation,
+                cx,
+            ))
+            .await
+            .is_err()
+    );
+    let events_path = fixture.directory.path().join("unknown-checkout.jsonl");
+    std::fs::write(events_path.with_extension("jsonl.reconcile"), "ready").unwrap();
+    fixture
+        .store
+        .update(cx, |store, cx| store.refresh_checkouts(&repository.key, cx));
+    cx.condition(&fixture.store, |store, _| {
+        !store.file_operation_running() && !store.repository_operation_unresolved(&repository.key)
+    })
+    .await;
+    let catalog = checkout_catalog_ready(&fixture, cx).await;
+    assert_eq!(
+        catalog
+            .checkouts
+            .iter()
+            .filter(|checkout| checkout.name == "new-checkout")
+            .count(),
+        1
+    );
+    let events = std::fs::read_to_string(events_path).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"method\": \"vcs/applyCheckoutOperation\""))
+            .count(),
+        1
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn checkout_progress_is_token_bound_and_refresh_skips_active_owner(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "checkout-progress",
+        fixture.directory.path(),
+        "checkout-pending",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    checkout_catalog_ready(&fixture, cx).await;
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_checkout_operation(
+                repository.key.clone(),
+                CheckoutOperation::Create {
+                    name: "progress-checkout".into(),
+                    branch: "topic".into(),
+                    base: "main".into(),
+                },
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    let token = prepared.prepared.operation_token.clone();
+    let apply = fixture.store.update(cx, |store, cx| {
+        store.apply_prepared_checkout_operation(prepared, cx)
+    });
+    let events_path = fixture.directory.path().join("checkout-progress.jsonl");
+    provider_event(events_path.clone(), "checkout-apply-held").await;
+    cx.condition(&fixture.store, |store, _| {
+        store
+            .operation_progress(&repository.key)
+            .is_some_and(|progress| progress.phase == "preparing")
+    })
+    .await;
+    fixture
+        .store
+        .update(cx, |store, cx| store.refresh_checkouts(&repository.key, cx));
+    checkout_catalog_ready(&fixture, cx).await;
+    let progress = fixture.store.read_with(cx, |store, _| {
+        store.operation_progress(&repository.key).unwrap()
+    });
+    assert_eq!(progress.operation_token, token);
+    assert_eq!(progress.phase, "preparing");
+    let events = std::fs::read_to_string(&events_path).unwrap();
+    assert!(!events.contains("vcs/reconcileCheckoutOperation"));
+    std::fs::write(events_path.with_extension("jsonl.release"), "release").unwrap();
+    let result = apply.await.unwrap();
+    assert_eq!(
+        result.checkout.unwrap().id,
+        "fixture-created:progress-checkout"
+    );
+    assert!(fixture.store.read_with(cx, |store, _| {
+        store.operation_progress(&repository.key).is_none()
+    }));
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn failed_checkout_preparation_retries_the_same_checkout(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "failed-checkout",
+        fixture.directory.path(),
+        "checkout-preparation-failed",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    checkout_catalog_ready(&fixture, cx).await;
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_checkout_operation(
+                repository.key.clone(),
+                CheckoutOperation::Create {
+                    name: "retained".into(),
+                    branch: "topic".into(),
+                    base: "main".into(),
+                },
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    let created = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.apply_prepared_checkout_operation(prepared, cx)
+        })
+        .await
+        .unwrap()
+        .checkout
+        .unwrap();
+    assert_eq!(created.preparation, vcs::CheckoutPreparation::Failed);
+    checkout_catalog_ready(&fixture, cx).await;
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_checkout_operation(
+                repository.key.clone(),
+                CheckoutOperation::Prepare {
+                    checkout_id: created.id.clone(),
+                },
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    let retried = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.apply_prepared_checkout_operation(prepared, cx)
+        })
+        .await
+        .unwrap()
+        .checkout
+        .unwrap();
+    assert_eq!(retried.id, created.id);
+    assert_eq!(retried.root_uri, created.root_uri);
+    assert_eq!(retried.preparation, vcs::CheckoutPreparation::Ready);
+    let events =
+        std::fs::read_to_string(fixture.directory.path().join("failed-checkout.jsonl")).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(
+                |line| line.contains("\"event\": \"checkout-operation-applied\"")
+                    && line.contains("\"operation\": \"create\"")
+            )
+            .count(),
+        1
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn checkout_intent_blocks_both_source_and_target_roots(cx: &mut TestAppContext) {
+    let fs = fs::FakeFs::new(cx.background_executor.clone());
+    let journal = OperationJournal::new(fs, "/journal/checkout.json".into());
+    journal.load().await.unwrap();
+    let source = FileOperationScope {
+        extension_id: "fixture".into(),
+        provider_id: "fixture".into(),
+        repository_id: "source".into(),
+        root_uri: "file:///source".into(),
+        scope_uri: "file:///source/project".into(),
+    };
+    let target = FileOperationScope {
+        repository_id: "target".into(),
+        root_uri: "file:///target".into(),
+        scope_uri: "file:///target/project".into(),
+        ..source.clone()
+    };
+    let checkout = PendingOperation {
+        token: "checkout-token".into(),
+        request: OperationRequest::Checkout {
+            operation: CheckoutOperation::Create {
+                name: "target".into(),
+                branch: "topic".into(),
+                base: "main".into(),
+            },
+            target_root_uri: "file://localhost/target/".into(),
+            checkout: None,
+        },
+    };
+    let claim = journal
+        .record(source.clone(), checkout.clone())
+        .await
+        .unwrap();
+    assert!(journal.blocking(&source, false).unwrap().is_some());
+    assert!(journal.blocking(&target, false).unwrap().is_some());
+    assert!(
+        journal
+            .claim_recovery(&source, "checkout-token")
+            .unwrap()
+            .is_none()
+    );
+    let file = PendingFileOperation {
+        path: "file.txt".into(),
+        operation: FileOperation::Stage,
+        token: "file-token".into(),
+    };
+    assert!(journal.record(target.clone(), file.clone()).await.is_err());
+    drop(claim);
+    journal.clear(&source, "checkout-token").await.unwrap();
+    let claim = journal.record(target, file).await.unwrap();
+    assert!(journal.record(source, checkout).await.is_err());
+    drop(claim);
+}
+
+async fn populate_file_kind_fixture(fixture: &Fixture) {
+    for path in [
+        "new.txt",
+        "renamed.txt",
+        "old.txt",
+        "type-change.txt",
+        "executable.sh",
+        "disabled.txt",
+        "neighbor.txt",
+    ] {
+        fixture
+            .fs
+            .insert_file(fixture.directory.path().join(path), b"working\n".to_vec())
+            .await;
+    }
+    for path in ["binary.bin", "binary-no-capabilities.bin"] {
+        fixture
+            .fs
+            .insert_file(fixture.directory.path().join(path), vec![0, 255, 1])
+            .await;
+    }
+    fixture
+        .fs
+        .create_dir(&fixture.directory.path().join("directory"))
+        .await
+        .unwrap();
+    fixture
+        .fs
+        .insert_tree(
+            fixture.directory.path().join("real-dir"),
+            json!({"child.txt": "child", "old.txt": "old"}),
+        )
+        .await;
+    fixture
+        .fs
+        .insert_symlink(
+            fixture.directory.path().join("link"),
+            "src/example.txt".into(),
+        )
+        .await;
+    fixture
+        .fs
+        .insert_symlink(
+            fixture.directory.path().join("linked-parent"),
+            "real-dir".into(),
+        )
+        .await;
+}
+
+#[gpui::test]
+async fn explicit_file_kinds_enable_only_the_advertised_rows_and_keep_parents_safe(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    populate_file_kind_fixture(&fixture).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("file-kinds", fixture.directory.path(), "file-kinds").register(cx);
+    let repository = ready(&fixture, cx).await;
+    for path in ["disabled.txt", "binary-no-capabilities.bin"] {
+        assert!(fixture.store.read_with(cx, |store, _| {
+            store
+                .file_operations_for_path(&repository.key, path)
+                .is_empty()
+        }));
+        assert!(
+            fixture
+                .store
+                .update(cx, |store, cx| store.prepare_file_operation(
+                    repository.key.clone(),
+                    path.into(),
+                    FileOperation::Stage,
+                    cx,
+                ))
+                .await
+                .is_err()
+        );
+    }
+    for path in [
+        "new.txt",
+        "deleted.txt",
+        "binary.bin",
+        "link",
+        "renamed.txt",
+        "executable.sh",
+        "type-change.txt",
+    ] {
+        let prepared = fixture
+            .store
+            .update(cx, |store, cx| {
+                store.prepare_file_operation(
+                    repository.key.clone(),
+                    path.into(),
+                    FileOperation::Stage,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        if path == "renamed.txt" {
+            assert_eq!(prepared.affected_paths(), ["renamed.txt", "old.txt"]);
+        }
+        assert!(prepared.summary().is_some());
+        fixture
+            .store
+            .update(cx, |store, cx| {
+                store.apply_prepared_file_operation(prepared, cx)
+            })
+            .await
+            .unwrap();
+    }
+    for path in ["directory", "linked-parent/child.txt"] {
+        assert!(
+            fixture
+                .store
+                .update(cx, |store, cx| store.prepare_file_operation(
+                    repository.key.clone(),
+                    path.into(),
+                    FileOperation::Stage,
+                    cx,
+                ))
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(
+        fixture
+            .fs
+            .load_bytes(&fixture.directory.path().join("binary.bin"))
+            .await
+            .unwrap(),
+        [0, 255, 1]
+    );
+    assert_eq!(
+        fixture
+            .fs
+            .load(&fixture.directory.path().join("src/example.txt"))
+            .await
+            .unwrap(),
+        "working text\n"
+    );
+    let events =
+        std::fs::read_to_string(fixture.directory.path().join("file-kinds.jsonl")).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"event\": \"file-operation-applied\""))
+            .count(),
+        7
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn file_preparation_refuses_widened_paths_incomplete_rename_and_ambiguous_discard(
+    cx: &mut TestAppContext,
+) {
+    for (scenario, path, operation, reason) in [
+        (
+            "file-kinds-missing-summary",
+            "new.txt",
+            FileOperation::Discard,
+            "summary",
+        ),
+        (
+            "file-kinds-bad-targets",
+            "binary.bin",
+            FileOperation::Stage,
+            "another file",
+        ),
+        (
+            "file-kinds-missing-old-path",
+            "renamed.txt",
+            FileOperation::Stage,
+            "both paths",
+        ),
+        (
+            "file-kinds-old-parent",
+            "renamed.txt",
+            FileOperation::Stage,
+            "symlink",
+        ),
+        (
+            "file-kinds-old-directory",
+            "renamed.txt",
+            FileOperation::Stage,
+            "directory",
+        ),
+    ] {
+        let fixture = fixture(cx, false).await;
+        populate_file_kind_fixture(&fixture).await;
+        trust(&fixture, cx);
+        FixtureExtension::new(scenario, fixture.directory.path(), scenario).register(cx);
+        let repository = ready(&fixture, cx).await;
+        let error = fixture
+            .store
+            .update(cx, |store, cx| {
+                store.prepare_file_operation(repository.key.clone(), path.into(), operation, cx)
+            })
+            .await
+            .err()
+            .expect("unsafe preparation is refused");
+        assert!(error.to_string().contains(reason), "{scenario}: {error:#}");
+        let events =
+            std::fs::read_to_string(fixture.directory.path().join(format!("{scenario}.jsonl")))
+                .unwrap();
+        assert!(!events.contains("vcs/applyFileOperation"));
+        if scenario == "file-kinds-old-parent" || scenario == "file-kinds-old-directory" {
+            assert!(!events.contains("vcs/prepareFileOperation"));
+        }
+        stop(&fixture, cx).await;
+        cx.update(|cx| {
+            ExtensionHostProxy::global(cx).unregister_vcs_provider(
+                scenario.into(),
+                "fixture".into(),
+                cx,
+            )
+        });
+    }
+}
+
+#[gpui::test]
+async fn same_file_and_rename_source_buffers_in_another_project_block_mutation(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    populate_file_kind_fixture(&fixture).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("shared-buffers", fixture.directory.path(), "file-kinds").register(cx);
+    let repository = ready(&fixture, cx).await;
+    let other = Project::test(fixture.fs.clone(), [fixture.directory.path()], cx).await;
+    let buffer = other
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "unsaved in other project\n")], None, cx)
+    });
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_file_operation(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Discard,
+                cx,
+            )
+        })
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("unsaved"));
+    let unrelated = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_file_operation(
+                repository.key.clone(),
+                "new.txt".into(),
+                FileOperation::Stage,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    drop(unrelated);
+    buffer.update(cx, |buffer, _| buffer.set_conflict());
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store.prepare_file_operation(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                cx,
+            ))
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("conflict")
+    );
+    let old = other
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("old.txt"), cx)
+        })
+        .await
+        .unwrap();
+    old.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "unsaved rename source\n")], None, cx)
+    });
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store.prepare_file_operation(
+                repository.key.clone(),
+                "renamed.txt".into(),
+                FileOperation::Stage,
+                cx,
+            ))
+            .await
+            .is_err()
+    );
+    let events =
+        std::fs::read_to_string(fixture.directory.path().join("shared-buffers.jsonl")).unwrap();
+    assert!(!events.contains("vcs/applyFileOperation"));
+    drop(other);
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn discard_preserves_a_buffer_edited_in_another_project_after_dispatch(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("other-discard", fixture.directory.path(), "discard-pending")
+        .register(cx);
+    let repository = ready(&fixture, cx).await;
+    let other = Project::test(fixture.fs.clone(), [fixture.directory.path()], cx).await;
+    let buffer = other
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let task = fixture.store.update(cx, |store, cx| {
+        store.run_file_operation(
+            repository.key.clone(),
+            "src/example.txt".into(),
+            FileOperation::Discard,
+            cx,
+        )
+    });
+    let events_path = fixture.directory.path().join("other-discard.jsonl");
+    provider_event(events_path.clone(), "apply-held").await;
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "keep this new edit\n")], None, cx)
+    });
+    let edited = buffer.read_with(cx, |buffer, _| buffer.text());
+    fixture
+        .fs
+        .insert_file(
+            fixture.directory.path().join("src/example.txt"),
+            b"restored\n".to_vec(),
+        )
+        .await;
+    std::fs::write(events_path.with_extension("jsonl.release"), "release").unwrap();
+    assert!(task.await.unwrap_err().to_string().contains("preserved"));
+    assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), edited);
+    assert!(buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+    drop(other);
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn rename_old_path_metadata_is_rechecked_after_confirmation(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    populate_file_kind_fixture(&fixture).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("rename-recheck", fixture.directory.path(), "file-kinds").register(cx);
+    let repository = ready(&fixture, cx).await;
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_file_operation(
+                repository.key.clone(),
+                "renamed.txt".into(),
+                FileOperation::Stage,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    fixture
+        .fs
+        .remove_file(
+            &fixture.directory.path().join("old.txt"),
+            fs::RemoveOptions::default(),
+        )
+        .await
+        .unwrap();
+    fixture
+        .fs
+        .create_dir(&fixture.directory.path().join("old.txt"))
+        .await
+        .unwrap();
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.apply_prepared_file_operation(prepared, cx)
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("directory"));
+    let events =
+        std::fs::read_to_string(fixture.directory.path().join("rename-recheck.jsonl")).unwrap();
+    assert!(!events.contains("vcs/applyFileOperation"));
+    assert!(!fixture.store.read_with(cx, |store, _| {
+        store.file_operation_unresolved(&repository.key)
+    }));
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn overlapping_file_intents_in_parent_and_nested_scopes_are_blocked(cx: &mut TestAppContext) {
+    let fs = fs::FakeFs::new(cx.background_executor.clone());
+    let journal = OperationJournal::new(fs, "/journal/overlapping.json".into());
+    journal.load().await.unwrap();
+    let parent = FileOperationScope {
+        extension_id: "fixture".into(),
+        provider_id: "fixture".into(),
+        repository_id: "parent".into(),
+        root_uri: "file:///checkout".into(),
+        scope_uri: "file:///checkout/project".into(),
+    };
+    let nested = FileOperationScope {
+        repository_id: "nested".into(),
+        scope_uri: "file:///checkout/project/nested".into(),
+        ..parent.clone()
+    };
+    let rename = PendingOperation {
+        token: "rename-token".into(),
+        request: OperationRequest::File {
+            path: "nested/new.txt".into(),
+            operation: FileOperation::Stage,
+            affected_paths: vec!["nested/new.txt".into(), "nested/old.txt".into()],
+        },
+    };
+    let nested_file = PendingFileOperation {
+        path: "old.txt".into(),
+        operation: FileOperation::Unstage,
+        token: "nested-token".into(),
+    };
+    let claim = journal
+        .record(parent.clone(), rename.clone())
+        .await
+        .unwrap();
+    assert!(
+        journal
+            .record(nested.clone(), nested_file.clone())
+            .await
+            .is_err()
+    );
+    drop(claim);
+    assert!(
+        journal
+            .record(nested.clone(), nested_file.clone())
+            .await
+            .is_err()
+    );
+    let neighbor = PendingFileOperation {
+        path: "neighbor.txt".into(),
+        operation: FileOperation::Stage,
+        token: "neighbor-token".into(),
+    };
+    drop(journal.record(nested.clone(), neighbor).await.unwrap());
+    journal.clear(&parent, "rename-token").await.unwrap();
+    journal.clear(&nested, "neighbor-token").await.unwrap();
+    drop(journal.record(nested, nested_file).await.unwrap());
+    assert!(journal.record(parent, rename).await.is_err());
+}
+
+#[gpui::test]
+async fn explicitly_supported_staged_added_absence_allows_all_file_operations(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    populate_file_kind_fixture(&fixture).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("staged-missing", fixture.directory.path(), "file-kinds").register(cx);
+    let repository = ready(&fixture, cx).await;
+    assert!(
+        fixture
+            .fs
+            .metadata(&fixture.directory.path().join("staged-missing.txt"))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    for operation in [
+        FileOperation::Stage,
+        FileOperation::Unstage,
+        FileOperation::Discard,
+    ] {
+        fixture
+            .store
+            .update(cx, |store, cx| {
+                store.run_file_operation(
+                    repository.key.clone(),
+                    "staged-missing.txt".into(),
+                    operation,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+    }
+    fixture
+        .fs
+        .remove_file(
+            &fixture.directory.path().join("src/example.txt"),
+            fs::RemoveOptions::default(),
+        )
+        .await
+        .unwrap();
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_file_operation(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                cx,
+            )
+        })
+        .await
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("no longer exists"));
+    let events =
+        std::fs::read_to_string(fixture.directory.path().join("staged-missing.jsonl")).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"event\": \"file-operation-applied\""))
+            .count(),
+        3
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn explicit_symlink_directory_leaf_is_allowed_without_following_parents(
+    cx: &mut TestAppContext,
+) {
+    let fs = fs::FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        "/scope",
+        json!({"target-directory": {"kept.txt": "untouched"}, "ordinary-directory": {}}),
+    )
+    .await;
+    fs.insert_symlink("/scope/link", PathBuf::from("/scope/target-directory"))
+        .await;
+    let metadata = fs
+        .metadata(Path::new("/scope/link"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        metadata.is_symlink && metadata.is_dir,
+        "must reproduce RealFs symlink-to-directory metadata"
+    );
+    let mut change: vcs::Change = serde_json::from_value(json!({
+        "path": "link", "status": "modified", "kind": "symlink",
+        "oldMode": 40960, "newMode": 40960, "fileOperations": ["stage", "unstage", "discard"]
+    }))
+    .unwrap();
+    let fs: Arc<dyn Fs> = fs;
+    validate_file_metadata(Path::new("/scope"), &change, &fs)
+        .await
+        .unwrap();
+    change.path = "link/kept.txt".into();
+    change.kind = vcs::ContentKind::File;
+    assert!(
+        validate_file_metadata(Path::new("/scope"), &change, &fs)
+            .await
+            .is_err()
+    );
+    change.path = "ordinary-directory".into();
+    assert!(
+        validate_file_metadata(Path::new("/scope"), &change, &fs)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fs.load(Path::new("/scope/target-directory/kept.txt"))
+            .await
+            .unwrap(),
+        "untouched"
+    );
 }

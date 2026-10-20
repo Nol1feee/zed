@@ -1,8 +1,10 @@
 use crate::{
-    Content, FileOperation, FileOperationResult, InitializeParams, InitializeResult,
-    MAX_MESSAGE_BYTES, PROTOCOL_VERSION, PreparedFileOperation, ProviderCapabilities,
-    ProviderError, ProviderInfo, RepositoryDescriptor, SUPPORTED_PROTOCOL_VERSIONS, Snapshot,
-    validate_operation_token, validate_path,
+    CheckoutCatalog, CheckoutOperation, CheckoutOperationResult, Content, FileOperation,
+    FileOperationResult, InitializeParams, InitializeResult, MAX_MESSAGE_BYTES, OperationProgress,
+    PROTOCOL_VERSION, PreparedCheckoutOperation, PreparedFileOperation,
+    PreparedRepositoryOperation, ProviderCapabilities, ProviderError, ProviderInfo,
+    RepositoryDescriptor, RepositoryOperation, RepositoryState, SUPPORTED_PROTOCOL_VERSIONS,
+    Snapshot, validate_operation_token, validate_path,
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use collections::HashMap;
@@ -43,6 +45,7 @@ pub struct ProviderCommand {
 pub enum ProviderNotification {
     DidChange { repository_id: String },
     Exited { message: String },
+    OperationProgress { progress: OperationProgress },
 }
 
 pub struct ProviderConnection {
@@ -182,6 +185,22 @@ impl ProviderConnection {
                             match notification_sender.try_send(ProviderNotification::DidChange {
                                 repository_id: repository_id.to_owned(),
                             }) {
+                                Ok(()) | Err(async_channel::TrySendError::Full(_)) => {}
+                                Err(async_channel::TrySendError::Closed(_)) => break,
+                            }
+                        } else if message.get("method").and_then(Value::as_str)
+                            == Some("vcs/operationProgress")
+                        {
+                            let progress: OperationProgress = serde_json::from_value(
+                                message
+                                    .get("params")
+                                    .cloned()
+                                    .context("VCS progress has no params")?,
+                            )?;
+                            progress.validate()?;
+                            match notification_sender
+                                .try_send(ProviderNotification::OperationProgress { progress })
+                            {
                                 Ok(()) | Err(async_channel::TrySendError::Full(_)) => {}
                                 Err(async_channel::TrySendError::Closed(_)) => break,
                             }
@@ -346,6 +365,13 @@ impl ProviderConnection {
             )
             .await?;
         prepared.validate()?;
+        ensure!(
+            prepared
+                .affected_paths
+                .as_ref()
+                .is_none_or(|paths| paths.contains(&path)),
+            "Prepared file operation omitted the selected path"
+        );
         Ok(prepared)
     }
 
@@ -380,6 +406,178 @@ impl ProviderConnection {
             json!({"repositoryId": repository_id, "path": path, "operation": operation, "operationToken": operation_token}),
             REQUEST_TIMEOUT,
         ).await
+    }
+
+    pub async fn repository_state(&self, repository_id: String) -> Result<RepositoryState> {
+        self.ensure_initialized()?;
+        ensure!(!repository_id.is_empty(), "empty VCS repository id");
+        ensure!(
+            self.capabilities()
+                .is_some_and(|capabilities| !capabilities.repository_operations.is_empty()),
+            "VCS provider does not support repository state"
+        );
+        let state: RepositoryState = self
+            .request(
+                "vcs/repositoryState",
+                json!({"repositoryId": repository_id}),
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        state.validate()?;
+        Ok(state)
+    }
+
+    pub async fn prepare_repository_operation(
+        &self,
+        repository_id: String,
+        operation: RepositoryOperation,
+    ) -> Result<PreparedRepositoryOperation> {
+        let params = self.repository_operation_params(&repository_id, &operation, None)?;
+        let prepared: PreparedRepositoryOperation = self
+            .request("vcs/prepareRepositoryOperation", params, REQUEST_TIMEOUT)
+            .await?;
+        prepared.validate(&operation)?;
+        Ok(prepared)
+    }
+
+    pub async fn apply_repository_operation(
+        &self,
+        repository_id: String,
+        operation: RepositoryOperation,
+        operation_token: String,
+    ) -> Result<FileOperationResult> {
+        let params =
+            self.repository_operation_params(&repository_id, &operation, Some(&operation_token))?;
+        self.request(
+            "vcs/applyRepositoryOperation",
+            params,
+            Duration::from_secs(120),
+        )
+        .await
+    }
+
+    pub async fn reconcile_repository_operation(
+        &self,
+        repository_id: String,
+        operation: RepositoryOperation,
+        operation_token: String,
+    ) -> Result<FileOperationResult> {
+        let params =
+            self.repository_operation_params(&repository_id, &operation, Some(&operation_token))?;
+        self.request("vcs/reconcileRepositoryOperation", params, REQUEST_TIMEOUT)
+            .await
+    }
+
+    fn repository_operation_params(
+        &self,
+        repository_id: &str,
+        operation: &RepositoryOperation,
+        token: Option<&str>,
+    ) -> Result<Value> {
+        self.ensure_initialized()?;
+        ensure!(!repository_id.is_empty(), "empty VCS repository id");
+        operation.validate()?;
+        ensure!(
+            self.capabilities().is_some_and(
+                |capabilities| capabilities.supports_repository_operation(operation.kind())
+            ),
+            "VCS provider does not support this repository operation"
+        );
+        let mut params = serde_json::to_value(operation)?;
+        params["repositoryId"] = repository_id.into();
+        if let Some(token) = token {
+            validate_operation_token(token)?;
+            params["operationToken"] = token.into();
+        }
+        Ok(params)
+    }
+
+    pub async fn list_checkouts(&self, repository_id: String) -> Result<CheckoutCatalog> {
+        self.ensure_initialized()?;
+        ensure!(!repository_id.is_empty(), "empty VCS repository id");
+        ensure!(
+            self.capabilities()
+                .is_some_and(|capabilities| capabilities.checkout_catalog),
+            "VCS provider does not support a checkout catalog"
+        );
+        let catalog: CheckoutCatalog = self
+            .request(
+                "vcs/listCheckouts",
+                json!({"repositoryId": repository_id}),
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        catalog.validate()?;
+        Ok(catalog)
+    }
+
+    pub async fn prepare_checkout_operation(
+        &self,
+        repository_id: String,
+        operation: CheckoutOperation,
+    ) -> Result<PreparedCheckoutOperation> {
+        let params = self.checkout_operation_params(&repository_id, &operation, None)?;
+        let prepared: PreparedCheckoutOperation = self
+            .request("vcs/prepareCheckoutOperation", params, REQUEST_TIMEOUT)
+            .await?;
+        prepared.validate(&operation)?;
+        Ok(prepared)
+    }
+
+    pub async fn apply_checkout_operation(
+        &self,
+        repository_id: String,
+        operation: CheckoutOperation,
+        operation_token: String,
+    ) -> Result<CheckoutOperationResult> {
+        let params =
+            self.checkout_operation_params(&repository_id, &operation, Some(&operation_token))?;
+        self.request(
+            "vcs/applyCheckoutOperation",
+            params,
+            Duration::from_secs(900),
+        )
+        .await
+    }
+
+    pub async fn reconcile_checkout_operation(
+        &self,
+        repository_id: String,
+        operation: CheckoutOperation,
+        operation_token: String,
+    ) -> Result<CheckoutOperationResult> {
+        let params =
+            self.checkout_operation_params(&repository_id, &operation, Some(&operation_token))?;
+        self.request(
+            "vcs/reconcileCheckoutOperation",
+            params,
+            Duration::from_secs(120),
+        )
+        .await
+    }
+
+    fn checkout_operation_params(
+        &self,
+        repository_id: &str,
+        operation: &CheckoutOperation,
+        token: Option<&str>,
+    ) -> Result<Value> {
+        self.ensure_initialized()?;
+        ensure!(!repository_id.is_empty(), "empty VCS repository id");
+        operation.validate()?;
+        ensure!(
+            self.capabilities().is_some_and(
+                |capabilities| capabilities.supports_checkout_operation(operation.kind())
+            ),
+            "VCS provider does not support this checkout operation"
+        );
+        let mut params = serde_json::to_value(operation)?;
+        params["repositoryId"] = repository_id.into();
+        if let Some(token) = token {
+            validate_operation_token(token)?;
+            params["operationToken"] = token.into();
+        }
+        Ok(params)
     }
 
     pub async fn shutdown(&self) -> Result<()> {

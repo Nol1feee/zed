@@ -2,7 +2,7 @@
 
 use crate::{
     Content, FileOperation, FileOperationOutcome, MAX_OPERATION_TOKEN_BYTES, ProviderCommand,
-    ProviderConnection, ProviderError, ProviderNotification,
+    ProviderConnection, ProviderError, ProviderNotification, RepositoryOperation,
 };
 use futures::future::{Either, select};
 use gpui::TestAppContext;
@@ -19,6 +19,197 @@ struct Fixture {
     connection: Arc<ProviderConnection>,
     directory: tempfile::TempDir,
     events: PathBuf,
+}
+
+#[gpui::test]
+async fn repository_operations_require_capability_and_bind_the_prepared_request(
+    cx: &mut TestAppContext,
+) {
+    let read_only = fixture("normal", cx);
+    bounded(read_only.connection.initialize(), cx)
+        .await
+        .unwrap();
+    let operation = RepositoryOperation::Commit {
+        message: "Commit staged changes".into(),
+    };
+    assert!(
+        read_only
+            .connection
+            .prepare_repository_operation("fixture-repository".into(), operation.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        !events(&read_only)
+            .iter()
+            .any(|event| event["method"] == "vcs/prepareRepositoryOperation")
+    );
+    bounded(read_only.connection.shutdown(), cx).await.unwrap();
+
+    let fixture = fixture("repository-operations", cx);
+    bounded(fixture.connection.initialize(), cx).await.unwrap();
+    let state = fixture
+        .connection
+        .repository_state("fixture-repository".into())
+        .await
+        .unwrap();
+    assert_eq!(state.staged_paths, ["src/example.txt"]);
+    let prepared = fixture
+        .connection
+        .prepare_repository_operation("fixture-repository".into(), operation.clone())
+        .await
+        .unwrap();
+    let changed = RepositoryOperation::Commit {
+        message: "A different request".into(),
+    };
+    assert!(
+        fixture
+            .connection
+            .apply_repository_operation(
+                "fixture-repository".into(),
+                changed,
+                prepared.operation_token.clone(),
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        !events(&fixture)
+            .iter()
+            .any(|event| event["event"] == "repository-operation-applied")
+    );
+    assert_eq!(
+        fixture
+            .connection
+            .repository_state("fixture-repository".into())
+            .await
+            .unwrap()
+            .staged_paths,
+        ["src/example.txt"]
+    );
+    let result = fixture
+        .connection
+        .apply_repository_operation(
+            "fixture-repository".into(),
+            operation.clone(),
+            prepared.operation_token.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, FileOperationOutcome::Applied);
+    assert_token_consumed(
+        fixture
+            .connection
+            .apply_repository_operation(
+                "fixture-repository".into(),
+                operation.clone(),
+                prepared.operation_token.clone(),
+            )
+            .await
+            .unwrap_err(),
+    );
+    let changed_after_completion = RepositoryOperation::Commit {
+        message: "A different request after completion".into(),
+    };
+    assert!(
+        fixture
+            .connection
+            .apply_repository_operation(
+                "fixture-repository".into(),
+                changed_after_completion.clone(),
+                prepared.operation_token.clone(),
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .connection
+            .reconcile_repository_operation(
+                "fixture-repository".into(),
+                changed_after_completion,
+                prepared.operation_token.clone(),
+            )
+            .await
+            .is_err()
+    );
+    let reconciled = fixture
+        .connection
+        .reconcile_repository_operation(
+            "fixture-repository".into(),
+            operation,
+            prepared.operation_token,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reconciled.outcome, FileOperationOutcome::Applied);
+    assert!(
+        fixture
+            .connection
+            .repository_state("fixture-repository".into())
+            .await
+            .unwrap()
+            .staged_paths
+            .is_empty()
+    );
+    assert_eq!(
+        events(&fixture)
+            .iter()
+            .filter(|event| event["event"] == "repository-operation-applied")
+            .count(),
+        1
+    );
+    bounded(fixture.connection.shutdown(), cx).await.unwrap();
+}
+
+#[gpui::test]
+async fn branch_operation_rejects_a_changed_checkout(cx: &mut TestAppContext) {
+    let fixture = fixture("repository-clean", cx);
+    bounded(fixture.connection.initialize(), cx).await.unwrap();
+    let operation = RepositoryOperation::SwitchBranch {
+        branch_id: "topic".into(),
+    };
+    let prepared = fixture
+        .connection
+        .prepare_repository_operation("fixture-repository".into(), operation.clone())
+        .await
+        .unwrap();
+    std::fs::write(
+        fixture.events.with_extension("jsonl.state"),
+        "concurrent state",
+    )
+    .unwrap();
+    let result = fixture
+        .connection
+        .apply_repository_operation(
+            "fixture-repository".into(),
+            operation.clone(),
+            prepared.operation_token,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, FileOperationOutcome::Conflict);
+    let prepared = fixture
+        .connection
+        .prepare_repository_operation("fixture-repository".into(), operation.clone())
+        .await
+        .unwrap();
+    fixture
+        .connection
+        .apply_repository_operation(
+            "fixture-repository".into(),
+            operation,
+            prepared.operation_token,
+        )
+        .await
+        .unwrap();
+    let state = fixture
+        .connection
+        .repository_state("fixture-repository".into())
+        .await
+        .unwrap();
+    assert_eq!(state.current_branch.unwrap().id, "topic");
+    bounded(fixture.connection.shutdown(), cx).await.unwrap();
 }
 
 fn fixture(scenario: &str, cx: &TestAppContext) -> Fixture {
@@ -632,6 +823,31 @@ async fn explicit_file_operations_are_scoped_idempotent_and_reconcilable(cx: &mu
     .await
     .expect("reconcile before apply");
     assert_eq!(reconciled.outcome, FileOperationOutcome::NotApplied);
+    let consumed_token = prepared.operation_token;
+    assert_token_consumed(
+        bounded(
+            fixture.connection.apply_file_operation(
+                "fixture-repository".into(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                consumed_token.clone(),
+            ),
+            cx,
+        )
+        .await
+        .unwrap_err(),
+    );
+    let prepared = bounded(
+        fixture.connection.prepare_file_operation(
+            "fixture-repository".into(),
+            "src/example.txt".into(),
+            FileOperation::Stage,
+        ),
+        cx,
+    )
+    .await
+    .expect("fresh preparation after terminal reconciliation");
+    assert_ne!(prepared.operation_token, consumed_token);
     let sibling = bounded(
         fixture.connection.prepare_file_operation(
             "fixture-repository".into(),
@@ -654,8 +870,20 @@ async fn explicit_file_operations_are_scoped_idempotent_and_reconcilable(cx: &mu
     .await
     .expect("stage sibling");
     assert_eq!(sibling_result.outcome, FileOperationOutcome::Applied);
-    for _ in 0..2 {
-        let applied = bounded(
+    let applied = bounded(
+        fixture.connection.apply_file_operation(
+            "fixture-repository".into(),
+            "src/example.txt".into(),
+            FileOperation::Stage,
+            prepared.operation_token.clone(),
+        ),
+        cx,
+    )
+    .await
+    .expect("apply fresh token");
+    assert_eq!(applied.outcome, FileOperationOutcome::Applied);
+    assert_token_consumed(
+        bounded(
             fixture.connection.apply_file_operation(
                 "fixture-repository".into(),
                 "src/example.txt".into(),
@@ -665,9 +893,8 @@ async fn explicit_file_operations_are_scoped_idempotent_and_reconcilable(cx: &mu
             cx,
         )
         .await
-        .expect("stage or acknowledge duplicate");
-        assert_eq!(applied.outcome, FileOperationOutcome::Applied);
-    }
+        .unwrap_err(),
+    );
     let unstage = bounded(
         fixture.connection.prepare_file_operation(
             "fixture-repository".into(),
@@ -690,6 +917,19 @@ async fn explicit_file_operations_are_scoped_idempotent_and_reconcilable(cx: &mu
     .await
     .expect("unstage selected file");
     assert_eq!(applied.outcome, FileOperationOutcome::Applied);
+    assert_token_consumed(
+        bounded(
+            fixture.connection.apply_file_operation(
+                "fixture-repository".into(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                prepared.operation_token,
+            ),
+            cx,
+        )
+        .await
+        .unwrap_err(),
+    );
     bounded(fixture.connection.shutdown(), cx)
         .await
         .expect("shutdown");
@@ -753,13 +993,27 @@ async fn stale_file_operation_token_is_a_conflict_without_a_mutation(cx: &mut Te
             "fixture-repository".into(),
             "src/example.txt".into(),
             FileOperation::Stage,
-            prepared.operation_token,
+            prepared.operation_token.clone(),
         ),
         cx,
     )
     .await
     .expect("reconcile conflict");
     assert_eq!(reconciled.outcome, FileOperationOutcome::Conflict);
+    std::fs::write(format!("{}.state", fixture.events.display()), "").unwrap();
+    assert_token_consumed(
+        bounded(
+            fixture.connection.apply_file_operation(
+                "fixture-repository".into(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                prepared.operation_token,
+            ),
+            cx,
+        )
+        .await
+        .unwrap_err(),
+    );
     bounded(fixture.connection.shutdown(), cx)
         .await
         .expect("shutdown");
@@ -910,4 +1164,508 @@ async fn file_operation_inputs_and_prepared_tokens_are_validated(cx: &mut TestAp
     bounded(invalid.connection.shutdown(), cx)
         .await
         .expect("shutdown");
+}
+
+#[gpui::test]
+async fn checkout_catalog_and_write_capabilities_are_independent(cx: &mut TestAppContext) {
+    for scenario in ["normal", "checkout-read-only"] {
+        let fixture = fixture(scenario, cx);
+        bounded(fixture.connection.initialize(), cx).await.unwrap();
+        let catalog = bounded(
+            fixture
+                .connection
+                .list_checkouts("fixture-repository".into()),
+            cx,
+        )
+        .await;
+        if scenario == "normal" {
+            assert!(catalog.is_err());
+        } else {
+            assert_eq!(catalog.unwrap().checkouts.len(), 5);
+        }
+        let operation = crate::CheckoutOperation::Open {
+            checkout_id: "fixture-checkout".into(),
+        };
+        assert!(
+            bounded(
+                fixture
+                    .connection
+                    .prepare_checkout_operation("fixture-repository".into(), operation.clone()),
+                cx
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            bounded(
+                fixture.connection.apply_checkout_operation(
+                    "fixture-repository".into(),
+                    operation.clone(),
+                    "opaque-token".into()
+                ),
+                cx
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            bounded(
+                fixture.connection.reconcile_checkout_operation(
+                    "fixture-repository".into(),
+                    operation,
+                    "opaque-token".into()
+                ),
+                cx
+            )
+            .await
+            .is_err()
+        );
+        bounded(fixture.connection.shutdown(), cx).await.unwrap();
+        assert!(!events(&fixture).iter().any(|event| {
+            event["method"]
+                .as_str()
+                .is_some_and(|method| method.ends_with("CheckoutOperation"))
+        }));
+    }
+}
+
+#[gpui::test]
+async fn checkout_transport_returns_prepared_target_and_verified_identity(cx: &mut TestAppContext) {
+    let fixture = fixture("checkouts", cx);
+    bounded(fixture.connection.initialize(), cx).await.unwrap();
+    let operation = crate::CheckoutOperation::Open {
+        checkout_id: "unmounted-checkout".into(),
+    };
+    let prepared = bounded(
+        fixture
+            .connection
+            .prepare_checkout_operation("fixture-repository".into(), operation.clone()),
+        cx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(prepared.checkout.as_ref().unwrap().id, "unmounted-checkout");
+    let result = bounded(
+        fixture.connection.apply_checkout_operation(
+            "fixture-repository".into(),
+            operation.clone(),
+            prepared.operation_token,
+        ),
+        cx,
+    )
+    .await
+    .unwrap();
+    result
+        .validate(
+            &operation,
+            &prepared.target_root_uri,
+            prepared.checkout.as_ref(),
+        )
+        .unwrap();
+    assert_eq!(
+        result.checkout.unwrap().state,
+        crate::CheckoutState::Mounted
+    );
+    bounded(fixture.connection.shutdown(), cx).await.unwrap();
+}
+
+#[test]
+fn checkout_result_must_preserve_prepared_root_and_existing_identity() {
+    let operation = crate::CheckoutOperation::Open {
+        checkout_id: "existing".into(),
+    };
+    let checkout: crate::CheckoutDescriptor = serde_json::from_value(json!({
+        "id": "existing", "name": "Existing", "rootUri": "file:///checkouts/existing",
+        "scopeUri": "file:///checkouts/existing/project", "state": "mounted",
+        "owned": true, "operations": ["open"], "preparation": "ready"
+    }))
+    .unwrap();
+    let mut result = crate::CheckoutOperationResult {
+        outcome: FileOperationOutcome::Applied,
+        checkout: Some(checkout.clone()),
+    };
+    result
+        .validate(&operation, &checkout.root_uri, Some(&checkout))
+        .unwrap();
+    result.checkout.as_mut().unwrap().id = "replacement".into();
+    assert!(
+        result
+            .validate(&operation, &checkout.root_uri, Some(&checkout))
+            .is_err()
+    );
+    result.checkout = None;
+    assert!(
+        result
+            .validate(&operation, &checkout.root_uri, Some(&checkout))
+            .is_err()
+    );
+    let mut invalid = checkout;
+    invalid.scope_uri = "file:///another/project".into();
+    assert!(invalid.validate().is_err());
+}
+
+#[test]
+fn applied_removal_cannot_report_a_live_checkout() {
+    let operation = crate::CheckoutOperation::Remove {
+        checkout_id: "existing".into(),
+    };
+    let mut checkout: crate::CheckoutDescriptor = serde_json::from_value(json!({
+        "id": "existing", "name": "Existing", "rootUri": "file:///checkouts/existing",
+        "scopeUri": "file:///checkouts/existing/project", "state": "mounted",
+        "owned": true, "operations": ["open"], "preparation": "ready"
+    }))
+    .unwrap();
+    let expected = checkout.clone();
+    for state in [
+        crate::CheckoutState::Mounted,
+        crate::CheckoutState::Unmounted,
+        crate::CheckoutState::Busy,
+    ] {
+        checkout.state = state;
+        let result = crate::CheckoutOperationResult {
+            outcome: FileOperationOutcome::Applied,
+            checkout: Some(checkout.clone()),
+        };
+        assert!(
+            result
+                .validate(&operation, &expected.root_uri, Some(&expected))
+                .is_err()
+        );
+    }
+    checkout.state = crate::CheckoutState::Missing;
+    checkout.operations.clear();
+    crate::CheckoutOperationResult {
+        outcome: FileOperationOutcome::Applied,
+        checkout: Some(checkout),
+    }
+    .validate(&operation, &expected.root_uri, Some(&expected))
+    .unwrap();
+    crate::CheckoutOperationResult {
+        outcome: FileOperationOutcome::Applied,
+        checkout: None,
+    }
+    .validate(&operation, &expected.root_uri, Some(&expected))
+    .unwrap();
+}
+
+#[test]
+fn optional_file_operation_metadata_keeps_legacy_responses_valid() {
+    let legacy: crate::PreparedFileOperation =
+        serde_json::from_value(json!({"operationToken": "legacy"})).unwrap();
+    legacy.validate().unwrap();
+    assert!(legacy.affected_paths.is_none());
+    assert!(legacy.summary.is_none());
+    let prepared: crate::PreparedFileOperation = serde_json::from_value(json!({
+        "operationToken": "typed", "affectedPaths": ["new.txt", "old.txt"], "summary": "Restore both paths"
+    })).unwrap();
+    prepared.validate().unwrap();
+    assert_eq!(prepared.affected_paths.unwrap(), ["new.txt", "old.txt"]);
+}
+
+fn assert_token_consumed(error: anyhow::Error) {
+    let error = error
+        .downcast_ref::<ProviderError>()
+        .expect("typed consumed-token error");
+    assert_eq!(error.data.as_ref().unwrap()["kind"], "tokenConsumed");
+}
+
+#[gpui::test]
+async fn repository_terminal_tokens_cannot_rewrite_state_after_aba(cx: &mut TestAppContext) {
+    let fixture = fixture("repository-clean", cx);
+    bounded(fixture.connection.initialize(), cx).await.unwrap();
+    let topic = crate::RepositoryOperation::SwitchBranch {
+        branch_id: "topic".into(),
+    };
+    let main = crate::RepositoryOperation::SwitchBranch {
+        branch_id: "main".into(),
+    };
+    let unused = bounded(
+        fixture
+            .connection
+            .prepare_repository_operation("fixture-repository".into(), topic.clone()),
+        cx,
+    )
+    .await
+    .unwrap();
+    let result = bounded(
+        fixture.connection.reconcile_repository_operation(
+            "fixture-repository".into(),
+            topic.clone(),
+            unused.operation_token.clone(),
+        ),
+        cx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.outcome, FileOperationOutcome::NotApplied);
+    assert_token_consumed(
+        bounded(
+            fixture.connection.apply_repository_operation(
+                "fixture-repository".into(),
+                topic.clone(),
+                unused.operation_token.clone(),
+            ),
+            cx,
+        )
+        .await
+        .unwrap_err(),
+    );
+
+    let first = bounded(
+        fixture
+            .connection
+            .prepare_repository_operation("fixture-repository".into(), topic.clone()),
+        cx,
+    )
+    .await
+    .unwrap();
+    assert_ne!(first.operation_token, unused.operation_token);
+    let applied = bounded(
+        fixture.connection.apply_repository_operation(
+            "fixture-repository".into(),
+            topic.clone(),
+            first.operation_token.clone(),
+        ),
+        cx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(applied.outcome, FileOperationOutcome::Applied);
+    let second = bounded(
+        fixture
+            .connection
+            .prepare_repository_operation("fixture-repository".into(), main.clone()),
+        cx,
+    )
+    .await
+    .unwrap();
+    bounded(
+        fixture.connection.apply_repository_operation(
+            "fixture-repository".into(),
+            main,
+            second.operation_token,
+        ),
+        cx,
+    )
+    .await
+    .unwrap();
+    assert_token_consumed(
+        bounded(
+            fixture.connection.apply_repository_operation(
+                "fixture-repository".into(),
+                topic.clone(),
+                first.operation_token,
+            ),
+            cx,
+        )
+        .await
+        .unwrap_err(),
+    );
+
+    let stale = bounded(
+        fixture
+            .connection
+            .prepare_repository_operation("fixture-repository".into(), topic.clone()),
+        cx,
+    )
+    .await
+    .unwrap();
+    std::fs::write(format!("{}.state", fixture.events.display()), "changed").unwrap();
+    let conflicted = bounded(
+        fixture.connection.reconcile_repository_operation(
+            "fixture-repository".into(),
+            topic.clone(),
+            stale.operation_token.clone(),
+        ),
+        cx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(conflicted.outcome, FileOperationOutcome::Conflict);
+    std::fs::write(format!("{}.state", fixture.events.display()), "").unwrap();
+    assert_token_consumed(
+        bounded(
+            fixture.connection.apply_repository_operation(
+                "fixture-repository".into(),
+                topic,
+                stale.operation_token,
+            ),
+            cx,
+        )
+        .await
+        .unwrap_err(),
+    );
+    let state = bounded(
+        fixture
+            .connection
+            .repository_state("fixture-repository".into()),
+        cx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(state.current_branch.unwrap().id, "main");
+    bounded(fixture.connection.shutdown(), cx).await.unwrap();
+    assert_eq!(
+        events(&fixture)
+            .iter()
+            .filter(|event| event["event"] == "repository-operation-applied")
+            .count(),
+        2
+    );
+}
+
+#[gpui::test]
+async fn checkout_terminal_tokens_cannot_remount_after_aba(cx: &mut TestAppContext) {
+    let fixture = fixture("checkouts", cx);
+    bounded(fixture.connection.initialize(), cx).await.unwrap();
+    let open = crate::CheckoutOperation::Open {
+        checkout_id: "unmounted-checkout".into(),
+    };
+    let suspend = crate::CheckoutOperation::Suspend {
+        checkout_id: "unmounted-checkout".into(),
+    };
+    let unused = bounded(
+        fixture
+            .connection
+            .prepare_checkout_operation("fixture-repository".into(), open.clone()),
+        cx,
+    )
+    .await
+    .unwrap();
+    let result = bounded(
+        fixture.connection.reconcile_checkout_operation(
+            "fixture-repository".into(),
+            open.clone(),
+            unused.operation_token.clone(),
+        ),
+        cx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.outcome, FileOperationOutcome::NotApplied);
+    assert_token_consumed(
+        bounded(
+            fixture.connection.apply_checkout_operation(
+                "fixture-repository".into(),
+                open.clone(),
+                unused.operation_token.clone(),
+            ),
+            cx,
+        )
+        .await
+        .unwrap_err(),
+    );
+
+    let first = bounded(
+        fixture
+            .connection
+            .prepare_checkout_operation("fixture-repository".into(), open.clone()),
+        cx,
+    )
+    .await
+    .unwrap();
+    assert_ne!(first.operation_token, unused.operation_token);
+    bounded(
+        fixture.connection.apply_checkout_operation(
+            "fixture-repository".into(),
+            open.clone(),
+            first.operation_token.clone(),
+        ),
+        cx,
+    )
+    .await
+    .unwrap();
+    let second = bounded(
+        fixture
+            .connection
+            .prepare_checkout_operation("fixture-repository".into(), suspend.clone()),
+        cx,
+    )
+    .await
+    .unwrap();
+    bounded(
+        fixture.connection.apply_checkout_operation(
+            "fixture-repository".into(),
+            suspend,
+            second.operation_token,
+        ),
+        cx,
+    )
+    .await
+    .unwrap();
+    assert_token_consumed(
+        bounded(
+            fixture.connection.apply_checkout_operation(
+                "fixture-repository".into(),
+                open.clone(),
+                first.operation_token,
+            ),
+            cx,
+        )
+        .await
+        .unwrap_err(),
+    );
+
+    let stale = bounded(
+        fixture
+            .connection
+            .prepare_checkout_operation("fixture-repository".into(), open.clone()),
+        cx,
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        format!("{}.checkout-state", fixture.events.display()),
+        "changed",
+    )
+    .unwrap();
+    let conflicted = bounded(
+        fixture.connection.reconcile_checkout_operation(
+            "fixture-repository".into(),
+            open.clone(),
+            stale.operation_token.clone(),
+        ),
+        cx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(conflicted.outcome, FileOperationOutcome::Conflict);
+    std::fs::write(format!("{}.checkout-state", fixture.events.display()), "").unwrap();
+    assert_token_consumed(
+        bounded(
+            fixture.connection.apply_checkout_operation(
+                "fixture-repository".into(),
+                open,
+                stale.operation_token,
+            ),
+            cx,
+        )
+        .await
+        .unwrap_err(),
+    );
+    let catalog = bounded(
+        fixture
+            .connection
+            .list_checkouts("fixture-repository".into()),
+        cx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        catalog
+            .checkouts
+            .iter()
+            .find(|checkout| checkout.id == "unmounted-checkout")
+            .unwrap()
+            .state,
+        crate::CheckoutState::Unmounted
+    );
+    bounded(fixture.connection.shutdown(), cx).await.unwrap();
+    assert_eq!(
+        events(&fixture)
+            .iter()
+            .filter(|event| event["event"] == "checkout-operation-applied")
+            .count(),
+        2
+    );
 }

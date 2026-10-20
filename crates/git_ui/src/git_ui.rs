@@ -60,12 +60,14 @@ pub mod stash_picker;
 pub mod text_diff_view;
 pub mod unstaged_diff;
 pub mod vcs_panel;
+mod vcs_repository_ui;
 
 pub use blame_ui::GitBlameStatus;
 pub use conflict_view::MergeConflictIndicator;
 
 pub fn init(cx: &mut App) {
     vcs_panel::init(cx);
+    git_ui_core::vcs_checkout_picker::init(cx);
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
     git_graph::init(cx);
@@ -135,6 +137,19 @@ pub fn init(cx: &mut App) {
         );
 
         workspace.register_action(|workspace, _: &zed_actions::git::Worktree, window, cx| {
+            let project = workspace.project().read(cx);
+            if project.repositories(cx).is_empty()
+                && project.vcs_store().is_some_and(|store| {
+                    let store = store.read(cx);
+                    store
+                        .repositories()
+                        .iter()
+                        .any(|repository| store.checkout_catalog_available(&repository.key))
+                })
+            {
+                git_ui_core::vcs_checkout_picker::show(workspace, None, window, cx);
+                return;
+            }
             let focused_dock = workspace.focused_dock_position(window, cx);
             let project = workspace.project().clone();
             let workspace_handle = workspace.weak_handle();

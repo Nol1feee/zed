@@ -336,6 +336,7 @@ impl Render for TitleBar {
                                         .children(self.render_project_host(cx))
                                         .child(self.render_project_name(project_name, window, cx))
                                 })
+                                .children(self.render_provider_checkouts(cx))
                                 .when_some(
                                     repository.filter(|_| is_git_enabled),
                                     |title_bar, repository| {
@@ -493,6 +494,9 @@ impl TitleBar {
                 _ => {}
             }),
         );
+        if let Some(store) = project.read(cx).vcs_store().cloned() {
+            subscriptions.push(cx.observe(&store, |_, _, cx| cx.notify()));
+        }
         subscriptions.push(cx.observe(&user_store, |_a, _, cx| cx.notify()));
         if let Some(workspace_entity) = workspace.weak_handle().upgrade() {
             subscriptions.push(cx.subscribe(
@@ -925,6 +929,31 @@ impl TitleBar {
                 },
             )
             .anchor(gpui::Anchor::TopLeft)
+    }
+
+    fn render_provider_checkouts(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !TitleBarSettings::get_global(cx).show_worktree_name {
+            return None;
+        }
+        let store = self.project.read(cx).vcs_store()?.read(cx);
+        if !store
+            .repositories()
+            .iter()
+            .any(|repository| store.checkout_catalog_available(&repository.key))
+        {
+            return None;
+        }
+        Some(
+            Button::new("vcs-checkout-picker-trigger", "Checkouts")
+                .label_size(LabelSize::Small)
+                .on_click(|_, window, cx| {
+                    window.dispatch_action(
+                        Box::new(git_ui_core::vcs_checkout_picker::OpenCheckouts),
+                        cx,
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     fn render_worktree_and_branch(
