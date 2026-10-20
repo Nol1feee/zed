@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Neutral protocol-1 stdio fixture; no VCS, index, or repository metadata needed.
+"""Neutral stdio fixture; default protocol 1 needs no VCS or repository metadata.
 
 Usage: python3 crates/vcs/tests/fixture_provider.py --scenario normal --events FILE
 Feed Content-Length framed JSON-RPC. `--events` records test-only lifecycle events.
@@ -18,6 +18,14 @@ later snapshots from r42 to r43 while older snapshot contents remain pinned.
 pending while still processing snapshots, cancellation, and shutdown.
 `pending-refresh` replies to the first snapshot, then holds later snapshots and
 records refresh-held without blocking cancellation or shutdown.
+`writable` negotiates protocol 2 and maintains synthetic per-file staged state.
+Changing FILE.state invalidates prepared tokens; duplicate apply is idempotent.
+`write-error` and `write-invalid-result` apply once before sending an ambiguous
+response, so callers must reconcile the token.
+`write-unknown` also rejects reconciliation until FILE.reconcile exists.
+`write-reconcile-crash` applies before returning an error and exits on every reconcile.
+`prepare-pending` holds preparation until FILE.release exists and remains
+responsive to cancellation and shutdown while waiting.
 """
 import argparse
 import json
@@ -26,13 +34,21 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
+import time
 
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 EOF_TEXT = "baseline — r42\n" * 8192
 SCENARIOS = ("normal", "reply-eof", "crash", "error", "pending", "malformed",
              "oversized", "stderr-flood", "descendant", "early-exit", "reordered",
              "hang-after-exit", "exit-leaves-descendant", "polling-content",
-             "changing-slow-content", "pending-refresh")
+             "changing-slow-content", "pending-refresh",
+             "writable", "write-error", "write-invalid-result", "write-unknown", "write-reconcile-crash", "prepare-pending",
+             "v2-read-only", "v2-no-file-operations", "v2-stage-only",
+             "v2-contradictory", "v1-writable", "invalid-token")
+WRITABLE_SCENARIOS = {"writable", "write-error", "write-invalid-result", "write-unknown", "write-reconcile-crash",
+                      "prepare-pending", "v2-stage-only", "invalid-token"}
+SEND_LOCK = threading.Lock()
 
 
 def read_message():
@@ -56,8 +72,9 @@ def read_message():
 
 def send(message):
     body = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode()
-    sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
-    sys.stdout.buffer.flush()
+    with SEND_LOCK:
+        sys.stdout.buffer.write(f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+        sys.stdout.buffer.flush()
 
 
 def reply(identifier, result=None, error=None):
@@ -105,6 +122,23 @@ def main():
     snapshots = 0
     held_snapshot = None
     snapshot_revisions = {}
+    file_states = {}
+    operations = {}
+    apply_count = 0
+
+    def file_state(path):
+        marker = Path(str(args.events) + ".state") if args.events else None
+        revision = marker.read_text() if marker and marker.is_file() else ""
+        generation, staged = file_states.get(path, (0, False))
+        return revision, generation, staged
+
+    def release_preparation(identifier, token):
+        marker = Path(str(args.events) + ".release") if args.events else None
+        while marker is None or not marker.is_file():
+            time.sleep(0.01)
+        record("prepare-released", id=identifier)
+        reply(identifier, {"operationToken": token})
+
     while (message := read_message()) is not None:
         method, identifier = message.get("method"), message.get("id")
         params = message.get("params") or {}
@@ -129,7 +163,23 @@ def main():
             if args.scenario == "stderr-flood":
                 sys.stderr.buffer.write(b"discarded-prefix\n" + ("diagnostic ✓\n" * 40000).encode() + b"fixture-stderr-tail\n")
                 sys.stderr.buffer.flush()
-            reply(identifier, {"protocolVersion": 1, "serverInfo": {"name": "fixture", "version": "1"}, "capabilities": {"readOnly": True}})
+            record("initialize-received", protocol_version=params.get("protocolVersion"),
+                   supported_protocol_versions=params.get("supportedProtocolVersions"))
+            version, capabilities = 1, {"readOnly": True}
+            if args.scenario in WRITABLE_SCENARIOS or args.scenario.startswith("v2-"):
+                version = 2
+                capabilities = {"readOnly": False, "fileOperations": ["stage", "unstage"]}
+                if args.scenario == "v2-read-only":
+                    capabilities = {"readOnly": True}
+                elif args.scenario == "v2-no-file-operations":
+                    capabilities = {"readOnly": False}
+                elif args.scenario == "v2-stage-only":
+                    capabilities["fileOperations"] = ["stage"]
+                elif args.scenario == "v2-contradictory":
+                    capabilities["readOnly"] = True
+            elif args.scenario == "v1-writable":
+                capabilities = {"readOnly": False, "fileOperations": ["stage"]}
+            reply(identifier, {"protocolVersion": version, "serverInfo": {"name": "fixture", "version": "1"}, "capabilities": capabilities})
         elif method == "vcs/discover":
             reply(identifier, [{"id": "fixture-repository", "rootUri": params["scopeUri"], "scopeUri": params["scopeUri"],
                                 "displayName": "Fixture", "baselines": [{"id": "submitted", "label": "Submitted changes"},
@@ -197,6 +247,63 @@ def main():
             reply(identifier, content)
             if args.scenario == "reply-eof":
                 return 0
+        elif method in ("vcs/prepareFileOperation", "vcs/applyFileOperation",
+                        "vcs/reconcileFileOperation"):
+            if args.scenario not in WRITABLE_SCENARIOS:
+                reply(identifier, error={"code": -32601, "message": "File operations unavailable"})
+                continue
+            path, operation = params.get("path"), params.get("operation")
+            if (params.get("repositoryId") != "fixture-repository" or not isinstance(path, str)
+                    or not path or operation not in ("stage", "unstage")
+                    or args.scenario == "v2-stage-only" and operation != "stage"):
+                reply(identifier, error={"code": -32602, "message": "Invalid file operation"})
+                continue
+            if method == "vcs/prepareFileOperation":
+                token = f"fixture:operation:{len(operations) + 1}"
+                operations[token] = {"path": path, "operation": operation,
+                                     "before": file_state(path), "after": None}
+                if args.scenario == "prepare-pending":
+                    record("prepare-held", id=identifier, path=path)
+                    threading.Thread(target=release_preparation,
+                                     args=(identifier, token), daemon=True).start()
+                else:
+                    reply(identifier, {"operationToken": "" if args.scenario == "invalid-token" else token})
+                continue
+            prepared = operations.get(params.get("operationToken"))
+            state = file_state(path)
+            if method == "vcs/reconcileFileOperation" and args.scenario == "write-reconcile-crash":
+                record("reconcile-crashed", id=identifier)
+                return 23
+            if method == "vcs/reconcileFileOperation" and args.scenario == "write-unknown":
+                marker = Path(str(args.events) + ".reconcile") if args.events else None
+                if marker is None or not marker.is_file():
+                    reply(identifier, error={"code": -32046, "message": "Reconciliation unavailable",
+                                             "data": {"kind": "outcomeUnknown"}})
+                    continue
+            if (prepared is None or prepared["path"] != path
+                    or prepared["operation"] != operation):
+                outcome = "conflict"
+            elif prepared["after"] == state:
+                outcome = "applied"
+            elif prepared["after"] is not None or prepared["before"] != state:
+                outcome = "conflict"
+            elif method == "vcs/reconcileFileOperation":
+                outcome = "notApplied"
+            else:
+                file_states[path] = (state[1] + 1, operation == "stage")
+                prepared["after"] = file_state(path)
+                apply_count += 1
+                record("file-operation-applied", path=path, operation=operation,
+                       count=apply_count, staged=operation == "stage")
+                if args.scenario in ("write-error", "write-unknown", "write-reconcile-crash"):
+                    reply(identifier, error={"code": -32045, "message": "Apply acknowledgement lost",
+                                             "data": {"kind": "outcomeUnknown"}})
+                    continue
+                if args.scenario == "write-invalid-result":
+                    reply(identifier, {"outcome": "unknown"})
+                    continue
+                outcome = "applied"
+            reply(identifier, {"outcome": outcome})
         elif method == "shutdown":
             record("shutdown-received")
             reply(identifier)

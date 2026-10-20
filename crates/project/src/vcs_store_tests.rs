@@ -285,6 +285,15 @@ async fn trust_precedes_callback_and_spawn_and_read_only_rejects_git_init(cx: &m
     let repository = ready(&fixture, cx).await;
     assert_eq!(extension.callbacks.load(Ordering::SeqCst), 1);
     assert_eq!(repository.snapshot.unwrap().revision_id, "r42");
+    let mutation = fixture.store.update(cx, |store, cx| {
+        store.run_file_operation(
+            repository.key.clone(),
+            "src/example.txt".into(),
+            FileOperation::Stage,
+            cx,
+        )
+    });
+    assert!(mutation.await.is_err());
     let initialize_repository = fixture.project.read_with(cx, |project, cx| {
         project.git_init(Arc::from(fixture.directory.path()), "main".into(), cx)
     });
@@ -320,6 +329,353 @@ async fn trust_precedes_callback_and_spawn_and_read_only_rejects_git_init(cx: &m
         std::fs::read_to_string(fixture.directory.path().join("trust-fixture.jsonl")).unwrap();
     assert!(events.contains("shutdown-received"));
     assert!(!events.contains("vcs/commit"));
+    assert!(!events.contains("vcs/prepareFileOperation"));
+}
+
+#[gpui::test]
+async fn file_operations_preserve_scope_and_refuse_dirty_conflicted_and_git_files(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, true).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("file-operations", fixture.directory.path(), "writable").register(cx);
+    let repository = ready(&fixture, cx).await;
+    fixture
+        .project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    for path in ["nested/file.txt", "../src/example.txt", "src/missing.txt"] {
+        let task = fixture.store.update(cx, |store, cx| {
+            store.run_file_operation(
+                repository.key.clone(),
+                path.into(),
+                FileOperation::Stage,
+                cx,
+            )
+        });
+        assert!(task.await.is_err(), "{path}");
+    }
+    let mut foreign_key = repository.key.clone();
+    foreign_key.worktree_id = WorktreeId::from_usize(999_999);
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| {
+                store.run_file_operation(
+                    foreign_key,
+                    "src/example.txt".into(),
+                    FileOperation::Stage,
+                    cx,
+                )
+            })
+            .await
+            .is_err()
+    );
+    for operation in [FileOperation::Stage, FileOperation::Unstage] {
+        fixture
+            .store
+            .update(cx, |store, cx| {
+                store.run_file_operation(
+                    repository.key.clone(),
+                    "src/example.txt".into(),
+                    operation,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        ready(&fixture, cx).await;
+    }
+    let buffer = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "unsaved\n")], None, cx)
+    });
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_file_operation(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                cx,
+            )
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unsaved"));
+    buffer.update(cx, |buffer, _| buffer.set_conflict());
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_file_operation(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Unstage,
+                cx,
+            )
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("conflict"));
+    let events =
+        std::fs::read_to_string(fixture.directory.path().join("file-operations.jsonl")).unwrap();
+    let applied: Vec<serde_json::Value> = events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"] == "file-operation-applied")
+        .collect();
+    assert_eq!(applied.len(), 2);
+    assert!(
+        applied
+            .iter()
+            .all(|event| event["path"] == "src/example.txt")
+    );
+    assert_eq!(
+        fixture
+            .fs
+            .load(&fixture.directory.path().join("src/example.txt"))
+            .await
+            .unwrap(),
+        "working text\n"
+    );
+    assert_eq!(
+        fixture
+            .fs
+            .load(&fixture.directory.path().join("nested/file.txt"))
+            .await
+            .unwrap(),
+        "Git content"
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn file_operation_rechecks_buffer_after_prepare_and_rejects_double_dispatch(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "prepare-buffer",
+        fixture.directory.path(),
+        "prepare-pending",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    let buffer = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let task = fixture.store.update(cx, |store, cx| {
+        store.run_file_operation(
+            repository.key.clone(),
+            "src/example.txt".into(),
+            FileOperation::Stage,
+            cx,
+        )
+    });
+    let events_path = fixture.directory.path().join("prepare-buffer.jsonl");
+    provider_event(events_path.clone(), "prepare-held").await;
+    let duplicate = fixture.store.update(cx, |store, cx| {
+        store.run_file_operation(
+            repository.key.clone(),
+            "src/example.txt".into(),
+            FileOperation::Stage,
+            cx,
+        )
+    });
+    assert!(duplicate.await.unwrap_err().to_string().contains("running"));
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "edited during prepare\n")], None, cx)
+    });
+    std::fs::write(events_path.with_extension("jsonl.release"), "release").unwrap();
+    assert!(task.await.unwrap_err().to_string().contains("unsaved"));
+    fixture.store.read_with(cx, |store, _| {
+        assert!(!store.file_operation_running());
+        assert!(store.pending_file_operations.is_empty());
+    });
+    let events = std::fs::read_to_string(events_path).unwrap();
+    assert!(!events.contains("vcs/applyFileOperation"));
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn file_operation_unknown_outcome_requires_reconciliation_before_retry(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "unknown-operation",
+        fixture.directory.path(),
+        "write-unknown",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    let first = fixture.store.update(cx, |store, cx| {
+        store.run_file_operation(
+            repository.key.clone(),
+            "src/example.txt".into(),
+            FileOperation::Stage,
+            cx,
+        )
+    });
+    assert!(first.await.unwrap_err().to_string().contains("unknown"));
+    let duplicate = fixture.store.update(cx, |store, cx| {
+        store.run_file_operation(
+            repository.key.clone(),
+            "src/example.txt".into(),
+            FileOperation::Stage,
+            cx,
+        )
+    });
+    assert!(duplicate.await.unwrap_err().to_string().contains("unknown"));
+    let events_path = fixture.directory.path().join("unknown-operation.jsonl");
+    std::fs::write(events_path.with_extension("jsonl.reconcile"), "ready").unwrap();
+    fixture.store.update(cx, |store, cx| store.refresh_all(cx));
+    cx.condition(&fixture.store, |store, _| {
+        !store.file_operation_running() && store.pending_file_operations.is_empty()
+    })
+    .await;
+    fixture.store.read_with(cx, |store, _| {
+        assert!(store.file_operation_error(&repository.key).is_none());
+    });
+    let events = std::fs::read_to_string(events_path).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"method\": \"vcs/applyFileOperation\""))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"event\": \"file-operation-applied\""))
+            .count(),
+        1
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn unresolved_file_operation_survives_worktree_identity_change(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "reopened-operation",
+        fixture.directory.path(),
+        "write-unknown",
+    )
+    .register(cx);
+    let original = ready(&fixture, cx).await;
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| {
+                store.run_file_operation(
+                    original.key.clone(),
+                    "src/example.txt".into(),
+                    FileOperation::Stage,
+                    cx,
+                )
+            })
+            .await
+            .is_err()
+    );
+    fixture.project.update(cx, |project, cx| {
+        project.remove_worktree(fixture.worktree_id, cx)
+    });
+    cx.condition(&fixture.store, |store, _| store.repositories().is_empty())
+        .await;
+    let reopened_id = open_worktree(&fixture, fixture.directory.path(), cx).await;
+    assert_ne!(fixture.worktree_id, reopened_id);
+    trust_worktree(&fixture, reopened_id, cx);
+    let reopened = ready(&fixture, cx).await;
+    cx.condition(&fixture.store, |store, _| !store.file_operation_running())
+        .await;
+    fixture.store.read_with(cx, |store, _| {
+        assert!(store.file_operation_unresolved(&reopened.key));
+    });
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_file_operation(
+                reopened.key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                cx,
+            )
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown"));
+    let events =
+        std::fs::read_to_string(fixture.directory.path().join("reopened-operation.jsonl")).unwrap();
+    assert_eq!(
+        events
+            .lines()
+            .filter(|line| line.contains("\"method\": \"vcs/applyFileOperation\""))
+            .count(),
+        1
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn crashing_reconciliation_waits_for_explicit_reconnect(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    let extension = FixtureExtension::new(
+        "crashing-reconcile",
+        fixture.directory.path(),
+        "write-reconcile-crash",
+    );
+    extension.register(cx);
+    let repository = ready(&fixture, cx).await;
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| {
+                store.run_file_operation(
+                    repository.key.clone(),
+                    "src/example.txt".into(),
+                    FileOperation::Stage,
+                    cx,
+                )
+            })
+            .await
+            .is_err()
+    );
+    cx.executor().advance_clock(Duration::from_secs(20));
+    cx.run_until_parked();
+    assert_eq!(extension.callbacks.load(Ordering::SeqCst), 1);
+    fixture.store.update(cx, |store, cx| store.refresh_all(cx));
+    cx.condition(&fixture.store, |store, _| {
+        !store.file_operation_running()
+            && store
+                .repositories
+                .values()
+                .any(|repository| !repository.connection.is_alive())
+            && extension.callbacks.load(Ordering::SeqCst) == 2
+    })
+    .await;
+    cx.executor().advance_clock(Duration::from_secs(20));
+    cx.run_until_parked();
+    assert_eq!(extension.callbacks.load(Ordering::SeqCst), 2);
+    fixture.store.read_with(cx, |store, _| {
+        assert!(store.file_operation_unresolved(&repository.key));
+    });
+    stop(&fixture, cx).await;
 }
 
 #[gpui::test]

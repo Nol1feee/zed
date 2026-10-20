@@ -1,4 +1,4 @@
-//! Read-only external source-control repositories, scoped to opened worktrees.
+//! External source-control repositories, scoped to opened worktrees.
 
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
@@ -15,8 +15,8 @@ use language::{Buffer, BufferEvent};
 use settings::WorktreeId;
 use util::{ResultExt, rel_path::RelPath};
 use vcs::{
-    ChangeStatus, Content, ProviderCommand, ProviderConnection, ProviderNotification,
-    RepositoryDescriptor, Snapshot,
+    ChangeStatus, Content, FileOperation, FileOperationOutcome, ProviderCommand,
+    ProviderConnection, ProviderNotification, RepositoryDescriptor, Snapshot,
 };
 
 use crate::{
@@ -138,6 +138,22 @@ struct Session {
     notification_task: Option<Task<()>>,
 }
 
+#[derive(Clone)]
+struct PendingFileOperation {
+    path: String,
+    operation: FileOperation,
+    token: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FileOperationScope {
+    extension_id: Arc<str>,
+    provider_id: Arc<str>,
+    repository_id: String,
+    root_uri: String,
+    scope_uri: String,
+}
+
 struct DiffState {
     repository: VcsRepositoryId,
     path: String,
@@ -190,6 +206,9 @@ pub struct VcsStore {
     discovery_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     errors: HashMap<SessionKey, SharedString>,
+    file_operation_running: bool,
+    pending_file_operations: HashMap<FileOperationScope, PendingFileOperation>,
+    file_operation_errors: HashMap<VcsRepositoryId, SharedString>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -260,6 +279,9 @@ impl VcsStore {
             discovery_task: None,
             poll_task: None,
             errors: HashMap::default(),
+            file_operation_running: false,
+            pending_file_operations: HashMap::default(),
+            file_operation_errors: HashMap::default(),
             _subscriptions: subscriptions,
         };
         store.schedule_discovery(cx);
@@ -704,6 +726,9 @@ impl VcsStore {
     }
 
     pub fn refresh_all(&mut self, cx: &mut Context<Self>) {
+        if self.file_operation_running {
+            return;
+        }
         let failed: Vec<_> = self
             .sessions
             .iter()
@@ -764,6 +789,7 @@ impl VcsStore {
     }
 
     pub fn refresh(&mut self, key: &VcsRepositoryId, cx: &mut Context<Self>) {
+        self.reconcile_file_operation(key, cx);
         self.refresh_with_reason(key, RefreshReason::Explicit, cx);
     }
 
@@ -943,6 +969,255 @@ impl VcsStore {
 
     pub fn owns_project_path(&self, path: &ProjectPath, cx: &App) -> bool {
         self.repository_for_path(path, cx).is_some()
+    }
+
+    pub fn file_operations(&self, key: &VcsRepositoryId) -> Vec<FileOperation> {
+        self.repositories
+            .get(key)
+            .and_then(|repository| repository.connection.capabilities())
+            .filter(|capabilities| !capabilities.read_only)
+            .map(|capabilities| capabilities.file_operations)
+            .unwrap_or_default()
+    }
+
+    pub fn file_operation_running(&self) -> bool {
+        self.file_operation_running
+    }
+
+    pub fn file_operation_unresolved(&self, key: &VcsRepositoryId) -> bool {
+        self.file_operation_scope(key)
+            .is_some_and(|scope| self.pending_file_operations.contains_key(&scope))
+    }
+
+    pub fn file_operation_error(&self, key: &VcsRepositoryId) -> Option<SharedString> {
+        self.file_operation_errors.get(key).cloned()
+    }
+
+    fn file_operation_scope(&self, key: &VcsRepositoryId) -> Option<FileOperationScope> {
+        let repository = self.repositories.get(key)?;
+        Some(FileOperationScope {
+            extension_id: key.extension_id.clone(),
+            provider_id: key.provider_id.clone(),
+            repository_id: key.repository_id.clone(),
+            root_uri: repository.view.descriptor.root_uri.clone(),
+            scope_uri: repository.view.descriptor.scope_uri.clone(),
+        })
+    }
+
+    fn check_file_operation(
+        &mut self,
+        key: &VcsRepositoryId,
+        path: &str,
+        operation: FileOperation,
+        cx: &mut Context<Self>,
+    ) -> Result<(Arc<ProviderConnection>, Arc<Path>)> {
+        vcs::validate_path(path)?;
+        ensure!(
+            self.trusted(key.worktree_id, cx),
+            "VCS worktree is not trusted"
+        );
+        let project_path = ProjectPath {
+            worktree_id: key.worktree_id,
+            path: Arc::from(RelPath::from_unix_str(path)?),
+        };
+        ensure!(
+            self.repository_for_path(&project_path, cx).as_ref() == Some(key),
+            "file belongs to another source-control provider"
+        );
+        ensure!(
+            self.file_operations(key).contains(&operation),
+            "VCS provider does not support this file operation"
+        );
+        let repository = self
+            .repositories
+            .get(key)
+            .context("VCS repository closed")?;
+        ensure!(
+            repository.connection.is_alive(),
+            "VCS provider is no longer running"
+        );
+        let snapshot = repository
+            .view
+            .snapshot
+            .as_ref()
+            .context("Refresh changes before modifying a file")?;
+        let change = snapshot
+            .changes
+            .iter()
+            .find(|change| change.path == path)
+            .context("File is no longer in the selected comparison; refresh changes")?;
+        ensure!(
+            change.kind == vcs::ContentKind::File && change.old_path.is_none(),
+            "File operations are unavailable for this change"
+        );
+        let project = self.project.upgrade().context("VCS project closed")?;
+        for buffer in project.read(cx).buffer_store().read(cx).buffers() {
+            if buffer.read(cx).project_path(cx).as_ref() == Some(&project_path) {
+                ensure!(
+                    !buffer.read(cx).has_conflict(),
+                    "Resolve the file's disk conflict before modifying source control"
+                );
+                ensure!(
+                    !buffer.read(cx).is_dirty(),
+                    "Save or revert the file's unsaved edits before modifying source control"
+                );
+            }
+        }
+        let root = self
+            .worktrees
+            .read(cx)
+            .worktree_for_id(key.worktree_id, cx)
+            .context("VCS worktree closed")?
+            .read(cx)
+            .abs_path();
+        Ok((repository.connection.clone(), root))
+    }
+
+    pub fn run_file_operation(
+        &mut self,
+        key: VcsRepositoryId,
+        path: String,
+        operation: FileOperation,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let result = (|| {
+            ensure!(
+                !self.file_operation_running,
+                "Another VCS file operation is running"
+            );
+            ensure!(
+                !self.file_operation_unresolved(&key),
+                "The previous operation has an unknown outcome; refresh to reconcile it"
+            );
+            let (connection, root) = self.check_file_operation(&key, &path, operation, cx)?;
+            let scope = self
+                .file_operation_scope(&key)
+                .context("VCS repository closed")?;
+            Ok((connection, root, scope))
+        })();
+        let (connection, root, scope) = match result {
+            Ok(result) => result,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        self.file_operation_running = true;
+        self.file_operation_errors.remove(&key);
+        self.notify(cx);
+        let fs = self.fs.clone();
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        // Keep reconciliation alive if the initiating panel or its waiter closes.
+        cx.spawn(async move |this, cx| {
+            let mut settled = true;
+            let result: Result<()> = async {
+                let metadata = scoped_metadata(&root, &path, &fs).await?
+                    .context("The selected file no longer exists")?;
+                ensure!(!metadata.is_dir && !metadata.is_symlink, "File operations require an ordinary file");
+                let prepared = connection.prepare_file_operation(
+                    key.repository_id.clone(), path.clone(), operation,
+                ).await?;
+                this.update(cx, |this, cx| {
+                    let (current, _) = this.check_file_operation(&key, &path, operation, cx)?;
+                    ensure!(Arc::ptr_eq(&current, &connection), "VCS provider changed while preparing the operation");
+                    this.pending_file_operations.insert(scope.clone(), PendingFileOperation {
+                        path: path.clone(), operation, token: prepared.operation_token.clone(),
+                    });
+                    anyhow::Ok(())
+                })??;
+                settled = false;
+                let outcome = match connection.apply_file_operation(
+                    key.repository_id.clone(), path.clone(), operation, prepared.operation_token.clone(),
+                ).await {
+                    Ok(result) => result.outcome,
+                    Err(error) => connection.reconcile_file_operation(
+                        key.repository_id.clone(), path.clone(), operation, prepared.operation_token,
+                    ).await.with_context(|| format!(
+                        "File operation outcome is unknown ({error:#}); refresh to reconcile before retrying"
+                    ))?.outcome,
+                };
+                settled = true;
+                match outcome {
+                    FileOperationOutcome::Applied => Ok(()),
+                    FileOperationOutcome::NotApplied => bail!("The file operation was not applied"),
+                    FileOperationOutcome::Conflict => bail!("The file changed while the operation was running; review its current state"),
+                }
+            }.await;
+            this.update(cx, |this, cx| {
+                this.file_operation_running = false;
+                if settled {
+                    this.pending_file_operations.remove(&scope);
+                }
+                if let Err(error) = &result {
+                    this.file_operation_errors.insert(key.clone(), format!("{error:#}").into());
+                }
+                if connection.is_alive() {
+                    this.refresh_with_reason(&key, RefreshReason::Explicit, cx);
+                }
+                this.notify(cx);
+            }).log_err();
+            if sender.send(result).is_err() {
+                log::debug!("VCS file operation waiter closed after reconciliation");
+            }
+        }).detach();
+        cx.spawn(async move |_, _| {
+            receiver
+                .await
+                .context("VCS file operation was interrupted")?
+        })
+    }
+
+    fn reconcile_file_operation(&mut self, key: &VcsRepositoryId, cx: &mut Context<Self>) {
+        if self.file_operation_running {
+            return;
+        }
+        let Some(scope) = self.file_operation_scope(key) else {
+            return;
+        };
+        let Some(pending) = self.pending_file_operations.get(&scope).cloned() else {
+            return;
+        };
+        let Some(repository) = self.repositories.get(key) else {
+            return;
+        };
+        let connection = repository.connection.clone();
+        if !connection.is_alive() {
+            return;
+        }
+        let key = key.clone();
+        self.file_operation_running = true;
+        self.notify(cx);
+        cx.spawn(async move |this, cx| {
+            let result = connection.reconcile_file_operation(
+                key.repository_id.clone(), pending.path, pending.operation, pending.token,
+            ).await;
+            this.update(cx, |this, cx| {
+                this.file_operation_running = false;
+                match result {
+                    Ok(result) => {
+                        this.pending_file_operations.remove(&scope);
+                        match result.outcome {
+                            FileOperationOutcome::Applied => {
+                                this.file_operation_errors.remove(&key);
+                            }
+                            FileOperationOutcome::NotApplied => {
+                                this.file_operation_errors.insert(key.clone(),
+                                    "The previous operation was not applied. You can try again.".into());
+                            }
+                            FileOperationOutcome::Conflict => {
+                                this.file_operation_errors.insert(key.clone(),
+                                    "The file changed after the previous operation. Review its current state before continuing.".into());
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        this.file_operation_errors.insert(key.clone(),
+                            format!("File operation outcome remains unknown: {error:#}").into());
+                    }
+                }
+                if connection.is_alive() {
+                    this.refresh_with_reason(&key, RefreshReason::Explicit, cx);
+                }
+                this.notify(cx);
+            }).log_err();
+        }).detach();
     }
 
     pub fn changes(&self, key: &VcsRepositoryId, cx: &App) -> Vec<vcs::Change> {

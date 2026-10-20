@@ -20,7 +20,7 @@ use project::{
 use settings::Settings;
 use ui::{Button, Color, IconButton, IconName, Label, ListItem, prelude::*};
 use util::ResultExt as _;
-use vcs::{Change, ChangeStatus, ContentKind};
+use vcs::{Change, ChangeStatus, ContentKind, FileOperation};
 use workspace::{
     Item, Panel, Workspace,
     dock::{DockPosition, PanelEvent},
@@ -36,6 +36,10 @@ actions!(
         Refresh,
         /// Opens errors and bounded stderr output from external version-control providers.
         ShowDiagnostics,
+        /// Stages the selected file through its external version-control provider.
+        StageFile,
+        /// Unstages the selected file through its external version-control provider.
+        UnstageFile,
     ]
 );
 
@@ -302,6 +306,47 @@ impl VcsPanel {
         }
     }
 
+    fn stage_file(&mut self, _: &StageFile, _: &mut Window, cx: &mut Context<Self>) {
+        self.run_file_operation(FileOperation::Stage, cx);
+    }
+
+    fn unstage_file(&mut self, _: &UnstageFile, _: &mut Window, cx: &mut Context<Self>) {
+        self.run_file_operation(FileOperation::Unstage, cx);
+    }
+
+    fn selected_file(&self) -> Option<&Row> {
+        self.rows.get(self.selected?).filter(|row| {
+            row.change
+                .as_ref()
+                .is_some_and(|change| change.kind == ContentKind::File)
+        })
+    }
+
+    fn run_file_operation(&mut self, operation: FileOperation, cx: &mut Context<Self>) {
+        let Some(row) = self.selected_file().cloned() else {
+            return;
+        };
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        self.error = None;
+        let task = store.update(cx, |store, cx| {
+            store.run_file_operation(row.repository, row.path, operation, cx)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.error = Some(format!("{error:#}").into());
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn open_diff(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(row) = self.rows.get(index).cloned() else {
             return;
@@ -501,18 +546,88 @@ impl Render for VcsPanel {
             .as_ref()
             .map(|store| store.read(cx).errors())
             .unwrap_or_default();
+        let operation_running = self
+            .store
+            .as_ref()
+            .is_some_and(|store| store.read(cx).file_operation_running());
+        let file_actions = self.selected_file().map(|row| {
+            let unresolved = self
+                .store
+                .as_ref()
+                .is_some_and(|store| store.read(cx).file_operation_unresolved(&row.repository));
+            let operations = self
+                .store
+                .as_ref()
+                .map(|store| store.read(cx).file_operations(&row.repository))
+                .unwrap_or_default();
+            v_flex()
+                .px_2()
+                .py_1()
+                .gap_1()
+                .child(Label::new(row.path.clone()).size(LabelSize::Small))
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .child(
+                            Button::new("vcs-stage-file", "Stage File")
+                                .disabled(
+                                    operation_running
+                                        || unresolved
+                                        || !operations.contains(&FileOperation::Stage),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.run_file_operation(FileOperation::Stage, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("vcs-unstage-file", "Unstage File")
+                                .disabled(
+                                    operation_running
+                                        || unresolved
+                                        || !operations.contains(&FileOperation::Unstage),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.run_file_operation(FileOperation::Unstage, cx)
+                                })),
+                        ),
+                )
+                .when(operations.is_empty(), |element| {
+                    element.child(
+                        Label::new("File operations are unavailable for this provider.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                })
+                .when(unresolved && !operation_running, |element| {
+                    element.child(
+                        Label::new("Refresh to reconcile the previous operation.")
+                            .size(LabelSize::Small)
+                            .color(Color::Warning),
+                    )
+                })
+        });
         let has_errors = self.error.is_some()
             || !errors.is_empty()
-            || self
-                .repositories
-                .iter()
-                .any(|repository| repository.error.is_some());
+            || self.repositories.iter().any(|repository| {
+                repository.error.is_some()
+                    || self.store.as_ref().is_some_and(|store| {
+                        store
+                            .read(cx)
+                            .file_operation_error(&repository.key)
+                            .is_some()
+                    })
+            });
         let repository_headers = self
             .repositories
             .iter()
             .enumerate()
             .map(|(repository_index, repository)| {
                 let key = repository.key.clone();
+                let operation_error = self
+                    .store
+                    .as_ref()
+                    .and_then(|store| store.read(cx).file_operation_error(&key));
                 let baselines = repository
                     .descriptor
                     .baselines
@@ -554,6 +669,9 @@ impl Render for VcsPanel {
                     .when_some(repository.error.clone(), |element, error| {
                         element.child(Label::new(error).color(Color::Error))
                     })
+                    .when_some(operation_error, |element, error| {
+                        element.child(Label::new(error).color(Color::Error))
+                    })
             })
             .collect::<Vec<_>>();
         v_flex()
@@ -565,6 +683,8 @@ impl Render for VcsPanel {
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::stage_file))
+            .on_action(cx.listener(Self::unstage_file))
             .child(
                 h_flex()
                     .p_2()
@@ -582,17 +702,25 @@ impl Render for VcsPanel {
                         )),
                     )
                     .child(
-                        IconButton::new("refresh-vcs", IconName::ArrowCircle).on_click(
-                            cx.listener(|this, _, _, cx| {
+                        IconButton::new("refresh-vcs", IconName::ArrowCircle)
+                            .disabled(operation_running)
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 this.error = None;
                                 if let Some(store) = &this.store {
                                     store.update(cx, |store, cx| store.refresh_all(cx));
                                 }
-                            }),
-                        ),
+                            })),
                     ),
             )
             .children(repository_headers)
+            .children(file_actions)
+            .when(operation_running, |element| {
+                element.child(
+                    div()
+                        .px_2()
+                        .child(Label::new("Updating source control…").color(Color::Muted)),
+                )
+            })
             .children(
                 errors
                     .into_iter()

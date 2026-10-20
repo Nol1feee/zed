@@ -1,6 +1,9 @@
 #![cfg(unix)]
 
-use crate::{Content, ProviderCommand, ProviderConnection, ProviderError, ProviderNotification};
+use crate::{
+    Content, FileOperation, FileOperationOutcome, MAX_OPERATION_TOKEN_BYTES, ProviderCommand,
+    ProviderConnection, ProviderError, ProviderNotification,
+};
 use futures::future::{Either, select};
 use gpui::TestAppContext;
 use serde_json::{Value, json};
@@ -452,4 +455,455 @@ async fn exit_before_request_registration_never_leaves_initialization_pending(
         assert!(bounded(fixture.connection.initialize(), cx).await.is_err());
         assert!(!fixture.connection.is_alive());
     }
+}
+
+#[gpui::test]
+async fn file_operations_are_denied_before_dispatch_without_the_capability(
+    cx: &mut TestAppContext,
+) {
+    for scenario in [
+        "normal",
+        "v2-read-only",
+        "v2-no-file-operations",
+        "v2-stage-only",
+    ] {
+        let fixture = fixture(scenario, cx);
+        assert!(fixture.connection.capabilities().is_none());
+        assert!(
+            bounded(
+                fixture.connection.prepare_file_operation(
+                    "fixture-repository".into(),
+                    "src/example.txt".into(),
+                    FileOperation::Stage,
+                ),
+                cx,
+            )
+            .await
+            .is_err()
+        );
+        let initialized = bounded(fixture.connection.initialize(), cx)
+            .await
+            .expect("initialize");
+        let capability = fixture
+            .connection
+            .capabilities()
+            .expect("cached capabilities");
+        assert_eq!(capability.read_only, initialized.capabilities.read_only);
+        assert_eq!(
+            capability.file_operations,
+            initialized.capabilities.file_operations
+        );
+        assert_eq!(
+            initialized.protocol_version,
+            if scenario == "normal" { 1 } else { 2 }
+        );
+        for operation in [FileOperation::Stage, FileOperation::Unstage] {
+            if scenario == "v2-stage-only" && operation == FileOperation::Stage {
+                continue;
+            }
+            assert!(
+                bounded(
+                    fixture.connection.prepare_file_operation(
+                        "fixture-repository".into(),
+                        "src/example.txt".into(),
+                        operation,
+                    ),
+                    cx,
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                bounded(
+                    fixture.connection.apply_file_operation(
+                        "fixture-repository".into(),
+                        "src/example.txt".into(),
+                        operation,
+                        "unsupported-token".into(),
+                    ),
+                    cx,
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                bounded(
+                    fixture.connection.reconcile_file_operation(
+                        "fixture-repository".into(),
+                        "src/example.txt".into(),
+                        operation,
+                        "unsupported-token".into(),
+                    ),
+                    cx,
+                )
+                .await
+                .is_err()
+            );
+        }
+        bounded(
+            fixture
+                .connection
+                .snapshot("fixture-repository".into(), "submitted".into()),
+            cx,
+        )
+        .await
+        .expect("read-only operations remain usable");
+        bounded(fixture.connection.shutdown(), cx)
+            .await
+            .expect("shutdown");
+        let recorded = events(&fixture);
+        let initialize = recorded
+            .iter()
+            .find(|event| event["event"] == "initialize-received")
+            .expect("initialization receipt");
+        assert_eq!(initialize["protocol_version"], 1);
+        assert_eq!(initialize["supported_protocol_versions"], json!([1, 2]));
+        assert!(
+            !recorded.iter().any(|event| {
+                event["method"]
+                    .as_str()
+                    .is_some_and(|method| method.ends_with("FileOperation"))
+            }),
+            "denied operation reached fixture in {scenario}"
+        );
+    }
+}
+
+#[gpui::test]
+async fn contradictory_file_capabilities_do_not_initialize(cx: &mut TestAppContext) {
+    for scenario in ["v1-writable", "v2-contradictory"] {
+        let fixture = fixture(scenario, cx);
+        assert!(bounded(fixture.connection.initialize(), cx).await.is_err());
+        assert!(fixture.connection.capabilities().is_none());
+        assert!(
+            bounded(
+                fixture.connection.prepare_file_operation(
+                    "fixture-repository".into(),
+                    "src/example.txt".into(),
+                    FileOperation::Stage,
+                ),
+                cx,
+            )
+            .await
+            .is_err()
+        );
+        bounded(fixture.connection.shutdown(), cx)
+            .await
+            .expect("shutdown");
+        assert!(!events(&fixture).iter().any(|event| {
+            event["method"]
+                .as_str()
+                .is_some_and(|method| method.ends_with("FileOperation"))
+        }));
+    }
+}
+
+#[gpui::test]
+async fn explicit_file_operations_are_scoped_idempotent_and_reconcilable(cx: &mut TestAppContext) {
+    let fixture = fixture("writable", cx);
+    let initialized = bounded(fixture.connection.initialize(), cx)
+        .await
+        .expect("initialize");
+    assert_eq!(initialized.protocol_version, 2);
+    assert!(!initialized.capabilities.read_only);
+    let prepared = bounded(
+        fixture.connection.prepare_file_operation(
+            "fixture-repository".into(),
+            "src/example.txt".into(),
+            FileOperation::Stage,
+        ),
+        cx,
+    )
+    .await
+    .expect("prepare stage");
+    let reconciled = bounded(
+        fixture.connection.reconcile_file_operation(
+            "fixture-repository".into(),
+            "src/example.txt".into(),
+            FileOperation::Stage,
+            prepared.operation_token.clone(),
+        ),
+        cx,
+    )
+    .await
+    .expect("reconcile before apply");
+    assert_eq!(reconciled.outcome, FileOperationOutcome::NotApplied);
+    let sibling = bounded(
+        fixture.connection.prepare_file_operation(
+            "fixture-repository".into(),
+            "src/sibling.txt".into(),
+            FileOperation::Stage,
+        ),
+        cx,
+    )
+    .await
+    .expect("prepare sibling stage");
+    let sibling_result = bounded(
+        fixture.connection.apply_file_operation(
+            "fixture-repository".into(),
+            "src/sibling.txt".into(),
+            FileOperation::Stage,
+            sibling.operation_token,
+        ),
+        cx,
+    )
+    .await
+    .expect("stage sibling");
+    assert_eq!(sibling_result.outcome, FileOperationOutcome::Applied);
+    for _ in 0..2 {
+        let applied = bounded(
+            fixture.connection.apply_file_operation(
+                "fixture-repository".into(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                prepared.operation_token.clone(),
+            ),
+            cx,
+        )
+        .await
+        .expect("stage or acknowledge duplicate");
+        assert_eq!(applied.outcome, FileOperationOutcome::Applied);
+    }
+    let unstage = bounded(
+        fixture.connection.prepare_file_operation(
+            "fixture-repository".into(),
+            "src/example.txt".into(),
+            FileOperation::Unstage,
+        ),
+        cx,
+    )
+    .await
+    .expect("prepare unstage");
+    let applied = bounded(
+        fixture.connection.apply_file_operation(
+            "fixture-repository".into(),
+            "src/example.txt".into(),
+            FileOperation::Unstage,
+            unstage.operation_token,
+        ),
+        cx,
+    )
+    .await
+    .expect("unstage selected file");
+    assert_eq!(applied.outcome, FileOperationOutcome::Applied);
+    bounded(fixture.connection.shutdown(), cx)
+        .await
+        .expect("shutdown");
+    let recorded = events(&fixture);
+    let applied: Vec<_> = recorded
+        .iter()
+        .filter(|event| event["event"] == "file-operation-applied")
+        .map(|event| {
+            (
+                event["path"].clone(),
+                event["operation"].clone(),
+                event["staged"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        applied,
+        vec![
+            (json!("src/sibling.txt"), json!("stage"), json!(true)),
+            (json!("src/example.txt"), json!("stage"), json!(true)),
+            (json!("src/example.txt"), json!("unstage"), json!(false)),
+        ]
+    );
+}
+
+#[gpui::test]
+async fn stale_file_operation_token_is_a_conflict_without_a_mutation(cx: &mut TestAppContext) {
+    let fixture = fixture("writable", cx);
+    bounded(fixture.connection.initialize(), cx)
+        .await
+        .expect("initialize");
+    let prepared = bounded(
+        fixture.connection.prepare_file_operation(
+            "fixture-repository".into(),
+            "src/example.txt".into(),
+            FileOperation::Stage,
+        ),
+        cx,
+    )
+    .await
+    .expect("prepare stage");
+    std::fs::write(
+        format!("{}.state", fixture.events.display()),
+        "concurrent edit",
+    )
+    .expect("change fixture state");
+    let applied = bounded(
+        fixture.connection.apply_file_operation(
+            "fixture-repository".into(),
+            "src/example.txt".into(),
+            FileOperation::Stage,
+            prepared.operation_token.clone(),
+        ),
+        cx,
+    )
+    .await
+    .expect("report conflict");
+    assert_eq!(applied.outcome, FileOperationOutcome::Conflict);
+    let reconciled = bounded(
+        fixture.connection.reconcile_file_operation(
+            "fixture-repository".into(),
+            "src/example.txt".into(),
+            FileOperation::Stage,
+            prepared.operation_token,
+        ),
+        cx,
+    )
+    .await
+    .expect("reconcile conflict");
+    assert_eq!(reconciled.outcome, FileOperationOutcome::Conflict);
+    bounded(fixture.connection.shutdown(), cx)
+        .await
+        .expect("shutdown");
+    assert!(
+        !events(&fixture)
+            .iter()
+            .any(|event| event["event"] == "file-operation-applied")
+    );
+}
+
+#[gpui::test]
+async fn ambiguous_apply_is_reconciled_without_an_automatic_retry(cx: &mut TestAppContext) {
+    for scenario in ["write-error", "write-invalid-result"] {
+        let fixture = fixture(scenario, cx);
+        bounded(fixture.connection.initialize(), cx)
+            .await
+            .expect("initialize");
+        let prepared = bounded(
+            fixture.connection.prepare_file_operation(
+                "fixture-repository".into(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+            ),
+            cx,
+        )
+        .await
+        .expect("prepare stage");
+        bounded(
+            fixture.connection.apply_file_operation(
+                "fixture-repository".into(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                prepared.operation_token.clone(),
+            ),
+            cx,
+        )
+        .await
+        .expect_err("unknown apply outcome");
+        let reconciled = bounded(
+            fixture.connection.reconcile_file_operation(
+                "fixture-repository".into(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                prepared.operation_token,
+            ),
+            cx,
+        )
+        .await
+        .expect("reconcile the original token");
+        assert_eq!(reconciled.outcome, FileOperationOutcome::Applied);
+        bounded(fixture.connection.shutdown(), cx)
+            .await
+            .expect("shutdown");
+        let recorded = events(&fixture);
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|event| event["method"] == "vcs/applyFileOperation")
+                .count(),
+            1
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|event| event["event"] == "file-operation-applied")
+                .count(),
+            1
+        );
+    }
+}
+
+#[gpui::test]
+async fn file_operation_inputs_and_prepared_tokens_are_validated(cx: &mut TestAppContext) {
+    let fixture = fixture("writable", cx);
+    bounded(fixture.connection.initialize(), cx)
+        .await
+        .expect("initialize");
+    for (repository, path) in [
+        ("", "src/example.txt"),
+        ("fixture-repository", "../outside"),
+    ] {
+        assert!(
+            bounded(
+                fixture.connection.prepare_file_operation(
+                    repository.into(),
+                    path.into(),
+                    FileOperation::Stage,
+                ),
+                cx,
+            )
+            .await
+            .is_err()
+        );
+    }
+    for token in [String::new(), "x".repeat(MAX_OPERATION_TOKEN_BYTES + 1)] {
+        assert!(
+            bounded(
+                fixture.connection.apply_file_operation(
+                    "fixture-repository".into(),
+                    "src/example.txt".into(),
+                    FileOperation::Stage,
+                    token.clone(),
+                ),
+                cx,
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            bounded(
+                fixture.connection.reconcile_file_operation(
+                    "fixture-repository".into(),
+                    "src/example.txt".into(),
+                    FileOperation::Stage,
+                    token,
+                ),
+                cx,
+            )
+            .await
+            .is_err()
+        );
+    }
+    bounded(fixture.connection.shutdown(), cx)
+        .await
+        .expect("shutdown");
+    assert!(!events(&fixture).iter().any(|event| {
+        event["method"]
+            .as_str()
+            .is_some_and(|method| method.ends_with("FileOperation"))
+    }));
+
+    let invalid = self::fixture("invalid-token", cx);
+    bounded(invalid.connection.initialize(), cx)
+        .await
+        .expect("initialize");
+    assert!(
+        bounded(
+            invalid.connection.prepare_file_operation(
+                "fixture-repository".into(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+            ),
+            cx,
+        )
+        .await
+        .is_err()
+    );
+    bounded(invalid.connection.shutdown(), cx)
+        .await
+        .expect("shutdown");
 }

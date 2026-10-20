@@ -1,6 +1,8 @@
 use crate::{
-    Content, InitializeParams, InitializeResult, MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
-    ProviderError, ProviderInfo, RepositoryDescriptor, Snapshot, validate_path,
+    Content, FileOperation, FileOperationResult, InitializeParams, InitializeResult,
+    MAX_MESSAGE_BYTES, PROTOCOL_VERSION, PreparedFileOperation, ProviderCapabilities,
+    ProviderError, ProviderInfo, RepositoryDescriptor, SUPPORTED_PROTOCOL_VERSIONS, Snapshot,
+    validate_operation_token, validate_path,
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use collections::HashMap;
@@ -51,6 +53,7 @@ pub struct ProviderConnection {
     next_id: AtomicU64,
     alive: Arc<AtomicBool>,
     initialized: AtomicBool,
+    capabilities: Mutex<Option<ProviderCapabilities>>,
     child: Arc<Mutex<Option<Child>>>,
     diagnostics: Arc<Mutex<String>>,
     executor: BackgroundExecutor,
@@ -235,6 +238,7 @@ impl ProviderConnection {
             next_id: AtomicU64::new(1),
             alive,
             initialized: AtomicBool::new(false),
+            capabilities: Mutex::new(None),
             child,
             diagnostics,
             executor,
@@ -254,6 +258,10 @@ impl ProviderConnection {
         self.diagnostics.lock().clone()
     }
 
+    pub fn capabilities(&self) -> Option<ProviderCapabilities> {
+        self.capabilities.lock().clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn has_taken_shutdown_child(&self) -> bool {
         self.child.lock().is_none()
@@ -266,6 +274,7 @@ impl ProviderConnection {
         );
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION,
+            supported_protocol_versions: SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
             client_info: ProviderInfo {
                 name: "Zed".into(),
                 version: "1".into(),
@@ -275,6 +284,7 @@ impl ProviderConnection {
             .request("initialize", serde_json::to_value(params)?, REQUEST_TIMEOUT)
             .await?;
         result.validate()?;
+        *self.capabilities.lock() = Some(result.capabilities.clone());
         self.initialized.store(true, Ordering::Release);
         Ok(result)
     }
@@ -321,6 +331,57 @@ impl ProviderConnection {
         self.request("vcs/readContent", json!({"repositoryId":repository_id,"snapshotId":snapshot_id,"baselineId":baseline_id,"path":path}), REQUEST_TIMEOUT).await
     }
 
+    pub async fn prepare_file_operation(
+        &self,
+        repository_id: String,
+        path: String,
+        operation: FileOperation,
+    ) -> Result<PreparedFileOperation> {
+        self.ensure_file_operation(&repository_id, &path, operation)?;
+        let prepared: PreparedFileOperation = self
+            .request(
+                "vcs/prepareFileOperation",
+                json!({"repositoryId": repository_id, "path": path, "operation": operation}),
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        prepared.validate()?;
+        Ok(prepared)
+    }
+
+    /// An error leaves the outcome unknown. Reconcile this token before another mutation.
+    pub async fn apply_file_operation(
+        &self,
+        repository_id: String,
+        path: String,
+        operation: FileOperation,
+        operation_token: String,
+    ) -> Result<FileOperationResult> {
+        self.ensure_file_operation(&repository_id, &path, operation)?;
+        validate_operation_token(&operation_token)?;
+        self.request(
+            "vcs/applyFileOperation",
+            json!({"repositoryId": repository_id, "path": path, "operation": operation, "operationToken": operation_token}),
+            REQUEST_TIMEOUT,
+        ).await
+    }
+
+    pub async fn reconcile_file_operation(
+        &self,
+        repository_id: String,
+        path: String,
+        operation: FileOperation,
+        operation_token: String,
+    ) -> Result<FileOperationResult> {
+        self.ensure_file_operation(&repository_id, &path, operation)?;
+        validate_operation_token(&operation_token)?;
+        self.request(
+            "vcs/reconcileFileOperation",
+            json!({"repositoryId": repository_id, "path": path, "operation": operation, "operationToken": operation_token}),
+            REQUEST_TIMEOUT,
+        ).await
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         let result = if self.is_alive() {
             self.request::<Value>("shutdown", json!({}), SHUTDOWN_TIMEOUT)
@@ -358,6 +419,25 @@ impl ProviderConnection {
         }
         self.reap_child().await?;
         result
+    }
+
+    fn ensure_file_operation(
+        &self,
+        repository_id: &str,
+        path: &str,
+        operation: FileOperation,
+    ) -> Result<()> {
+        self.ensure_initialized()?;
+        ensure!(!repository_id.is_empty(), "empty VCS repository id");
+        validate_path(path)?;
+        let capabilities = self.capabilities.lock();
+        ensure!(
+            capabilities
+                .as_ref()
+                .is_some_and(|capabilities| capabilities.supports_file_operation(operation)),
+            "VCS provider does not support file operation {operation:?}"
+        );
+        Ok(())
     }
 
     fn ensure_initialized(&self) -> Result<()> {
