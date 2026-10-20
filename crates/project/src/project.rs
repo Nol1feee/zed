@@ -149,7 +149,7 @@ use worktree::{CreatedEntry, Snapshot, Traversal};
 pub use worktree::{
     Entry, EntryKind, FS_WATCH_LATENCY, File, LocalWorktree, PathChange, ProjectEntryId,
     UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree, WorktreeId, WorktreeSettings,
-    discover_root_repo_common_dir,
+    discover_root_repo_common_dir, is_git_repository_excluded,
 };
 use worktree_store::{WorktreeStore, WorktreeStoreEvent};
 

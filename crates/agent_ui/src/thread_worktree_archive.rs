@@ -684,10 +684,18 @@ pub async fn restore_worktree_via_git(
     let already_exists = app_state.fs.metadata(worktree_path).await?.is_some();
 
     let created_new_worktree = if already_exists {
-        let is_git_worktree =
-            resolve_git_worktree_to_main_repo(app_state.fs.as_ref(), worktree_path)
-                .await
-                .is_some();
+        let excluded_markers = cx.update(|cx| {
+            project::WorktreeSettings::get_global(cx)
+                .git_repository_exclusion_markers
+                .clone()
+        });
+        let is_git_worktree = resolve_git_worktree_to_main_repo(
+            app_state.fs.as_ref(),
+            worktree_path,
+            &excluded_markers,
+        )
+        .await
+        .is_some();
 
         if !is_git_worktree {
             let rx = main_repo.update(cx, |repo, _cx| repo.repair_worktrees());

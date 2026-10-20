@@ -24,6 +24,7 @@ use gpui::{AppContext as _, Entity, Global, Subscription, Task, TaskExt};
 pub use project::WorktreePaths;
 use project::{AgentId, linked_worktree_short_name};
 use remote::{RemoteConnectionOptions, same_remote_connection_identity};
+use settings::Settings;
 use ui::{App, Context, SharedString, ThreadItemWorktreeInfo, WorktreeKind};
 use util::{ResultExt as _, paths::PathStyle};
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
@@ -195,6 +196,9 @@ fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::
     let kvp = KeyValueStore::global(cx);
     let workspace_db = WorkspaceDb::global(cx);
     let fs = <dyn Fs>::global(cx);
+    let excluded_markers = project::WorktreeSettings::get_global(cx)
+        .git_repository_exclusion_markers
+        .clone();
 
     cx.spawn(async move |cx| -> anyhow::Result<()> {
         migration_task.await?;
@@ -207,7 +211,7 @@ fn migrate_thread_remote_connections(cx: &mut App, migration_task: Task<anyhow::
         }
 
         let recent_workspaces = workspace_db
-            .recent_project_workspaces_ungrouped(fs.as_ref())
+            .recent_project_workspaces_ungrouped(fs.as_ref(), &excluded_markers)
             .await?;
 
         let mut local_path_lists = HashSet::<PathList>::default();

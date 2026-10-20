@@ -333,6 +333,217 @@ async fn trust_precedes_callback_and_spawn_and_read_only_rejects_git_init(cx: &m
 }
 
 #[gpui::test]
+async fn excluded_git_metadata_never_falls_back_when_provider_is_unavailable(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, true).await;
+    cx.update(|cx| {
+        settings::SettingsStore::update_global(cx, |settings, cx| {
+            settings.update_user_settings(cx, |content| {
+                content
+                    .git
+                    .get_or_insert_default()
+                    .excluded_repository_markers = Some(vec![".compatibility-vcs".into()]);
+            });
+        });
+    });
+    fixture
+        .fs
+        .insert_tree(
+            fixture.directory.path().join(".git"),
+            json!({".compatibility-vcs": ""}),
+        )
+        .await;
+    fixture
+        .project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    let external_path = ProjectPath {
+        worktree_id: fixture.worktree_id,
+        path: RelPath::from_unix_str("src/example.txt").unwrap().into(),
+    };
+    fixture.store.read_with(cx, |store, cx| {
+        assert!(
+            store
+                .git
+                .read(cx)
+                .repository_and_path_for_project_path(&external_path, cx)
+                .is_none()
+        );
+        let nested_path = ProjectPath {
+            worktree_id: fixture.worktree_id,
+            path: RelPath::from_unix_str("nested/file.txt").unwrap().into(),
+        };
+        assert!(
+            store
+                .git
+                .read(cx)
+                .repository_and_path_for_project_path(&nested_path, cx)
+                .is_some()
+        );
+    });
+    let initialization = fixture.project.read_with(cx, |project, cx| {
+        project.git_init(fixture.directory.path().into(), "main".into(), cx)
+    });
+    assert!(
+        initialization
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("excluded_repository_markers")
+    );
+
+    let extension = FixtureExtension::new("excluded-git", fixture.directory.path(), "normal");
+    extension.register(cx);
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(extension.callbacks.load(Ordering::SeqCst), 0);
+    trust(&fixture, cx);
+    let repository = ready(&fixture, cx).await;
+    fixture.store.read_with(cx, |store, cx| {
+        assert_eq!(
+            store.repository_for_path(&external_path, cx),
+            Some(repository.key)
+        );
+    });
+    stop(&fixture, cx).await;
+    cx.update(|cx| {
+        ExtensionHostProxy::global(cx).unregister_vcs_provider(
+            "excluded-git".into(),
+            "fixture".into(),
+            cx,
+        );
+    });
+    let initialization = fixture.project.read_with(cx, |project, cx| {
+        project.git_init(fixture.directory.path().into(), "main".into(), cx)
+    });
+    assert!(initialization.await.is_err());
+
+    FixtureExtension::new("failed-provider", fixture.directory.path(), "early-exit").register(cx);
+    cx.condition(&fixture.store, |store, _| !store.errors().is_empty())
+        .await;
+    fixture.store.read_with(cx, |store, cx| {
+        assert!(
+            store
+                .git
+                .read(cx)
+                .repository_and_path_for_project_path(&external_path, cx)
+                .is_none()
+        );
+        assert!(store.repository_for_path(&external_path, cx).is_none());
+    });
+    let initialization = fixture.project.read_with(cx, |project, cx| {
+        project.git_init(fixture.directory.path().into(), "main".into(), cx)
+    });
+    assert!(initialization.await.is_err());
+}
+
+#[gpui::test]
+async fn outer_git_cannot_claim_an_excluded_repository_opened_in_multiple_scopes(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    let outer_directory = tempfile::tempdir().unwrap();
+    let project_directory = outer_directory.path().join("external/project");
+    std::fs::create_dir_all(&project_directory).unwrap();
+    cx.update(|cx| {
+        settings::SettingsStore::update_global(cx, |settings, cx| {
+            settings.update_user_settings(cx, |content| {
+                content
+                    .git
+                    .get_or_insert_default()
+                    .excluded_repository_markers = Some(vec![".compatibility-vcs".into()]);
+            });
+        })
+    });
+    fixture.fs.insert_tree(outer_directory.path(), json!({
+        ".git": {},
+        "external": {
+            ".fixture-vcs": "", ".git": {".compatibility-vcs": ""},
+            "project": {"src": {"example.txt": "external"}, "nested": {".git": {}, "file.txt": "Git"}}
+        }
+    })).await;
+    let outer_id = open_worktree(&fixture, outer_directory.path(), cx).await;
+    let external_worktree = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.create_worktree(&project_directory, true, cx)
+        })
+        .await
+        .unwrap();
+    external_worktree
+        .read_with(cx, |worktree, _| {
+            worktree.as_local().unwrap().scan_complete()
+        })
+        .await;
+    let external_id = external_worktree.read_with(cx, |worktree, _| worktree.id());
+    assert_ne!(outer_id, external_id);
+    fixture
+        .project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    let external_path = ProjectPath {
+        worktree_id: external_id,
+        path: RelPath::from_unix_str("src/example.txt").unwrap().into(),
+    };
+    let outer_path = ProjectPath {
+        worktree_id: outer_id,
+        path: RelPath::from_unix_str("external/project/src/example.txt")
+            .unwrap()
+            .into(),
+    };
+    let nested_path = ProjectPath {
+        worktree_id: external_id,
+        path: RelPath::from_unix_str("nested/file.txt").unwrap().into(),
+    };
+    fixture.store.read_with(cx, |store, cx| {
+        assert!(
+            store
+                .git
+                .read(cx)
+                .repository_and_path_for_project_path(&outer_path, cx)
+                .is_none()
+        );
+        assert!(
+            store
+                .git
+                .read(cx)
+                .repository_and_path_for_project_path(&external_path, cx)
+                .is_none()
+        );
+        assert!(
+            store
+                .git
+                .read(cx)
+                .repository_and_path_for_project_path(&nested_path, cx)
+                .is_some()
+        );
+        let root = ProjectPath {
+            worktree_id: outer_id,
+            path: RelPath::empty_arc(),
+        };
+        assert!(
+            store
+                .git
+                .read(cx)
+                .repository_and_path_for_project_path(&root, cx)
+                .is_some()
+        );
+    });
+    trust_worktree(&fixture, external_id, cx);
+    FixtureExtension::new("outer-boundary", fixture.directory.path(), "normal").register(cx);
+    let repository = ready(&fixture, cx).await;
+    fixture.store.read_with(cx, |store, cx| {
+        assert_eq!(
+            store.repository_for_path(&external_path, cx),
+            Some(repository.key)
+        );
+        assert!(store.repository_for_path(&nested_path, cx).is_none());
+    });
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
 async fn file_operations_preserve_scope_and_refuse_dirty_conflicted_and_git_files(
     cx: &mut TestAppContext,
 ) {
@@ -1161,8 +1372,12 @@ async fn linked_git_worktree_keeps_git_ownership_with_external_provider_register
         )
         .await;
     assert_eq!(
-        crate::git_store::resolve_git_worktree_to_main_repo(fixture.fs.as_ref(), linked.path())
-            .await,
+        crate::git_store::resolve_git_worktree_to_main_repo(
+            fixture.fs.as_ref(),
+            linked.path(),
+            &[]
+        )
+        .await,
         Some(main.path().to_path_buf())
     );
     let linked_id = open_worktree(&fixture, linked.path(), cx).await;

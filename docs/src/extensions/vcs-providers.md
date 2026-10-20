@@ -32,6 +32,28 @@ confirm repository ownership. An existing nested Git repository retains ownershi
 of its files. Ambiguous external ownership must be reported, not resolved by
 registration order.
 
+When migrating from a compatibility bridge that left synthetic Git metadata,
+`git.excluded_repository_markers` can prevent that metadata from activating the
+Git backend:
+
+```json
+{
+  "git": { "excluded_repository_markers": [".example-compatibility-bridge"] }
+}
+```
+
+The default is empty, so ordinary Git discovery is unchanged. Each entry is a
+literal basename checked inside the repository's Git directory. For a `.git`
+file, Zed resolves its `gitdir:` target and checks that directory, without inheriting
+markers from the shared `commondir`. Invalid names are logged and ignored.
+This setting excludes only matching Git metadata; it does not select or start a
+provider. The extension must still declare its root marker, confirm ownership,
+and pass workspace trust. A nested Git repository without an exclusion marker
+keeps ownership of its files. Exclusion also blocks Git initialization and mutation
+when a provider is missing, disabled, or fails, so recovery cannot silently switch
+backends. Use this only with a marker that positively identifies bridge metadata;
+do not use ordinary Git files such as `HEAD` or `config` as exclusion markers.
+
 Implement `Extension::vcs_provider_command` to return the executable, arguments, and
 environment. This callback follows the language-server command pattern, but the
 returned process speaks the VCS protocol below. The native host owns its pipes,

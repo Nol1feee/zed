@@ -10241,8 +10241,9 @@ impl WorkspaceHandle for Entity<Workspace> {
 pub async fn last_opened_workspace_location(
     db: &WorkspaceDb,
     fs: &dyn fs::Fs,
+    excluded_markers: &[String],
 ) -> Option<(WorkspaceId, SerializedWorkspaceLocation, PathList)> {
-    db.last_workspace(fs)
+    db.last_workspace(fs, excluded_markers)
         .await
         .log_err()
         .flatten()
@@ -10361,6 +10362,11 @@ pub async fn apply_restored_multiworkspace_state(
     } = state;
 
     if !project_groups.is_empty() {
+        let excluded_markers = cx.update(|cx| {
+            WorktreeSettings::get_global(cx)
+                .git_repository_exclusion_markers
+                .clone()
+        });
         // Resolve linked worktree paths to their main repo paths so
         // stale keys from previous sessions get normalized and deduped.
         let mut resolved_groups: Vec<SerializedProjectGroupState> = Vec::new();
@@ -10373,7 +10379,8 @@ pub async fn apply_restored_multiworkspace_state(
             for path in key.path_list().paths() {
                 if key.host().is_none()
                     && let Some(common_dir) =
-                        project::discover_root_repo_common_dir(path, fs.as_ref()).await
+                        project::discover_root_repo_common_dir(path, fs.as_ref(), &excluded_markers)
+                            .await
                     && !project::is_submodule_git_dir(&common_dir)
                 {
                     let main_path = project::repo_identity_path(&common_dir, PathStyle::local());

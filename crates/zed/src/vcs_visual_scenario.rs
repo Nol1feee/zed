@@ -6,8 +6,8 @@ use anyhow::{Context as _, Result, ensure};
 use extension::{ExtensionHostProxy, ExtensionManifest, ExtensionVcsProviderProxy as _};
 use extension_host::wasm_host::WasmHost;
 use gpui::{
-    AnyWindowHandle, AppContext as _, Bounds, Entity, Modifiers, VisualTestAppContext,
-    WindowBounds, WindowHandle, WindowOptions, point, px, size,
+    AnyWindowHandle, AppContext as _, Bounds, Entity, Modifiers, UpdateGlobal as _,
+    VisualTestAppContext, WindowBounds, WindowHandle, WindowOptions, point, px, size,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -25,6 +25,7 @@ pub(super) struct Scenario {
     extension_directory: PathBuf,
     provider_id: String,
     output_directory: PathBuf,
+    user_settings: Option<Value>,
     steps: Vec<Step>,
 }
 
@@ -87,6 +88,19 @@ impl Scenario {
         app: &Arc<AppState>,
         cx: &mut VisualTestAppContext,
     ) -> Result<()> {
+        if let Some(user_settings) = &self.user_settings {
+            ensure!(
+                user_settings.is_object(),
+                "scenario user_settings must be an object"
+            );
+            cx.update(|cx| {
+                settings::SettingsStore::update_global(cx, |store, cx| {
+                    store
+                        .set_user_settings(&user_settings.to_string(), cx)
+                        .result()
+                })
+            })?;
+        }
         let proxy = cx.update(|cx| {
             cx.set_prompt_builder(gpui::fallback_prompt_renderer);
             project::trusted_worktrees::init(Default::default(), cx);
@@ -486,6 +500,8 @@ fn observe(
             Some(json!({
                 "current": handle == window && Some(entity_id) == active,
                 "roots": workspace.root_paths(cx),
+                "git_repository_count": project.repositories(cx).len(),
+                "worktree_entry_count": project.visible_worktrees(cx).map(|worktree| worktree.read(cx).snapshot().entry_count()).sum::<usize>(),
                 "active_item_dirty": workspace.active_item(cx).map(|item| item.is_dirty(cx)),
                 "active_item_kind": if workspace.active_item_as::<editor::SplittableEditor>(cx).is_some() { "diff" } else if workspace.active_item_as::<editor::Editor>(cx).is_some() { "editor" } else { "other" },
                 "repositories": repositories,

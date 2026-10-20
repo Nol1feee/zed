@@ -67,10 +67,13 @@ impl SidebarRecentProjects {
                 cx.subscribe(&picker, |_this: &mut Self, _, _, cx| cx.emit(DismissEvent));
 
             let db = WorkspaceDb::global(cx);
+            let excluded_markers = project::WorktreeSettings::get_global(cx)
+                .git_repository_exclusion_markers
+                .clone();
             cx.spawn_in(window, async move |this, cx| {
                 let Some(fs) = fs else { return };
                 let workspaces = db
-                    .recent_project_workspaces(fs.as_ref())
+                    .recent_project_workspaces(fs.as_ref(), &excluded_markers)
                     .await
                     .log_err()
                     .unwrap_or_default();

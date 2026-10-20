@@ -2,6 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use fs::Fs;
 use gpui::{AppContext, Entity, Global, MenuItem};
+use settings::Settings;
 use smallvec::SmallVec;
 use ui::{App, Context};
 use util::{ResultExt, paths::PathExt};
@@ -42,9 +43,12 @@ impl HistoryManager {
 
     fn init(this: Entity<HistoryManager>, fs: Arc<dyn Fs>, cx: &App) {
         let db = WorkspaceDb::global(cx);
+        let excluded_markers = project::WorktreeSettings::get_global(cx)
+            .git_repository_exclusion_markers
+            .clone();
         cx.spawn(async move |cx| {
             let recent_folders = db
-                .recent_project_workspaces(fs.as_ref())
+                .recent_project_workspaces(fs.as_ref(), &excluded_markers)
                 .await
                 .unwrap_or_default()
                 .into_iter()

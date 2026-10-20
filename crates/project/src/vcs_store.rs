@@ -13,7 +13,7 @@ use gpui::{
 };
 use language::{Buffer, BufferEvent};
 use serde::{Deserialize, Serialize};
-use settings::WorktreeId;
+use settings::{Settings, SettingsLocation, WorktreeId};
 use util::{ResultExt, rel_path::RelPath};
 use vcs::{
     ChangeStatus, CheckoutCatalog, CheckoutDescriptor, CheckoutOperation, CheckoutOperationKind,
@@ -1923,12 +1923,29 @@ impl VcsStore {
                     .map(|provider| provider.root_markers.clone())
             })
             .collect();
-        if markers.is_empty() {
+        let settings_location =
+            self.worktrees
+                .read(cx)
+                .find_worktree(&path, cx)
+                .map(|(worktree, _)| SettingsLocation {
+                    worktree_id: worktree.read(cx).id(),
+                    path: RelPath::empty(),
+                });
+        let excluded_markers = worktree::WorktreeSettings::get(settings_location, cx)
+            .git_repository_exclusion_markers
+            .clone();
+        if markers.is_empty() && excluded_markers.is_empty() {
             return Task::ready(Ok(()));
         }
         let fs = self.fs.clone();
         cx.background_executor().spawn(async move {
             for ancestor in path.ancestors() {
+                ensure!(
+                    !worktree::is_git_repository_excluded(
+                        &ancestor.join(".git"), &excluded_markers, fs.as_ref()
+                    ).await?,
+                    "Git is unavailable because this repository matches git.excluded_repository_markers"
+                );
                 if !external_markers_first && fs.metadata(&ancestor.join(".git")).await?.is_some() { return Ok(()); }
                 for provider_markers in &markers {
                     for marker in provider_markers {
@@ -2336,6 +2353,31 @@ mod tests {
     use super::*;
 
     #[gpui::test]
+    async fn provider_which_inherits_process_path_only_when_directory_path_is_missing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut worktree = ProviderWorktree {
+            id: WorktreeId::from_proto(0),
+            root: directory.path().into(),
+            fs: fs::FakeFs::new(cx.background_executor.clone()),
+            environment: HashMap::default(),
+        };
+        let expected = which::which("git").expect("Git is available to project tests");
+        assert_eq!(
+            worktree.which("git".into()).await,
+            Some(expected.to_string_lossy().into_owned())
+        );
+        for path in [
+            String::new(),
+            directory.path().to_string_lossy().into_owned(),
+        ] {
+            worktree.environment.insert("PATH".into(), path);
+            assert_eq!(worktree.which("git".into()).await, None);
+        }
+    }
+
+    #[gpui::test]
     async fn marker_discovery_is_ancestor_scoped_and_rejects_paths(cx: &mut gpui::TestAppContext) {
         let fs = fs::FakeFs::new(cx.background_executor.clone());
         fs.insert_tree(
@@ -2573,7 +2615,12 @@ impl WorktreeDelegate for ProviderWorktree {
         self.fs.load(&self.root.join(path.as_std_path())).await
     }
     async fn which(&self, binary_name: String) -> Option<String> {
-        which::which_in(binary_name, self.environment.get("PATH"), &self.root)
+        let path = self
+            .environment
+            .get("PATH")
+            .map(std::ffi::OsString::from)
+            .or_else(|| std::env::var_os("PATH"));
+        which::which_in(binary_name, path, &self.root)
             .ok()
             .map(|path| path.to_string_lossy().into_owned())
     }

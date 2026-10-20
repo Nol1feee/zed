@@ -1855,7 +1855,8 @@ mod resolve_worktree_tests {
         .await;
 
         let result =
-            resolve_git_worktree_to_main_repo(fs.as_ref(), Path::new("/worktree-checkout")).await;
+            resolve_git_worktree_to_main_repo(fs.as_ref(), Path::new("/worktree-checkout"), &[])
+                .await;
         assert_eq!(result, Some(PathBuf::from("/main-repo")));
     }
 
@@ -1871,7 +1872,7 @@ mod resolve_worktree_tests {
         )
         .await;
 
-        let result = resolve_git_worktree_to_main_repo(fs.as_ref(), Path::new("/repo")).await;
+        let result = resolve_git_worktree_to_main_repo(fs.as_ref(), Path::new("/repo"), &[]).await;
         assert_eq!(result, None);
     }
 
@@ -1900,7 +1901,8 @@ mod resolve_worktree_tests {
         .await;
 
         let result =
-            resolve_git_worktree_to_main_repo(fs.as_ref(), Path::new("/monty/feature-a")).await;
+            resolve_git_worktree_to_main_repo(fs.as_ref(), Path::new("/monty/feature-a"), &[])
+                .await;
         assert_eq!(result, Some(PathBuf::from("/monty")));
     }
 
@@ -1915,7 +1917,7 @@ mod resolve_worktree_tests {
         )
         .await;
 
-        let result = resolve_git_worktree_to_main_repo(fs.as_ref(), Path::new("/plain")).await;
+        let result = resolve_git_worktree_to_main_repo(fs.as_ref(), Path::new("/plain"), &[]).await;
         assert_eq!(result, None);
     }
 
@@ -1924,7 +1926,7 @@ mod resolve_worktree_tests {
         let fs = FakeFs::new(cx.executor());
 
         let result =
-            resolve_git_worktree_to_main_repo(fs.as_ref(), Path::new("/does-not-exist")).await;
+            resolve_git_worktree_to_main_repo(fs.as_ref(), Path::new("/does-not-exist"), &[]).await;
         assert_eq!(result, None);
     }
 
