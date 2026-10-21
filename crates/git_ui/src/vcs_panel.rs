@@ -1,33 +1,33 @@
-use std::{
-    any::TypeId,
-    collections::{BTreeMap, HashMap},
-    ops::Range,
-};
+use std::collections::HashMap;
+use std::{any::TypeId, ops::Range, path::Path, sync::Arc};
 
+use crate::git_panel::{self, GitPanel};
+use crate::git_panel_settings::GitPanelSettings;
 use anyhow::Result;
 use editor::{Editor, EditorSettings, SplittableEditor};
+use file_icons::FileIcons;
 use gpui::{
-    Action, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyBinding, PromptLevel, ScrollStrategy, Subscription, UniformListScrollHandle, WeakEntity,
-    Window, actions, uniform_list,
+    Action, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel,
+    ScrollStrategy, Subscription, UniformListScrollHandle, WeakEntity, Window, actions,
+    uniform_list,
 };
 use language::{Buffer, Capability};
 use multi_buffer::{MultiBuffer, PathKey};
+use project::vcs_store::VcsDiff;
 use project::{
-    Project,
-    vcs_store::{VcsDiff, VcsRepositoryId, VcsRepositorySnapshot, VcsStore},
+    Project, ProjectPath,
+    vcs_store::{VcsRepositoryId, VcsRepositorySnapshot, VcsStore},
 };
-use settings::Settings;
-use ui::{Button, Color, IconButton, IconName, Label, ListItem, prelude::*};
-use util::ResultExt as _;
+use settings::{GitPanelClickBehavior, Settings};
+use ui::{
+    Button, ButtonLike, Color, IconButton, IconName, Label, ListItem, ListItemSpacing, Tab,
+    Tooltip, prelude::*,
+};
+use util::{ResultExt as _, rel_path::RelPath};
 use vcs::{
     Change, ChangeStatus, ContentKind, FileOperation, RepositoryOperation, RepositoryOperationKind,
 };
-use workspace::{
-    Item, Panel, Workspace,
-    dock::{DockPosition, PanelEvent},
-    searchable::SearchableItemHandle,
-};
+use workspace::{Item, Workspace, notifications::NotifyTaskExt, searchable::SearchableItemHandle};
 
 actions!(
     vcs_panel,
@@ -53,14 +53,9 @@ actions!(
 
 pub fn init(cx: &mut App) {
     crate::vcs_repository_ui::init(cx);
-    cx.bind_keys([
-        KeyBinding::new("up", menu::SelectPrevious, Some("VcsPanel")),
-        KeyBinding::new("down", menu::SelectNext, Some("VcsPanel")),
-        KeyBinding::new("enter", menu::Confirm, Some("VcsPanel")),
-    ]);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-            workspace.toggle_panel_focus::<VcsPanel>(window, cx);
+            workspace.toggle_panel_focus::<GitPanel>(window, cx);
         });
         workspace.register_action(|workspace, _: &ShowDiagnostics, window, cx| {
             show_diagnostics(workspace, window, cx);
@@ -178,7 +173,6 @@ struct Row {
     repository: VcsRepositoryId,
     path: String,
     label: String,
-    depth: usize,
     change: Option<Change>,
 }
 
@@ -187,8 +181,8 @@ pub struct VcsPanel {
     project: Entity<Project>,
     store: Option<Entity<VcsStore>>,
     focus: FocusHandle,
-    position: DockPosition,
     repositories: Vec<VcsRepositorySnapshot>,
+    selected_repository_id: Option<VcsRepositoryId>,
     rows: Vec<Row>,
     selected: Option<usize>,
     scroll_handle: UniformListScrollHandle,
@@ -199,18 +193,7 @@ pub struct VcsPanel {
 }
 
 impl VcsPanel {
-    pub async fn load(
-        workspace: WeakEntity<Workspace>,
-        mut cx: AsyncWindowContext,
-    ) -> Result<Entity<Self>> {
-        workspace.update_in(&mut cx, |workspace, _, cx| {
-            let project = workspace.project().clone();
-            let workspace = cx.entity().downgrade();
-            cx.new(|cx| Self::new(workspace, project, cx))
-        })
-    }
-
-    fn new(
+    pub(crate) fn new(
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         cx: &mut Context<Self>,
@@ -224,8 +207,8 @@ impl VcsPanel {
             project,
             store,
             focus: cx.focus_handle(),
-            position: DockPosition::Left,
             repositories: Vec::new(),
+            selected_repository_id: None,
             rows: Vec::new(),
             selected: None,
             scroll_handle: UniformListScrollHandle::new(),
@@ -248,9 +231,20 @@ impl VcsPanel {
             .as_ref()
             .map(|store| store.read(cx).repositories())
             .unwrap_or_default();
+        if !self
+            .repositories
+            .iter()
+            .any(|repository| Some(&repository.key) == self.selected_repository_id.as_ref())
+        {
+            self.selected_repository_id = self
+                .repositories
+                .first()
+                .map(|repository| repository.key.clone());
+        }
         let changes = self
             .repositories
             .iter()
+            .filter(|repository| Some(&repository.key) == self.selected_repository_id.as_ref())
             .map(|repository| {
                 let changes = self
                     .store
@@ -406,20 +400,18 @@ impl VcsPanel {
     }
 
     fn selected_repository(&self) -> Option<VcsRepositorySnapshot> {
-        let selected = self
-            .selected
-            .and_then(|index| self.rows.get(index))
-            .map(|row| &row.repository);
         self.repositories
             .iter()
-            .find(|repository| {
-                selected.is_some_and(|selected| selected == &repository.key)
-                    || (selected.is_none() && self.repositories.len() == 1)
-            })
+            .find(|repository| Some(&repository.key) == self.selected_repository_id.as_ref())
             .cloned()
     }
 
-    fn commit_staged(&mut self, _: &CommitStaged, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn commit_staged(
+        &mut self,
+        _: &CommitStaged,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(repository) = self.selected_repository() {
             self.commit_repository(repository.key, window, cx);
         }
@@ -445,6 +437,14 @@ impl VcsPanel {
         let Some(store) = self.store.clone() else {
             return;
         };
+        if !store
+            .read(cx)
+            .repository_operations(&key)
+            .contains(&RepositoryOperationKind::Commit)
+        {
+            self.unsupported_action(cx);
+            return;
+        }
         crate::vcs_repository_ui::show_commit(
             self.workspace.clone(),
             store,
@@ -454,7 +454,12 @@ impl VcsPanel {
         );
     }
 
-    fn switch_branch(&mut self, _: &SwitchBranch, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn switch_branch(
+        &mut self,
+        _: &SwitchBranch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(repository) = self.selected_repository() {
             self.switch_repository_branch(repository.key, window, cx);
         }
@@ -577,6 +582,23 @@ impl VcsPanel {
         let Some(store) = self.store.clone() else {
             return;
         };
+        if !store
+            .read(cx)
+            .file_operations_for_path(&row.repository, &row.path)
+            .contains(&operation)
+        {
+            self.error = Some(
+                row.change
+                    .as_ref()
+                    .and_then(|change| change.unavailable_reason.clone())
+                    .unwrap_or_else(|| {
+                        "This operation is unavailable for this file or checkout.".into()
+                    })
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
         self.error = None;
         let task = store.update(cx, |store, cx| {
             store.run_file_operation(row.repository, row.path, operation, cx)
@@ -596,6 +618,16 @@ impl VcsPanel {
     }
 
     fn open_diff(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_diff_with_focus(index, true, window, cx);
+    }
+
+    fn open_diff_with_focus(
+        &mut self,
+        index: usize,
+        focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(row) = self.rows.get(index).cloned() else {
             return;
         };
@@ -608,11 +640,68 @@ impl VcsPanel {
         if change.kind != ContentKind::File {
             return;
         }
-        let Some(store) = self.store.clone() else {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                crate::vcs_project_diff::deploy_at_with_focus(
+                    workspace,
+                    row.repository,
+                    Some(row.path),
+                    focus,
+                    window,
+                    cx,
+                );
+            })
+            .log_err();
+    }
+
+    fn open_entry_on_click(
+        &mut self,
+        index: usize,
+        secondary: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected = Some(index);
+        let primary = GitPanelSettings::get_global(cx).entry_primary_click_action;
+        match git_panel::entry_click_action(primary, secondary) {
+            GitPanelClickBehavior::ProjectDiff => {
+                self.open_diff_with_focus(index, false, window, cx);
+                self.focus.focus(window, cx);
+            }
+            GitPanelClickBehavior::FileDiff => self.open_file_diff(index, window, cx),
+            GitPanelClickBehavior::ViewFile => self.view_file(&git::ViewFile, window, cx),
+        }
+    }
+
+    fn secondary_confirm(
+        &mut self,
+        _: &menu::SecondaryConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.selected {
+            self.open_file_diff(index, window, cx);
+        }
+    }
+
+    fn open_file_diff(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.rows.get(index).cloned() else {
             return;
         };
-        let item_key = (row.repository.clone(), row.path.clone());
-        if let Some(item) = self.opened.get(&item_key).and_then(WeakEntity::upgrade) {
+        let Some(change) = &row.change else {
+            return;
+        };
+        self.selected = Some(index);
+        self.error = None;
+        cx.notify();
+        if change.kind != ContentKind::File {
+            return;
+        }
+        if let Some(item) = self
+            .opened
+            .get(&(row.repository.clone(), row.path.clone()))
+            .and_then(WeakEntity::upgrade)
+        {
             self.workspace
                 .update(cx, |workspace, cx| {
                     workspace.activate_item(&item, true, true, window, cx)
@@ -620,14 +709,18 @@ impl VcsPanel {
                 .log_err();
             return;
         }
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let key = (row.repository.clone(), row.path.clone());
         let task = store.update(cx, |store, cx| {
-            store.open_diff(row.repository.clone(), row.path.clone(), cx)
+            store.open_diff(row.repository, row.path, cx)
         });
         cx.spawn_in(window, async move |this, cx| {
             let result: Result<()> = async {
                 let opened_diff = task.await?;
                 this.update_in(cx, |this, window, cx| {
-                    this.show_comparison(item_key, opened_diff, window, cx)
+                    this.show_comparison(key, opened_diff, window, cx)
                 })??;
                 Ok(())
             }
@@ -641,6 +734,181 @@ impl VcsPanel {
             }
         })
         .detach();
+    }
+
+    fn view_file(&mut self, _: &git::ViewFile, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.selected_file().cloned() else {
+            return;
+        };
+        self.error = None;
+        cx.notify();
+        if row
+            .change
+            .as_ref()
+            .is_none_or(|change| change.kind != ContentKind::File)
+        {
+            return;
+        }
+        let path = match RelPath::from_unix_str(&row.path) {
+            Ok(path) => ProjectPath {
+                worktree_id: row.repository.worktree_id,
+                path: Arc::from(path),
+            },
+            Err(error) => {
+                self.error = Some(format!("{error:#}").into());
+                return;
+            }
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                workspace
+                    .open_path_preview(path, None, false, false, true, window, cx)
+                    .detach_and_notify_err(self.workspace.clone(), window, cx);
+            })
+            .log_err();
+    }
+
+    pub(crate) fn select_repository(&mut self, key: VcsRepositoryId, cx: &mut Context<Self>) {
+        if self.selected_repository_id.as_ref() != Some(&key) {
+            self.selected_repository_id = Some(key);
+            self.selected = None;
+            self.error = None;
+            self.update_entries(cx);
+        }
+    }
+
+    pub(crate) fn selected_repository_id(&self) -> Option<VcsRepositoryId> {
+        self.selected_repository_id.clone()
+    }
+
+    pub(crate) fn has_repositories_or_errors(&self, cx: &App) -> bool {
+        !self.repositories.is_empty()
+            || self
+                .store
+                .as_ref()
+                .is_some_and(|store| !store.read(cx).errors().is_empty())
+    }
+
+    pub(crate) fn change_count(&self) -> usize {
+        self.rows.iter().filter(|row| row.change.is_some()).count()
+    }
+
+    fn show_project_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(key) = self.selected_repository_id() else {
+            return;
+        };
+        self.workspace
+            .update(cx, |workspace, cx| {
+                crate::vcs_project_diff::deploy_at(workspace, key, None, window, cx);
+            })
+            .log_err();
+    }
+
+    fn next_entry(
+        &mut self,
+        _: &git_panel::NextEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_next(&menu::SelectNext, window, cx);
+        if let Some(index) = self.selected {
+            self.scroll_handle
+                .scroll_to_item(index, ScrollStrategy::Center);
+            self.open_diff_with_focus(index, false, window, cx);
+        }
+    }
+
+    fn previous_entry(
+        &mut self,
+        _: &git_panel::PreviousEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_previous(&menu::SelectPrevious, window, cx);
+        if let Some(index) = self.selected {
+            self.scroll_handle
+                .scroll_to_item(index, ScrollStrategy::Center);
+            self.open_diff_with_focus(index, false, window, cx);
+        }
+    }
+
+    fn first_entry(
+        &mut self,
+        _: &git_panel::FirstEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected = self.rows.iter().position(|row| row.change.is_some());
+        if let Some(index) = self.selected {
+            self.scroll_handle
+                .scroll_to_item(index, ScrollStrategy::Center);
+            self.open_diff_with_focus(index, false, window, cx);
+        }
+    }
+
+    fn last_entry(
+        &mut self,
+        _: &git_panel::LastEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected = self.rows.iter().rposition(|row| row.change.is_some());
+        if let Some(index) = self.selected {
+            self.scroll_handle
+                .scroll_to_item(index, ScrollStrategy::Center);
+            self.open_diff_with_focus(index, false, window, cx);
+        }
+    }
+
+    fn copy_path(
+        &mut self,
+        _: &zed_actions::workspace::CopyPath,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(row) = self.selected_file()
+            && let Some(repository) = self.selected_repository()
+        {
+            match vcs::local_path(&repository.descriptor.scope_uri) {
+                Ok(scope) => cx.write_to_clipboard(ClipboardItem::new_string(
+                    scope.join(&row.path).to_string_lossy().into_owned(),
+                )),
+                Err(error) => self.error = Some(format!("{error:#}").into()),
+            }
+        }
+    }
+
+    fn copy_relative_path(
+        &mut self,
+        _: &zed_actions::workspace::CopyRelativePath,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(row) = self.selected_file() {
+            cx.write_to_clipboard(ClipboardItem::new_string(row.path.clone()));
+        }
+    }
+
+    fn toggle_staged(&mut self, _: &git::ToggleStaged, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.selected_file() else {
+            return;
+        };
+        let staged = self
+            .selected_repository()
+            .and_then(|repository| repository.repository_state)
+            .is_some_and(|state| state.staged_paths.contains(&row.path));
+        self.run_file_operation(
+            if staged {
+                FileOperation::Unstage
+            } else {
+                FileOperation::Stage
+            },
+            cx,
+        );
+    }
+
+    pub(crate) fn unsupported_action(&mut self, cx: &mut Context<Self>) {
+        self.error = Some("This action is unavailable for the selected external repository. Use its supported file or repository actions.".into());
         cx.notify();
     }
 
@@ -674,41 +942,58 @@ impl VcsPanel {
         range
             .filter_map(|index| self.rows.get(index).cloned().map(|row| (index, row)))
             .map(|(index, row)| {
-                let mut label = row.label;
-                let (status, color) = match row.change.as_ref().map(|change| change.status) {
-                    Some(ChangeStatus::Added) => ("A", Color::Success),
-                    Some(ChangeStatus::Untracked) => ("?", Color::Success),
-                    Some(ChangeStatus::Modified) => ("M", Color::Warning),
-                    Some(ChangeStatus::Deleted) => ("D", Color::Error),
-                    Some(ChangeStatus::Renamed) => ("R", Color::Muted),
-                    None => ("", Color::Muted),
+                let Some(change) = row.change.as_ref() else {
+                    return ListItem::new(index)
+                        .inset(true)
+                        .disabled(true)
+                        .child(Label::new(row.label).color(Color::Muted))
+                        .into_any_element();
                 };
-                if let Some(change) = &row.change {
-                    match change.kind {
-                        ContentKind::File => {}
-                        ContentKind::Binary => label.push_str(" (binary)"),
-                        ContentKind::Symlink => label.push_str(" (symlink)"),
-                        ContentKind::Submodule => label.push_str(" (submodule)"),
-                    }
-                    if let Some(old_path) = &change.old_path {
-                        label = format!("{old_path} → {label}");
-                    }
-                    if change.old_mode.is_some()
-                        && change.new_mode.is_some()
-                        && change.old_mode != change.new_mode
-                    {
-                        label.push_str(" (mode changed)");
-                    }
-                }
+                let (status, color) = match change.status {
+                    ChangeStatus::Added => ("A", Color::VersionControlAdded),
+                    ChangeStatus::Untracked => ("?", Color::VersionControlAdded),
+                    ChangeStatus::Modified => ("M", Color::VersionControlModified),
+                    ChangeStatus::Deleted => ("D", Color::Disabled),
+                    ChangeStatus::Renamed => ("R", Color::VersionControlModified),
+                };
+                let path = Path::new(&row.path);
+                let parent = path
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .map(|path| path.to_string_lossy().into_owned());
+                let icon = GitPanelSettings::get_global(cx)
+                    .file_icons
+                    .then(|| FileIcons::get_icon(path, cx))
+                    .flatten();
                 ListItem::new(index)
                     .inset(true)
-                    .indent_level(row.depth)
+                    .spacing(ListItemSpacing::Sparse)
                     .toggle_state(self.selected == Some(index))
-                    .disabled(row.change.is_none())
-                    .child(Label::new(label).color(color))
-                    .end_slot(Label::new(status).color(color))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .overflow_hidden()
+                            .when_some(icon, |this, icon| {
+                                this.child(Icon::from_path(icon).size(IconSize::Small))
+                            })
+                            .child(Label::new(row.label).color(color))
+                            .when_some(parent, |this, parent| {
+                                this.child(
+                                    Label::new(parent)
+                                        .color(Color::Muted)
+                                        .size(LabelSize::Small),
+                                )
+                            }),
+                    )
+                    .end_slot(Label::new(status).color(color).size(LabelSize::Small))
+                    .tooltip(Tooltip::text(match &change.old_path {
+                        Some(old) => format!("{old} → {}", row.path),
+                        None => row.path.clone(),
+                    }))
                     .on_click(
-                        cx.listener(move |this, _, window, cx| this.open_diff(index, window, cx)),
+                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                            this.open_entry_on_click(index, event.click_count() > 1, window, cx)
+                        }),
                     )
                     .into_any_element()
             })
@@ -761,58 +1046,26 @@ fn add_comparison(
 }
 
 fn rows_for_repositories(repositories: &[(&VcsRepositorySnapshot, Vec<Change>)]) -> Vec<Row> {
-    let mut rows = Vec::new();
-    for (repository, changes) in repositories {
-        rows.push(Row {
-            repository: repository.key.clone(),
-            path: String::new(),
-            label: format!(
-                "{} — {}",
-                repository.descriptor.display_name, repository.descriptor.scope_uri
-            ),
-            depth: 0,
-            change: None,
-        });
-        let mut entries = BTreeMap::new();
-        for change in changes {
-            let components: Vec<_> = change.path.split('/').collect();
-            for depth in 1..components.len() {
-                let path = components[..depth].join("/");
-                entries
-                    .entry(
-                        components[..depth]
-                            .iter()
-                            .map(|part| part.to_string())
-                            .collect::<Vec<_>>(),
-                    )
-                    .or_insert(Row {
-                        repository: repository.key.clone(),
-                        path,
-                        label: components[depth - 1].to_owned(),
-                        depth,
-                        change: None,
-                    });
-            }
-            entries.insert(
-                components
-                    .iter()
-                    .map(|part| part.to_string())
-                    .collect::<Vec<_>>(),
-                Row {
-                    repository: repository.key.clone(),
-                    path: change.path.clone(),
-                    label: components.last().unwrap_or(&"").to_string(),
-                    depth: components.len(),
-                    change: Some(change.clone()),
-                },
-            );
-        }
-        rows.extend(entries.into_values());
-    }
+    let mut rows = repositories
+        .iter()
+        .flat_map(|(repository, changes)| {
+            changes.iter().map(|change| Row {
+                repository: repository.key.clone(),
+                path: change.path.clone(),
+                label: change
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&change.path)
+                    .to_owned(),
+                change: Some(change.clone()),
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.path.cmp(&right.path));
     rows
 }
 
-impl EventEmitter<PanelEvent> for VcsPanel {}
 impl Focusable for VcsPanel {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus.clone()
@@ -821,6 +1074,7 @@ impl Focusable for VcsPanel {
 
 impl Render for VcsPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let repository = self.selected_repository();
         let errors = self
             .store
             .as_ref()
@@ -831,321 +1085,229 @@ impl Render for VcsPanel {
                 .store
                 .as_ref()
                 .is_some_and(|store| store.read(cx).file_operation_running());
-        let file_actions = self.selected_file().map(|row| {
-            let unresolved = self
-                .store
-                .as_ref()
-                .is_some_and(|store| store.read(cx).file_operation_unresolved(&row.repository));
-            let operations = self
-                .store
-                .as_ref()
-                .map(|store| store.read(cx).file_operations_for_path(&row.repository, &row.path))
-                .unwrap_or_default();
-            v_flex()
-                .px_2()
-                .py_1()
-                .gap_1()
-                .child(Label::new(row.path.clone()).size(LabelSize::Small))
-                .child(
-                    h_flex()
-                        .flex_wrap()
-                        .gap_1()
-                        .child(
-                            Button::new("vcs-stage-file", "Stage File")
-                                .disabled(
-                                    operation_running
-                                        || unresolved
-                                        || !operations.contains(&FileOperation::Stage),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.run_file_operation(FileOperation::Stage, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("vcs-unstage-file", "Unstage File")
-                                .disabled(
-                                    operation_running
-                                        || unresolved
-                                        || !operations.contains(&FileOperation::Unstage),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.run_file_operation(FileOperation::Unstage, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("vcs-discard-file", "Discard Unstaged")
-                                .disabled(
-                                    operation_running
-                                        || unresolved
-                                        || !operations.contains(&FileOperation::Discard),
-                                )
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.discard_file(&DiscardFile, window, cx);
-                                })),
-                        ),
-                )
-                .when(operations.is_empty(), |element| {
-                    element.child(
-                        Label::new(row.change.as_ref().and_then(|change| change.unavailable_reason.clone()).unwrap_or_else(|| "This provider does not support file operations for this change.".into()))
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    )
+        let repository_operations = repository
+            .as_ref()
+            .and_then(|repository| {
+                self.store
+                    .as_ref()
+                    .map(|store| store.read(cx).repository_operations(&repository.key))
+            })
+            .unwrap_or_default();
+        let file_operations = self
+            .selected_file()
+            .and_then(|row| {
+                self.store.as_ref().map(|store| {
+                    store
+                        .read(cx)
+                        .file_operations_for_path(&row.repository, &row.path)
                 })
-                .when(unresolved && !operation_running, |element| {
-                    element.child(
-                        Label::new("Refresh to reconcile the previous operation.")
-                            .size(LabelSize::Small)
-                            .color(Color::Warning),
-                    )
-                })
+            })
+            .unwrap_or_default();
+        let unresolved = repository.as_ref().is_some_and(|repository| {
+            self.store.as_ref().is_some_and(|store| {
+                let store = store.read(cx);
+                store.file_operation_unresolved(&repository.key)
+                    || store.repository_operation_unresolved(&repository.key)
+            })
         });
-        let has_errors = self.error.is_some()
-            || !errors.is_empty()
-            || self.repositories.iter().any(|repository| {
-                repository.error.is_some()
-                    || self.store.as_ref().is_some_and(|store| {
-                        store
-                            .read(cx)
-                            .file_operation_error(&repository.key)
-                            .is_some()
-                    })
-            });
-        let repository_headers =
-            self.repositories
-                .iter()
-                .enumerate()
-                .map(|(repository_index, repository)| {
-                    let key = repository.key.clone();
-                    let repository_operations = self
-                        .store
-                        .as_ref()
-                        .map(|store| store.read(cx).repository_operations(&key))
-                        .unwrap_or_default();
-                    let repository_blocked = operation_running
-                        || repository.repository_state.is_none()
-                        || repository.repository_state_error.is_some()
-                        || self.store.as_ref().is_some_and(|store| {
-                            store.read(cx).repository_operation_unresolved(&key)
-                        });
-                    let commit_key = key.clone();
-                    let branch_key = key.clone();
-                    let checkout_key = key.clone();
-                    let has_checkout_catalog = self
-                        .store
-                        .as_ref()
-                        .is_some_and(|store| store.read(cx).checkout_catalog_available(&key));
-                    let operation_error = self
-                        .store
-                        .as_ref()
-                        .and_then(|store| store.read(cx).file_operation_error(&key));
-                    let baselines = repository
-                        .descriptor
-                        .baselines
-                        .iter()
-                        .enumerate()
-                        .map(|(index, baseline)| {
-                            let key = key.clone();
-                            let baseline_id = baseline.id.clone();
-                            Button::new(("baseline", index), baseline.label.clone())
-                                .toggle_state(repository.selected_baseline == baseline.id)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.error = None;
-                                    if let Some(store) = this.store.clone() {
-                                        if let Err(error) = store.update(cx, |store, cx| {
-                                            store.set_baseline(&key, baseline_id.clone(), cx)
-                                        }) {
-                                            this.error = Some(format!("{error:#}").into());
-                                        }
-                                    }
-                                    cx.notify();
-                                }))
-                        })
-                        .collect::<Vec<_>>();
-                    v_flex()
-                        .id(("vcs-repository", repository_index))
-                        .px_2()
-                        .py_1()
-                        .gap_1()
-                        .child(Label::new(repository.descriptor.display_name.clone()))
-                        .child(
-                            Label::new(repository.descriptor.scope_uri.clone())
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .child(h_flex().flex_wrap().gap_1().children(baselines))
-                        .when_some(
-                            repository
-                                .repository_state
-                                .as_ref()
-                                .and_then(|state| state.current_branch.as_ref()),
-                            |element, branch| {
-                                element.child(
-                                    Label::new(format!("Branch: {}", branch.name))
-                                        .size(LabelSize::Small),
-                                )
-                            },
-                        )
-                        .child(
-                            h_flex()
-                                .flex_wrap()
-                                .gap_1()
-                                .child(
-                                    Button::new(
-                                        ("vcs-commit-staged", repository_index),
-                                        "Commit Staged",
-                                    )
-                                    .disabled(
-                                        repository_blocked
-                                            || !repository_operations
-                                                .contains(&RepositoryOperationKind::Commit)
-                                            || repository
-                                                .repository_state
-                                                .as_ref()
-                                                .is_none_or(|state| state.staged_paths.is_empty()),
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _, window, cx| {
-                                            this.commit_repository(commit_key.clone(), window, cx)
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    Button::new(
-                                        ("vcs-switch-branch", repository_index),
-                                        "Switch Branch",
-                                    )
-                                    .disabled(
-                                        repository_blocked
-                                            || !repository_operations
-                                                .contains(&RepositoryOperationKind::SwitchBranch),
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _, window, cx| {
-                                            this.switch_repository_branch(
-                                                branch_key.clone(),
-                                                window,
-                                                cx,
-                                            )
-                                        },
-                                    )),
-                                ),
-                        )
-                        .when(has_checkout_catalog, |element| {
-                            element.child(
-                                Button::new(("vcs-checkouts", repository_index), "Checkouts")
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        if let Some(workspace) = this.workspace.upgrade() {
-                                            workspace.update(cx, |workspace, cx| {
-                                                git_ui_core::vcs_checkout_picker::show(
-                                                    workspace,
-                                                    Some(checkout_key.clone()),
-                                                    window,
-                                                    cx,
-                                                );
-                                            });
-                                        }
-                                    })),
-                            )
-                        })
-                        .when(repository.show_loading, |element| {
-                            element.child(Label::new("Loading changes…").color(Color::Muted))
-                        })
-                        .when_some(repository.error.clone(), |element, error| {
-                            element.child(Label::new(error).color(Color::Error))
-                        })
-                        .when_some(operation_error, |element, error| {
-                            element.child(Label::new(error).color(Color::Error))
-                        })
-                        .when_some(
-                            repository.repository_state_error.clone(),
-                            |element, error| element.child(Label::new(error).color(Color::Error)),
-                        )
-                })
-                .collect::<Vec<_>>();
+        let blocked = operation_running || unresolved;
+        let operation_error = repository.as_ref().and_then(|repository| {
+            self.store
+                .as_ref()
+                .and_then(|store| store.read(cx).file_operation_error(&repository.key))
+        });
+        let read_only_reason = repository.as_ref().and_then(|repository| {
+            let store = self.store.as_ref()?.read(cx);
+            if !store.file_operations(&repository.key).is_empty() || !repository_operations.is_empty() { return None; }
+            Some(self.selected_file().and_then(|row| row.change.as_ref()).and_then(|change| change.unavailable_reason.clone())
+                .unwrap_or_else(|| "Read-only repository: the provider does not allow changes in this checkout.".into()))
+        });
+        let count = self.change_count();
+        let loading = repository
+            .as_ref()
+            .is_some_and(|repository| repository.show_loading);
+        let repository_error = repository
+            .as_ref()
+            .and_then(|repository| repository.error.clone());
+        let repository_state_error = repository
+            .as_ref()
+            .and_then(|repository| repository.repository_state_error.clone());
+        let mut context = gpui::KeyContext::new_with_defaults();
+        context.add("GitPanel");
+        context.add("menu");
+        context.add("ChangesList");
         v_flex()
-            .id("vcs-panel")
-            .key_context("VcsPanel")
+            .id("vcs-changes-body")
+            .key_context(context)
             .track_focus(&self.focus)
+            .flex_1()
             .size_full()
-            .bg(cx.theme().colors().panel_background)
+            .overflow_hidden()
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::next_entry))
+            .on_action(cx.listener(Self::previous_entry))
+            .on_action(cx.listener(Self::first_entry))
+            .on_action(cx.listener(Self::last_entry))
             .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::secondary_confirm))
+            .on_action(cx.listener(Self::view_file))
+            .on_action(cx.listener(Self::copy_path))
+            .on_action(cx.listener(Self::copy_relative_path))
+            .on_action(cx.listener(Self::toggle_staged))
             .on_action(cx.listener(Self::stage_file))
             .on_action(cx.listener(Self::unstage_file))
             .on_action(cx.listener(Self::discard_file))
             .on_action(cx.listener(Self::commit_staged))
             .on_action(cx.listener(Self::switch_branch))
+            .on_action(cx.listener(|this, _: &git::StageFile, _, cx| {
+                this.run_file_operation(FileOperation::Stage, cx)
+            }))
+            .on_action(cx.listener(|this, _: &git::UnstageFile, _, cx| {
+                this.run_file_operation(FileOperation::Unstage, cx)
+            }))
+            .on_action(cx.listener(|this, _: &git::RestoreFile, window, cx| {
+                this.discard_file(&DiscardFile, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &git::Commit, window, cx| {
+                this.commit_staged(&CommitStaged, window, cx)
+            }))
             .child(
                 h_flex()
-                    .p_2()
+                    .min_h(Tab::container_height(cx))
+                    .w_full()
+                    .pl_1()
+                    .pr_2()
+                    .gap_1()
                     .justify_between()
-                    .child(Label::new("Source Control"))
                     .child(
-                        Button::new("vcs-diagnostics", "Diagnostics").on_click(cx.listener(
-                            |this, _, window, cx| {
-                                this.workspace
-                                    .update(cx, |workspace, cx| {
-                                        show_diagnostics(workspace, window, cx)
-                                    })
-                                    .log_err();
-                            },
-                        )),
+                        ButtonLike::new("diff-button")
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Icon::new(IconName::Diff)
+                                            .size(IconSize::Small)
+                                            .color(Color::Muted),
+                                    )
+                                    .child(
+                                        Label::new("View Diff")
+                                            .size(LabelSize::Small)
+                                            .color(Color::Muted),
+                                    ),
+                            )
+                            .tooltip(Tooltip::for_action_title(
+                                "View Diff",
+                                &crate::project_diff::Diff,
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.show_project_diff(window, cx)
+                            })),
                     )
                     .child(
-                        IconButton::new("refresh-vcs", IconName::ArrowCircle)
-                            .disabled(operation_running)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.error = None;
-                                if let Some(store) = &this.store {
-                                    store.update(cx, |store, cx| store.refresh_all(cx));
-                                }
-                            })),
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Label::new(count.to_string())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                IconButton::new("vcs-diagnostics", IconName::Ellipsis)
+                                    .tooltip(Tooltip::text("Provider diagnostics"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.workspace
+                                            .update(cx, |workspace, cx| {
+                                                show_diagnostics(workspace, window, cx)
+                                            })
+                                            .log_err();
+                                    })),
+                            )
+                            .child(
+                                IconButton::new("refresh-vcs", IconName::ArrowCircle)
+                                    .disabled(operation_running)
+                                    .tooltip(Tooltip::text("Refresh changes"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.error = None;
+                                        if let Some(store) = &this.store {
+                                            store.update(cx, |store, cx| store.refresh_all(cx));
+                                        }
+                                    })),
+                            ),
                     ),
             )
-            .children(repository_headers)
-            .children(file_actions)
-            .when(operation_running, |element| {
-                element.child(
+            .when_some(repository.clone(), |this, repository| {
+                this.child(
+                    h_flex().px_2().py_1().gap_1().flex_wrap().children(
+                        repository
+                            .descriptor
+                            .baselines
+                            .iter()
+                            .enumerate()
+                            .map(|(index, baseline)| {
+                                let key = repository.key.clone();
+                                let baseline_id = baseline.id.clone();
+                                Button::new(("vcs-baseline", index), baseline.label.clone())
+                                    .label_size(LabelSize::Small)
+                                    .toggle_state(repository.selected_baseline == baseline.id)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.error = None;
+                                        if let Some(store) = &this.store
+                                            && let Err(error) = store.update(cx, |store, cx| {
+                                                store.set_baseline(&key, baseline_id.clone(), cx)
+                                            })
+                                        {
+                                            this.error = Some(format!("{error:#}").into());
+                                        }
+                                        cx.notify();
+                                    }))
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                )
+            })
+            .when(loading, |this| {
+                this.child(
                     div()
                         .px_2()
-                        .child(Label::new("Updating source control…").color(Color::Muted)),
+                        .child(Label::new("Loading changes…").color(Color::Muted)),
                 )
             })
             .children(
                 errors
                     .into_iter()
-                    .map(|error| Label::new(error).color(Color::Error)),
+                    .chain(repository_error)
+                    .chain(repository_state_error)
+                    .chain(operation_error)
+                    .chain(self.error.clone())
+                    .map(|error| {
+                        div()
+                            .px_2()
+                            .py_1()
+                            .child(Label::new(error).size(LabelSize::Small).color(Color::Error))
+                    }),
             )
-            .when_some(self.error.clone(), |element, error| {
-                element.child(Label::new(error).color(Color::Error))
-            })
-            .when_some(self.metadata_notice(), |element, notice| {
-                element.child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .child(Label::new(notice).color(Color::Muted)),
+            .when_some(self.metadata_notice(), |this, notice| {
+                this.child(
+                    div().px_2().child(
+                        Label::new(notice)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
                 )
             })
-            .when(
-                self.rows.iter().all(|row| row.change.is_none())
-                    && !has_errors
-                    && !self
-                        .repositories
-                        .iter()
-                        .any(|repository| repository.show_loading),
-                |element| {
-                    element.child(
-                        Label::new(if self.repositories.is_empty() {
-                            "No external source-control repository"
-                        } else {
+            .when(count == 0 && !loading, |this| {
+                this.child(
+                    div().p_4().child(
+                        Label::new(if repository.is_some() {
                             "No changes for this comparison"
+                        } else {
+                            "No repository available"
                         })
                         .color(Color::Muted),
-                    )
-                },
-            )
+                    ),
+                )
+            })
             .child(
                 uniform_list(
                     "vcs-changes",
@@ -1155,54 +1317,185 @@ impl Render for VcsPanel {
                 .track_scroll(&self.scroll_handle)
                 .flex_1(),
             )
-    }
-}
-
-impl Panel for VcsPanel {
-    fn persistent_name() -> &'static str {
-        "VcsPanel"
-    }
-    fn panel_key() -> &'static str {
-        "vcs"
-    }
-    fn position(&self, _: &Window, _: &App) -> DockPosition {
-        self.position
-    }
-    fn position_is_valid(&self, position: DockPosition) -> bool {
-        matches!(position, DockPosition::Left | DockPosition::Right)
-    }
-    fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
-        self.position = position;
-        cx.notify();
-    }
-    fn default_size(&self, _: &Window, _: &App) -> Pixels {
-        px(300.)
-    }
-    fn icon(&self, _: &Window, _: &App) -> Option<IconName> {
-        Some(IconName::GitBranch)
-    }
-    fn icon_tooltip(&self, _: &Window, _: &App) -> Option<&'static str> {
-        Some("Source Control")
-    }
-    fn toggle_action(&self) -> Box<dyn Action> {
-        Box::new(ToggleFocus)
-    }
-    fn activation_priority(&self) -> u32 {
-        3
-    }
-    fn enabled(&self, cx: &App) -> bool {
-        !self.repositories.is_empty()
-            || self
-                .store
-                .as_ref()
-                .is_some_and(|store| !store.read(cx).errors().is_empty())
+            .when_some(read_only_reason, |this, reason| {
+                this.child(
+                    div().px_2().py_1().child(
+                        Label::new(reason)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
+            .when(unresolved, |this| {
+                this.child(
+                    div().px_2().py_1().child(
+                        Label::new("Refresh to reconcile the previous operation.")
+                            .size(LabelSize::Small)
+                            .color(Color::Warning),
+                    ),
+                )
+            })
+            .when(operation_running, |this| {
+                this.child(
+                    div().px_2().py_1().child(
+                        Label::new("Updating source control…")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                )
+            })
+            .when(!file_operations.is_empty(), |this| {
+                this.child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_1()
+                        .child(
+                            Button::new("vcs-stage-file", "Stage File")
+                                .label_size(LabelSize::Small)
+                                .disabled(
+                                    blocked || !file_operations.contains(&FileOperation::Stage),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.run_file_operation(FileOperation::Stage, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("vcs-unstage-file", "Unstage File")
+                                .label_size(LabelSize::Small)
+                                .disabled(
+                                    blocked || !file_operations.contains(&FileOperation::Unstage),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.run_file_operation(FileOperation::Unstage, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("vcs-discard-file", "Discard")
+                                .label_size(LabelSize::Small)
+                                .disabled(
+                                    blocked || !file_operations.contains(&FileOperation::Discard),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.discard_file(&DiscardFile, window, cx)
+                                })),
+                        ),
+                )
+            })
+            .when(
+                repository_operations.contains(&RepositoryOperationKind::Commit),
+                |this| {
+                    this.child(
+                        div().px_2().py_1().child(
+                            Button::new("vcs-commit-staged", "Commit Staged")
+                                .full_width()
+                                .disabled(
+                                    blocked
+                                        || repository
+                                            .as_ref()
+                                            .and_then(|repository| {
+                                                repository.repository_state.as_ref()
+                                            })
+                                            .is_none_or(|state| state.staged_paths.is_empty()),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.commit_staged(&CommitStaged, window, cx)
+                                })),
+                        ),
+                    )
+                },
+            )
+            .when_some(repository, |this, repository| {
+                let branch = repository
+                    .repository_state
+                    .as_ref()
+                    .and_then(|state| state.current_branch.as_ref())
+                    .map(|branch| branch.name.clone());
+                let has_checkouts = self.store.as_ref().is_some_and(|store| {
+                    store.read(cx).checkout_catalog_available(&repository.key)
+                });
+                let key = repository.key.clone();
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .px_2()
+                        .py_1p5()
+                        .gap_1()
+                        .justify_between()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border_variant)
+                        .child(
+                            h_flex()
+                                .min_w_0()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::GitBranch)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Button::new(
+                                        "vcs-repository-selector",
+                                        repository.descriptor.display_name,
+                                    )
+                                    .size(ButtonSize::None)
+                                    .label_size(LabelSize::Small)
+                                    .truncate(true)
+                                    .tooltip(Tooltip::text("Switch Active Repository"))
+                                    .on_click(
+                                        |_, window, cx| {
+                                            window.dispatch_action(
+                                                zed_actions::git::SelectRepo.boxed_clone(),
+                                                cx,
+                                            )
+                                        },
+                                    ),
+                                )
+                                .when_some(branch, |this, branch| {
+                                    this.child(Label::new("/").color(Color::Muted)).child(
+                                        Button::new("vcs-branch-selector", branch)
+                                            .size(ButtonSize::None)
+                                            .label_size(LabelSize::Small)
+                                            .truncate(true)
+                                            .disabled(
+                                                blocked
+                                                    || !repository_operations.contains(
+                                                        &RepositoryOperationKind::SwitchBranch,
+                                                    ),
+                                            )
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.switch_branch(&SwitchBranch, window, cx)
+                                            })),
+                                    )
+                                }),
+                        )
+                        .when(has_checkouts, |this| {
+                            this.child(
+                                Button::new("vcs-checkouts", "Checkouts")
+                                    .label_size(LabelSize::Small)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.workspace
+                                            .update(cx, |workspace, cx| {
+                                                git_ui_core::vcs_checkout_picker::show(
+                                                    workspace,
+                                                    Some(key.clone()),
+                                                    window,
+                                                    cx,
+                                                )
+                                            })
+                                            .log_err();
+                                    })),
+                            )
+                        }),
+                )
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, UpdateGlobal};
     use project::FakeFs;
     use settings::{DiffViewStyle, SettingsStore};
     use std::sync::Arc;
@@ -1363,7 +1656,6 @@ mod tests {
                 repository,
                 path: "file.txt".into(),
                 label: "file.txt".into(),
-                depth: 1,
                 change: Some(Change {
                     path: "file.txt".into(),
                     old_path: None,
@@ -1400,7 +1692,9 @@ mod tests {
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.activate_item(&normal_editor, true, true, window, cx);
         });
-        panel.update_in(cx, |panel, window, cx| panel.open_diff(0, window, cx));
+        panel.update_in(cx, |panel, window, cx| {
+            panel.open_entry_on_click(0, true, window, cx)
+        });
         workspace.read_with(cx, |workspace, cx| {
             assert_eq!(
                 workspace.active_item(cx).unwrap().item_id(),
@@ -1409,6 +1703,32 @@ mod tests {
             );
             assert_eq!(workspace.active_pane().read(cx).items_len(), 2);
         });
+        for (setting, expected_item) in [
+            (GitPanelClickBehavior::FileDiff, comparison.entity_id()),
+            (GitPanelClickBehavior::ViewFile, normal.item_id()),
+        ] {
+            cx.update(|_, cx| {
+                SettingsStore::update_global(cx, |store, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings
+                            .git_panel
+                            .get_or_insert_default()
+                            .entry_primary_click_action = Some(setting);
+                    });
+                })
+            });
+            panel.update_in(cx, |panel, window, cx| {
+                panel.open_entry_on_click(0, false, window, cx)
+            });
+            cx.run_until_parked();
+            workspace.read_with(cx, |workspace, cx| {
+                assert_eq!(
+                    workspace.active_item(cx).expect("clicked item").item_id(),
+                    expected_item
+                );
+                assert_eq!(workspace.active_pane().read(cx).items_len(), 2);
+            });
+        }
         normal_editor.update(cx, |editor, cx| {
             editor.edit(
                 [(language::Point::zero()..language::Point::zero(), "live\n")],
@@ -1492,7 +1812,6 @@ mod tests {
                 repository: repository.clone(),
                 path: path.into(),
                 label: path.into(),
-                depth: 1,
                 change: Some(Change {
                     path: path.into(),
                     old_path: None,
@@ -1508,7 +1827,7 @@ mod tests {
             panel
                 .opened
                 .insert((repository, "working.txt".into()), editor.downgrade());
-            panel.open_diff(0, window, cx);
+            panel.open_file_diff(0, window, cx);
             assert!(
                 panel.error.is_none(),
                 "Metadata-only content must not become a provider error"
@@ -1520,14 +1839,14 @@ mod tests {
                 "metadata-only changes remain selectable for capability-gated file operations"
             );
             panel.error = Some("previous provider failure".into());
-            panel.open_diff(1, window, cx);
+            panel.open_file_diff(1, window, cx);
             assert!(
                 panel.error.is_none(),
                 "Opening an already cached text diff must clear a previous error"
             );
             assert_eq!(panel.selected, Some(1));
             assert!(panel.metadata_notice().is_none());
-            panel.open_diff(0, window, cx);
+            panel.open_file_diff(0, window, cx);
             panel.select_next(&menu::SelectNext, window, cx);
             assert!(panel.metadata_notice().is_none());
         });

@@ -6,7 +6,7 @@ use anyhow::{Context as _, Result, ensure};
 use extension::{ExtensionHostProxy, ExtensionManifest, ExtensionVcsProviderProxy as _};
 use extension_host::wasm_host::WasmHost;
 use gpui::{
-    AnyWindowHandle, AppContext as _, Bounds, Entity, Modifiers, UpdateGlobal as _,
+    AnyWindowHandle, AppContext as _, Bounds, Entity, Focusable as _, Modifiers, UpdateGlobal as _,
     VisualTestAppContext, WindowBounds, WindowHandle, WindowOptions, point, px, size,
 };
 use serde::Deserialize;
@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use workspace::{AppState, MultiWorkspace, Workspace};
+use workspace::{AppState, MultiWorkspace, Panel as _, Workspace};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -148,6 +148,30 @@ impl Scenario {
     }
 
     pub fn run(self, app: &Arc<AppState>, cx: &mut VisualTestAppContext) -> Result<()> {
+        cx.update(|cx| {
+            // The runner omits some application subsystems, but uses their bundled keymap.
+            let mut bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                cx,
+            )?;
+            for action in [
+                "git_panel::ToggleFocus",
+                "git::Diff",
+                "git_panel::NextEntry",
+            ] {
+                ensure!(
+                    bindings
+                        .iter()
+                        .any(|binding| binding.action().name() == action),
+                    "required source-control action missing from bundled keymap: {action}"
+                );
+            }
+            for binding in &mut bindings {
+                binding.set_meta(settings::KeybindSource::Default.meta());
+            }
+            cx.bind_keys(bindings);
+            anyhow::Ok(())
+        })?;
         let project = cx.update(|cx| {
             project::Project::local(
                 app.client.clone(),
@@ -213,7 +237,7 @@ impl Scenario {
         cx.background_executor.allow_parking();
         let panel = cx
             .foreground_executor
-            .block_test(git_ui::vcs_panel::VcsPanel::load(
+            .block_test(git_ui::git_panel::GitPanel::load(
                 workspace.downgrade(),
                 async_cx.clone(),
             ));
@@ -231,7 +255,7 @@ impl Scenario {
                 workspace.add_panel(project_panel, window, cx);
                 workspace.add_panel(panel, window, cx);
                 workspace.open_panel::<project_panel::ProjectPanel>(window, cx);
-                workspace.open_panel::<git_ui::vcs_panel::VcsPanel>(window, cx);
+                workspace.open_panel::<git_ui::git_panel::GitPanel>(window, cx);
             })
         })?;
         cx.run_until_parked();
@@ -345,7 +369,7 @@ impl Scenario {
                 if cx.read(|cx| {
                     workspace
                         .read(cx)
-                        .panel::<git_ui::vcs_panel::VcsPanel>(cx)
+                        .panel::<git_ui::git_panel::GitPanel>(cx)
                         .is_none()
                 }) {
                     let async_cx =
@@ -353,7 +377,30 @@ impl Scenario {
                     cx.background_executor.allow_parking();
                     let panel =
                         cx.foreground_executor
-                            .block_test(git_ui::vcs_panel::VcsPanel::load(
+                            .block_test(git_ui::git_panel::GitPanel::load(
+                                workspace.downgrade(),
+                                async_cx,
+                            ));
+                    cx.background_executor.forbid_parking();
+                    let panel = panel?;
+                    cx.update_window(*window, |_, window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.add_panel(panel, window, cx);
+                        })
+                    })?;
+                }
+                if cx.read(|cx| {
+                    workspace
+                        .read(cx)
+                        .panel::<project_panel::ProjectPanel>(cx)
+                        .is_none()
+                }) {
+                    let async_cx =
+                        cx.update_window(*window, |_, window, cx| window.to_async(cx))?;
+                    cx.background_executor.allow_parking();
+                    let panel =
+                        cx.foreground_executor
+                            .block_test(project_panel::ProjectPanel::load(
                                 workspace.downgrade(),
                                 async_cx,
                             ));
@@ -421,7 +468,8 @@ impl Scenario {
                     let ready = cx.read(|cx| {
                         let workspace = workspace.read(cx);
                         workspace
-                            .active_item_as::<editor::Editor>(cx)
+                            .active_item(cx)
+                            .and_then(|item| item.act_as::<editor::Editor>(cx))
                             .is_some_and(|editor| editor.read(cx).text(cx).ends_with(suffix))
                             && workspace
                                 .active_item(cx)
@@ -474,16 +522,49 @@ fn observe(
     let active = current_workspace(window, cx)
         .ok()
         .map(|workspace| workspace.entity_id());
-    let mut state = cx.read(|cx| {
-        let workspaces = app.workspace_store.read(cx).workspaces_with_windows().filter_map(|(handle, weak)| {
-            let workspace = weak.upgrade()?;
-            let entity_id = workspace.entity_id();
+    let workspaces = cx.read(|cx| {
+        app.workspace_store
+            .read(cx)
+            .workspaces_with_windows()
+            .filter_map(|(handle, weak)| weak.upgrade().map(|workspace| (handle, workspace)))
+            .collect::<Vec<_>>()
+    });
+    let workspaces = workspaces.into_iter().map(|(handle, workspace)| {
+        let current = handle == window && Some(workspace.entity_id()) == active;
+        cx.update_window(handle, |_, window, cx| {
             let workspace = workspace.read(cx);
+            let vcs_panel_registered = workspace.all_docks().into_iter().any(|dock| {
+                dock.read(cx).panel_index_for_persistent_name("VcsPanel", cx).is_some()
+            });
+            ensure!(!vcs_panel_registered, "external VCS panel must not be registered separately");
+            let git_panel = workspace.panel::<git_ui::git_panel::GitPanel>(cx);
+            let visible_panels = workspace.all_docks().into_iter().filter_map(|dock| {
+                dock.read(cx).visible_panel().map(|panel| panel.persistent_name())
+            }).collect::<Vec<_>>();
+            let active_item = workspace.active_item(cx);
+            let editor = active_item.as_ref().and_then(|item| item.act_as::<editor::Editor>(cx));
+            let split_editor = active_item.as_ref().and_then(|item| item.act_as::<editor::SplittableEditor>(cx));
+            let mut buffers = editor.as_ref().map(|editor| {
+                editor.read(cx).buffer().read(cx).all_buffers_iter().map(|buffer| {
+                    let id = buffer.entity_id().as_u64();
+                    let buffer = buffer.read(cx);
+                    json!({
+                        "id": id,
+                        "path": buffer.file().map(|file| file.full_path(cx)),
+                        "dirty": buffer.is_dirty(),
+                    })
+                }).collect::<Vec<_>>()
+            }).unwrap_or_default();
+            buffers.sort_by_key(|buffer| buffer["id"].as_u64());
+            let active_item_kind = editor.as_ref().map_or("other", |editor| {
+                if editor.read(cx).buffer().read(cx).is_singleton() { "editor" } else { "diff" }
+            });
             let project = workspace.project().read(cx);
             let repositories = project.vcs_store().map(|store| {
                 let store = store.read(cx);
                 store.repositories().into_iter().map(|repo| json!({
                     "descriptor": repo.descriptor,
+                    "selected_baseline": repo.selected_baseline,
                     "loading": repo.loading,
                     "error": repo.error.as_deref(),
                     "snapshot": repo.snapshot,
@@ -495,23 +576,42 @@ fn observe(
                     "progress": store.operation_progress(&repo.key),
                     "operation_unresolved": store.file_operation_unresolved(&repo.key),
                     "operation_error": store.file_operation_error(&repo.key).as_deref(),
+                    "file_operations": store.file_operations(&repo.key),
+                    "repository_operations": store.repository_operations(&repo.key),
+                    "checkout_operations": store.checkout_operations(&repo.key),
                 })).collect::<Vec<_>>()
             }).unwrap_or_default();
-            Some(json!({
-                "current": handle == window && Some(entity_id) == active,
+            Ok(json!({
+                "current": current,
                 "roots": workspace.root_paths(cx),
                 "git_repository_count": project.repositories(cx).len(),
                 "worktree_entry_count": project.visible_worktrees(cx).map(|worktree| worktree.read(cx).snapshot().entry_count()).sum::<usize>(),
-                "active_item_dirty": workspace.active_item(cx).map(|item| item.is_dirty(cx)),
-                "active_item_kind": if workspace.active_item_as::<editor::SplittableEditor>(cx).is_some() { "diff" } else if workspace.active_item_as::<editor::Editor>(cx).is_some() { "editor" } else { "other" },
+                "active_item_dirty": active_item.as_ref().map(|item| item.is_dirty(cx)),
+                "active_item_kind": active_item_kind,
+                "active_item_title": active_item.as_ref().map(|item| item.tab_content_text(0, cx)),
+                "active_item_buffers": buffers,
+                "active_diff_split": split_editor.as_ref().map(|editor| editor.read(cx).is_split()),
+                "panels": {
+                    "git": {
+                        "loaded": git_panel.is_some(),
+                        "external_selected": git_panel.as_ref().is_some_and(|panel| panel.read(cx).uses_vcs_panel(cx)),
+                        "enabled": git_panel.as_ref().is_some_and(|panel| panel.read(cx).enabled(cx)),
+                        "focused": git_panel.as_ref().is_some_and(|panel| panel.read(cx).focus_handle(cx).contains_focused(window, cx)),
+                    },
+                    "vcs": {"loaded": vcs_panel_registered},
+                },
+                "visible_panels": visible_panels,
                 "repositories": repositories,
                 "errors": project.vcs_store().map(|store| store.read(cx).errors().into_iter().map(|s| s.to_string()).collect::<Vec<_>>()),
                 "operation_running": project.vcs_store().is_some_and(|store| store.read(cx).file_operation_running()),
             }))
-        }).collect::<Vec<_>>();
-        let current = workspaces.iter().find(|item| item["current"] == true).cloned();
-        json!({"workspaces": workspaces, "current": current})
-    });
+        })?
+    }).collect::<Result<Vec<_>>>()?;
+    let current = workspaces
+        .iter()
+        .find(|item| item["current"] == true)
+        .cloned();
+    let mut state = json!({"workspaces": workspaces, "current": current});
     state["prompt"] = json!(
         cx.update_window(window, |_, window, _| window.has_active_prompt())
             .unwrap_or(false)

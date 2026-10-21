@@ -82,6 +82,9 @@ impl BranchDiff {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        if crate::reject_external_vcs_action(workspace, cx) {
+            return;
+        }
         telemetry::event!("Git Branch Diff Opened");
         let project = workspace.project().clone();
         let Some(intended_repo) = project.read(cx).active_repository(cx) else {
@@ -141,6 +144,9 @@ impl BranchDiff {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        if crate::reject_external_vcs_action(workspace, cx) {
+            return;
+        }
         let project = workspace.project().clone();
         let Some(repository) = project.read(cx).active_repository(cx) else {
             let workspace = cx.entity().downgrade();
@@ -940,6 +946,109 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
             crate::init(cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn external_selection_without_repository_blocks_implicit_git_actions(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(language_model::init);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({".git": {}, "file.txt": "working\n"}),
+        )
+        .await;
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+        let panel = workspace.update_in(cx, crate::git_panel::GitPanel::new_test);
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            assert!(panel.active_repository().is_some());
+            panel.select_vcs_repository(
+                project::vcs_store::VcsRepositoryId {
+                    worktree_id: settings::WorktreeId::from_usize(1),
+                    extension_id: "fixture".into(),
+                    provider_id: "fixture".into(),
+                    repository_id: "unavailable".into(),
+                },
+                window,
+                cx,
+            );
+            assert!(panel.uses_vcs_panel(cx));
+            assert!(panel.selected_vcs_repository(cx).is_none());
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            for mode in [
+                crate::commit_modal::ForceMode::Commit,
+                crate::commit_modal::ForceMode::Amend,
+            ] {
+                crate::commit_modal::CommitModal::toggle(workspace, Some(mode), window, cx);
+                assert!(
+                    workspace
+                        .active_modal::<crate::commit_modal::CommitModal>(cx)
+                        .is_none()
+                );
+            }
+            crate::git_picker::open_branches(workspace, &zed_actions::git::Branch, window, cx);
+            assert!(
+                workspace
+                    .active_modal::<crate::git_picker::GitPicker>(cx)
+                    .is_none()
+            );
+            crate::git_picker::open_stash(workspace, &zed_actions::git::ViewStash, window, cx);
+            assert!(
+                workspace
+                    .active_modal::<crate::git_picker::GitPicker>(cx)
+                    .is_none()
+            );
+            BranchDiff::deploy_branch_diff(workspace, window, cx);
+            BranchDiff::compare_with_branch(workspace, &CompareWithBranch, window, cx);
+            assert!(
+                workspace
+                    .active_modal::<branch_picker::BranchList>(cx)
+                    .is_none()
+            );
+        });
+        cx.dispatch_action(crate::git_graph::Open);
+        cx.dispatch_action(crate::git_graph::OpenAtCommit {
+            sha: "0000000000000000000000000000000000000000".into(),
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.active_pane().read(cx).items_len(), 0);
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            assert!(panel.active_repository().is_some());
+            assert!(!panel.amend_pending());
+            panel.select_git_repository(window, cx);
+        });
+        cx.dispatch_action(crate::git_graph::Open);
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .items_of_type::<crate::git_graph::GitGraph>(cx)
+                    .count(),
+                1
+            );
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            crate::git_picker::open_branches(workspace, &zed_actions::git::Branch, window, cx);
+            assert!(
+                workspace
+                    .active_modal::<crate::git_picker::GitPicker>(cx)
+                    .is_some()
+            );
         });
     }
 

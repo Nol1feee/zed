@@ -81,6 +81,9 @@ impl ProjectDiff {
             Self::deploy_at(workspace, None, window, cx);
         });
         workspace.register_action(|workspace, _: &ToggleDiffBase, _window, cx| {
+            if crate::reject_external_vcs_action(workspace, cx) {
+                return;
+            }
             settings::update_settings_file(
                 workspace.app_state().fs.clone(),
                 cx,
@@ -100,11 +103,17 @@ impl ProjectDiff {
         );
         workspace.register_action(
             |workspace, _: &git_actions::ViewUnstagedChanges, window, cx| {
+                if crate::reject_external_vcs_action(workspace, cx) {
+                    return;
+                }
                 UnstagedDiff::deploy_at(workspace, None, window, cx);
             },
         );
         workspace.register_action(
             |workspace, _: &git_actions::ViewStagedChanges, window, cx| {
+                if crate::reject_external_vcs_action(workspace, cx) {
+                    return;
+                }
                 StagedDiff::deploy_at(workspace, None, window, cx);
             },
         );
@@ -120,6 +129,9 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        if crate::vcs_project_diff::try_deploy(workspace, None, window, cx) {
+            return;
+        }
         let project = workspace.project().clone();
         if project.read(cx).git_store().read(cx).diff_base() == GitDiffBaseSetting::DefaultBranch {
             BranchDiff::deploy_branch_diff(workspace, window, cx);
@@ -134,6 +146,9 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        if entry.is_none() && crate::vcs_project_diff::try_deploy(workspace, None, window, cx) {
+            return;
+        }
         telemetry::event!(
             "Git Diff Opened",
             source = if entry.is_some() {
@@ -191,6 +206,9 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        if crate::vcs_project_diff::try_deploy(workspace, Some(project_path.clone()), window, cx) {
+            return;
+        }
         telemetry::event!("Git Diff Opened", source = "Agent Panel");
         let existing = workspace.items_of_type::<Self>(cx).next();
         let project_diff = if let Some(existing) = existing {
@@ -730,6 +748,7 @@ pub(crate) mod persistence {
 
 pub struct ProjectDiffToolbar {
     project_diff: Option<WeakEntity<ProjectDiff>>,
+    vcs_project_diff: Option<WeakEntity<crate::vcs_project_diff::VcsProjectDiff>>,
     workspace: WeakEntity<Workspace>,
 }
 
@@ -737,6 +756,7 @@ impl ProjectDiffToolbar {
     pub fn new(workspace: &Workspace, _: &mut Context<Self>) -> Self {
         Self {
             project_diff: None,
+            vcs_project_diff: None,
             workspace: workspace.weak_handle(),
         }
     }
@@ -793,7 +813,10 @@ impl ToolbarItemView for ProjectDiffToolbar {
         self.project_diff = active_pane_item
             .and_then(|item| item.act_as::<ProjectDiff>(cx))
             .map(|entity| entity.downgrade());
-        if self.project_diff.is_some() {
+        self.vcs_project_diff = active_pane_item
+            .and_then(|item| item.act_as::<crate::vcs_project_diff::VcsProjectDiff>(cx))
+            .map(|entity| entity.downgrade());
+        if self.project_diff.is_some() || self.vcs_project_diff.is_some() {
             ToolbarItemLocation::PrimaryRight
         } else {
             ToolbarItemLocation::Hidden
@@ -811,6 +834,11 @@ impl ToolbarItemView for ProjectDiffToolbar {
 
 impl Render for ProjectDiffToolbar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(diff) = self.vcs_project_diff.as_ref().and_then(WeakEntity::upgrade) {
+            return h_flex()
+                .gap_1()
+                .child(editor::DiffStyleControls::new(diff.read(cx).editor()));
+        }
         let Some(project_diff) = self.project_diff(cx) else {
             return div();
         };

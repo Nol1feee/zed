@@ -1110,6 +1110,9 @@ pub fn init(cx: &mut App) {
                         move |_: &Open, window, cx| {
                             workspace
                                 .update(cx, |workspace, cx| {
+                                    if crate::reject_external_vcs_action(workspace, cx) {
+                                        return;
+                                    }
                                     let Some(repo) =
                                         workspace.project().read(cx).active_repository(cx)
                                     else {
@@ -1136,6 +1139,9 @@ pub fn init(cx: &mut App) {
                         let sha = action.sha.clone();
                         workspace
                             .update(cx, |workspace, cx| {
+                                if crate::reject_external_vcs_action(workspace, cx) {
+                                    return;
+                                }
                                 let Some(repo) = workspace.project().read(cx).active_repository(cx)
                                 else {
                                     return;

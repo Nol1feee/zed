@@ -17,6 +17,31 @@ Read-only capabilities constrain Zed's calls; they are not an operating-system
 sandbox for the provider executable. Zed requires workspace trust before invoking
 the extension callback or starting its process.
 
+## Using external repositories {#using-external-repositories}
+
+Open the [Git Panel](../git.md#git-panel) with
+{#action git_panel::ToggleFocus}. Its repository picker, also available through
+{#action git::SelectRepo}, lists both Git and external repositories. Select a
+repository to see its changes and available actions. External repositories use
+the same panel and keybindings; there is no separate Source Control dock.
+
+Choose a provider's comparison baseline in the Changes tab, then click **View
+Diff** or run {#action git::Diff}. The diff combines the selected repository's
+changed text files in one editor. It shares live buffers with ordinary file
+editors, preserving unsaved edits. Navigating the changes list moves to the
+selected file in the diff.
+
+With the changes list focused, {#action git::StageFile},
+{#action git::UnstageFile}, and {#action git::RestoreFile} use the selected file's
+provider capabilities. {#action git::Commit} and {#action git::Switch} open the
+provider's scoped commit and existing-branch switch controls when supported.
+
+External repositories do not expose Git's History, separate staged or unstaged
+index views, or hunk and batch mutations. Stash, amend, and remote Git operations
+are also unavailable. Unsupported commands report that limitation instead of
+operating on another Git repository in the project. Use the provider's own tools
+for operations it does not expose to Zed.
+
 ## Extension registration
 
 An extension using development API 0.9 declares providers in its manifest:
@@ -117,7 +142,7 @@ file operations; contradictory capabilities are rejected.
 
 ### Selected-file operations
 
-The Source Control panel shows Stage File, Unstage File, and Discard Unstaged for the selected
+The Git Panel shows Stage File, Unstage File, and Discard for the selected
 change. The optional `fileOperations` on each change narrows provider-level capabilities;
 an empty list disables all writes for that row. An optional `unavailableReason` explains
 why. Without this field, only an ordinary modified file without a rename retains legacy
@@ -262,7 +287,7 @@ Zed also refuses Suspend/Remove while any live Project overlaps its root. A
 provider may decline removal when cleanliness cannot be proved. The host never
 falls back to deleting the directory after a provider refusal.
 
-The native Checkouts picker is available from Source Control, the title bar, and
+The native Checkouts picker is available from the Git Panel, the title bar, and
 `vcs::OpenCheckouts`. It requires a live provider repository as its catalog anchor.
 Opening uses the returned scope and the ordinary workspace flow. Provider-created
 workspaces inherit trust through that flow without running Git create-worktree

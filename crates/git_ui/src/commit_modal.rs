@@ -130,6 +130,30 @@ impl CommitModal {
             return;
         };
 
+        if crate::external_vcs_selected(workspace, cx) {
+            if matches!(force_mode.as_ref(), Some(ForceMode::Commit))
+                && let Some(repository) = git_panel.read(cx).selected_vcs_repository(cx)
+            {
+                let git_panel = git_panel.downgrade();
+                window.defer(cx, move |window, cx| {
+                    let Some(git_panel) = git_panel.upgrade() else {
+                        return;
+                    };
+                    let panel = git_panel.read(cx);
+                    if panel.selected_vcs_repository(cx).as_ref() != Some(&repository) {
+                        return;
+                    }
+                    let vcs_panel = panel.vcs_panel();
+                    vcs_panel.update(cx, |panel, cx| {
+                        panel.commit_staged(&crate::vcs_panel::CommitStaged, window, cx);
+                    });
+                });
+            } else {
+                crate::reject_external_vcs_action(workspace, cx);
+            }
+            return;
+        }
+
         git_panel.update(cx, |git_panel, cx| {
             if let Some(force_mode) = force_mode {
                 match force_mode {
