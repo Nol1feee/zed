@@ -183,10 +183,7 @@ impl VcsStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<VcsPreparedRepositoryOperation>> {
         let checked = (|| {
-            ensure!(
-                !self.file_operation_running,
-                "Another VCS operation is running"
-            );
+            self.check_mutation_available(&key, None, cx)?;
             let connection = self.check_repository_operation(&key, &operation, None, cx)?;
             let scope = self
                 .file_operation_scope(&key)
@@ -257,10 +254,7 @@ impl VcsStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         let checked = (|| {
-            ensure!(
-                !self.file_operation_running,
-                "Another VCS operation is running"
-            );
+            self.check_mutation_available(&prepared.key, None, cx)?;
             ensure!(
                 !self.repository_operation_unresolved(&prepared.key),
                 "A previous checkout operation has an unknown outcome; refresh to reconcile it"

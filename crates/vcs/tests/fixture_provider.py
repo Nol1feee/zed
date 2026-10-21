@@ -72,6 +72,9 @@ SCENARIOS += tuple(sorted(BLAME_SCENARIOS))
 WORKFLOW_SCENARIOS = {"file-workflow", "file-workflow-stale", "file-workflow-bad-ignore"}
 SCENARIOS += tuple(sorted(WORKFLOW_SCENARIOS))
 WRITABLE_SCENARIOS.update(WORKFLOW_SCENARIOS)
+BATCH_SCENARIOS = {"staging-batch", "staging-batch-failure", "staging-batch-pending", "staging-batch-freshness"}
+SCENARIOS += tuple(sorted(BATCH_SCENARIOS))
+WRITABLE_SCENARIOS.update(BATCH_SCENARIOS)
 SEND_LOCK = threading.Lock()
 
 
@@ -200,6 +203,9 @@ def main():
               "params": {"repositoryId": "fixture-repository", "operationToken": token, "phase": phase, "message": message}})
     if args.scenario in REPOSITORY_SCENARIOS:
         file_states["src/example.txt"] = ("head", "head") if args.scenario == "repository-clean" else ("staged", "working")
+    if args.scenario in BATCH_SCENARIOS:
+        file_states.update({"a-mixed.txt": ("index", "working"), "b-unstaged.txt": ("head", "working"),
+                            "c-staged.txt": ("working", "working"), "d-renamed.txt": ("head", "working")})
     saved_operations = Path(str(args.events) + ".operations.json") if args.events else None
     if args.scenario in ("persistent-write-unknown", "repository-unknown") and saved_operations and saved_operations.is_file():
         saved = json.loads(saved_operations.read_text())
@@ -314,7 +320,7 @@ def main():
                 capabilities.update(fileHistory=True, fileOperations=["stage", "unstage", "discard", "ignore"])
             reply(identifier, {"protocolVersion": version, "serverInfo": {"name": "fixture", "version": "1"}, "capabilities": capabilities})
         elif method == "vcs/discover":
-            if args.scenario in WORKFLOW_SCENARIOS:
+            if args.scenario in WORKFLOW_SCENARIOS or args.scenario in BATCH_SCENARIOS:
                 reply(identifier, [{"id": "fixture-repository", "rootUri": params["scopeUri"], "scopeUri": params["scopeUri"],
                                     "displayName": "Fixture", "ignoreConfigPath": ".fixtureignore",
                                     "baselines": [{"id": purpose, "label": purpose.title(), "purpose": purpose,
@@ -364,6 +370,32 @@ def main():
                     snapshot["changes"] = []
             if args.scenario in FILE_KIND_SCENARIOS:
                 snapshot["changes"] = file_kind_changes()
+            if args.scenario in BATCH_SCENARIOS:
+                snapshot.update(id=f"batch:{snapshots}", currentRevisionId=f"index:{apply_count}")
+                snapshot["changes"] = []
+                for path, (index, disk) in file_states.items():
+                    change = {"path": path, "status": "modified", "kind": "file", "fileOperations": ["stage", "unstage"]}
+                    if index != "head":
+                        change["stagedStatus"] = "modified"
+                    if index != disk:
+                        change["unstagedStatus"] = "modified"
+                    if path == "d-renamed.txt":
+                        change.update(status="renamed", oldPath="old.txt")
+                    snapshot["changes"].append(change)
+                old_change = {"path": "old.txt", "status": "deleted", "kind": "file", "fileOperations": ["stage", "unstage"]}
+                index, disk = file_states["d-renamed.txt"]
+                if index != "head":
+                    old_change["stagedStatus"] = "deleted"
+                if index != disk:
+                    old_change["unstagedStatus"] = "deleted"
+                snapshot["changes"].append(old_change)
+                if args.scenario == "staging-batch-freshness":
+                    if not Path(str(args.events) + ".fresh").is_file():
+                        snapshot["changes"] = [change for change in snapshot["changes"] if change["path"] != "b-unstaged.txt"]
+                    elif not Path(str(args.events) + ".release").is_file():
+                        record("fresh-snapshot-held", id=identifier)
+                        threading.Thread(target=release_reply, args=(identifier, snapshot, "fresh-snapshot-released"), daemon=True).start()
+                        continue
             if args.scenario == "polling-content":
                 marker = Path(str(args.events) + ".revision") if args.events else None
                 revision = "r43" if marker and marker.is_file() and marker.read_text().strip() == "r43" else "r42"
@@ -450,12 +482,14 @@ def main():
                 operations[token] = {"path": path, "operation": operation,
                                      "before": file_state(path), "after": None, "terminal": None}
                 persist_operations()
-                if args.scenario == "prepare-pending":
+                if args.scenario == "prepare-pending" or args.scenario == "staging-batch-pending" and path == "a-mixed.txt":
                     record("prepare-held", id=identifier, path=path)
                     threading.Thread(target=release_reply,
                                      args=(identifier, {"operationToken": token}, "prepare-released"), daemon=True).start()
                 else:
                     prepared_result = {"operationToken": "" if args.scenario == "invalid-token" else token}
+                    if args.scenario in BATCH_SCENARIOS and path == "d-renamed.txt":
+                        prepared_result["affectedPaths"] = [path, "old.txt"]
                     if operation == "ignore":
                         prepared_result.update(affectedPaths=[path, "neighbor.txt" if args.scenario == "file-workflow-bad-ignore" else ".fixtureignore"], summary="Add selected file to .fixtureignore")
                     if args.scenario in FILE_KIND_SCENARIOS:
@@ -492,6 +526,10 @@ def main():
                                              "data": {"kind": "tokenConsumed"}})
                 else:
                     reply(identifier, {"outcome": prepared["terminal"]})
+                continue
+            if args.scenario == "staging-batch-failure" and path == "b-unstaged.txt":
+                prepared["terminal"] = "conflict"
+                reply(identifier, {"outcome": "conflict"})
                 continue
             if prepared["after"] == state:
                 outcome = "applied"

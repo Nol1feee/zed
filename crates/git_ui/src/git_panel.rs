@@ -3833,7 +3833,10 @@ impl GitPanel {
     }
 
     fn change_all_files_stage(&mut self, stage: bool, cx: &mut Context<Self>) {
-        if self.reject_native_operation(cx) {
+        if self.uses_vcs_panel(cx) {
+            self.vcs_panel.update(cx, |panel, cx| {
+                panel.change_all_files_stage(stage, cx);
+            });
             return;
         }
         let Some(active_repository) = self.active_repository.clone() else {
@@ -9876,8 +9879,8 @@ impl GitPanel {
             .on_action(cx.listener(Self::decrease_font_size))
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(|this, _: &git::StageRange, _, cx| this.unsupported_vcs_action(cx)))
-            .on_action(cx.listener(|this, _: &git::StageAll, _, cx| this.unsupported_vcs_action(cx)))
-            .on_action(cx.listener(|this, _: &git::UnstageAll, _, cx| this.unsupported_vcs_action(cx)))
+            .on_action(cx.listener(Self::stage_all))
+            .on_action(cx.listener(Self::unstage_all))
             .on_action(cx.listener(|this, _: &git::StageSection, _, cx| this.unsupported_vcs_action(cx)))
             .on_action(cx.listener(|this, _: &git::UnstageSection, _, cx| this.unsupported_vcs_action(cx)))
             .on_action(cx.listener(|this, _: &git::RestoreTrackedFiles, _, cx| this.unsupported_vcs_action(cx)))
@@ -11170,6 +11173,77 @@ mod tests {
             );
             assert!(panel.selected_vcs_repository(cx).is_none());
         });
+    }
+
+    #[gpui::test]
+    async fn test_external_staging_actions_never_fall_back_to_retained_git(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (fs, project, workspace, panel, mut cx) = setup_git_panel_with_changes(
+            cx,
+            json!({ ".git": {}, "file": "working\n" }),
+            &[("file", StatusCode::Modified)],
+        )
+        .await;
+        fs.set_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("file", "staged\n".into())],
+        );
+        let before = fs
+            .with_git_state(path!("/project/.git").as_ref(), false, |state| {
+                state.index_contents.clone()
+            })
+            .unwrap();
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.open_panel::<GitPanel>(window, cx);
+        });
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.vcs_selected = true;
+            panel.vcs_panel.focus_handle(cx).focus(window, cx);
+        });
+        for route in ["panel", "workspace", "external diff"] {
+            match route {
+                "workspace" => workspace.update_in(&mut cx, |workspace, window, cx| {
+                    workspace.focus_handle(cx).focus(window, cx);
+                }),
+                "external diff" => {
+                    let worktree_id = project.read_with(&cx, |project, cx| {
+                        project.worktrees(cx).next().unwrap().read(cx).id()
+                    });
+                    workspace.update_in(&mut cx, |workspace, window, cx| {
+                        crate::vcs_project_diff::deploy_at(
+                            workspace,
+                            VcsRepositoryId {
+                                worktree_id,
+                                extension_id: "fixture".into(),
+                                provider_id: "fixture".into(),
+                                repository_id: "external".into(),
+                            },
+                            None,
+                            window,
+                            cx,
+                        );
+                    });
+                    panel.update(&mut cx, |panel, _| panel.vcs_selected = false);
+                }
+                _ => {}
+            }
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            for action in [StageAll.boxed_clone(), UnstageAll.boxed_clone()] {
+                cx.update(|window, cx| window.dispatch_action(action, cx));
+                cx.run_until_parked();
+                assert_eq!(
+                    fs.with_git_state(path!("/project/.git").as_ref(), false, |state| {
+                        state.index_contents.clone()
+                    })
+                    .unwrap(),
+                    before,
+                    "{route} must fail closed when the external provider is unavailable"
+                );
+            }
+        }
     }
 
     #[gpui::test]

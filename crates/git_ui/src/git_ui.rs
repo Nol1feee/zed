@@ -366,9 +366,6 @@ pub fn init(cx: &mut App) {
             });
         });
         workspace.register_action(|workspace, action: &git::StageAll, window, cx| {
-            if reject_external_vcs_action(workspace, cx) {
-                return;
-            }
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                 return;
             };
@@ -377,9 +374,6 @@ pub fn init(cx: &mut App) {
             });
         });
         workspace.register_action(|workspace, action: &git::UnstageAll, window, cx| {
-            if reject_external_vcs_action(workspace, cx) {
-                return;
-            }
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                 return;
             };

@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use buffer_diff::{BufferDiff, DiffOperations};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use extension::{Extension, ExtensionHostProxy, ExtensionVcsProviderProxy, WorktreeDelegate};
 use fs::Fs;
 use gpui::{
@@ -352,6 +352,11 @@ pub struct VcsPreparedFileOperation {
     connection: Arc<ProviderConnection>,
 }
 
+struct StagingBatch {
+    scope: FileOperationScope,
+    owner: Arc<()>,
+}
+
 impl VcsPreparedFileOperation {
     pub fn affected_paths(&self) -> &[String] {
         &self.affected_paths
@@ -460,6 +465,7 @@ pub struct VcsStore {
     poll_task: Option<Task<()>>,
     errors: HashMap<SessionKey, SharedString>,
     file_operation_running: bool,
+    staging_batch: Option<StagingBatch>,
     operation_journal: Arc<OperationJournal>,
     pending_file_operations: HashMap<FileOperationScope, PendingOperation>,
     file_operation_errors: HashMap<VcsRepositoryId, SharedString>,
@@ -541,6 +547,7 @@ impl VcsStore {
             poll_task: None,
             errors: HashMap::default(),
             file_operation_running: false,
+            staging_batch: None,
             operation_journal,
             pending_file_operations: HashMap::default(),
             file_operation_errors: HashMap::default(),
@@ -1036,7 +1043,7 @@ impl VcsStore {
     }
 
     pub fn refresh_all(&mut self, cx: &mut Context<Self>) {
-        if self.file_operation_running {
+        if self.file_operation_running() {
             return;
         }
         let failed: Vec<_> = self
@@ -1069,6 +1076,14 @@ impl VcsStore {
         baseline: String,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        ensure!(
+            !self.staging_batch.as_ref().is_some_and(|batch| {
+                self.file_operation_scope(key).is_some_and(|scope| {
+                    batch.scope.same_provider(&scope) && batch.scope.root_uri == scope.root_uri
+                })
+            }),
+            "Wait for Stage All or Unstage All to finish before changing the comparison"
+        );
         ensure!(
             self.repositories
                 .keys()
@@ -1110,6 +1125,13 @@ impl VcsStore {
         reason: RefreshReason,
         cx: &mut Context<Self>,
     ) {
+        if self.staging_batch.as_ref().is_some_and(|batch| {
+            self.file_operation_scope(key).is_some_and(|scope| {
+                batch.scope.same_provider(&scope) && batch.scope.root_uri == scope.root_uri
+            })
+        }) {
+            return;
+        }
         if self
             .repositories
             .keys()
@@ -1522,7 +1544,37 @@ impl VcsStore {
     }
 
     pub fn file_operation_running(&self) -> bool {
-        self.file_operation_running
+        self.file_operation_running || self.staging_batch.is_some()
+    }
+
+    fn check_mutation_available(
+        &self,
+        key: &VcsRepositoryId,
+        owner: Option<&Arc<()>>,
+        cx: &Context<Self>,
+    ) -> Result<()> {
+        ensure!(
+            !self.file_operation_running
+                && self.staging_batch.as_ref().is_none_or(|batch| {
+                    owner.is_some_and(|owner| Arc::ptr_eq(owner, &batch.owner))
+                }),
+            "Another VCS operation is running"
+        );
+        let scope = self
+            .file_operation_scope(key)
+            .context("VCS repository closed")?;
+        let stores = GlobalRegistry::global(cx).0.read(cx).stores.clone();
+        for other in stores.iter().filter_map(WeakEntity::upgrade) {
+            if other.entity_id() != cx.entity().entity_id() {
+                ensure!(
+                    other.read(cx).staging_batch.as_ref().is_none_or(|batch| {
+                        !batch.scope.same_provider(&scope) || batch.scope.root_uri != scope.root_uri
+                    }),
+                    "Another project is staging files in this checkout"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn file_operation_unresolved(&self, key: &VcsRepositoryId) -> bool {
@@ -1795,11 +1847,20 @@ impl VcsStore {
         baseline: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<VcsPreparedFileOperation>> {
+        self.prepare_file_operation_for_owner(key, path, operation, baseline, None, cx)
+    }
+
+    fn prepare_file_operation_for_owner(
+        &mut self,
+        key: VcsRepositoryId,
+        path: String,
+        operation: FileOperation,
+        baseline: String,
+        owner: Option<&Arc<()>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<VcsPreparedFileOperation>> {
         let result = (|| {
-            ensure!(
-                !self.file_operation_running,
-                "Another VCS file operation is running"
-            );
+            self.check_mutation_available(&key, owner, cx)?;
             let (connection, root) =
                 self.check_file_operation(&key, &path, operation, &baseline, cx)?;
             let scope = self
@@ -1874,13 +1935,19 @@ impl VcsStore {
         prepared: VcsPreparedFileOperation,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        self.apply_prepared_file_operation_for_owner(prepared, None, cx)
+    }
+
+    fn apply_prepared_file_operation_for_owner(
+        &mut self,
+        prepared: VcsPreparedFileOperation,
+        owner: Option<&Arc<()>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         let result = self
             .check_prepared_file_operation(&prepared, cx)
             .and_then(|()| {
-                ensure!(
-                    !self.file_operation_running,
-                    "Another VCS file operation is running"
-                );
+                self.check_mutation_available(&prepared.key, owner, cx)?;
                 ensure!(
                     !self.file_operation_unresolved(&prepared.key),
                     "The previous operation has an unknown outcome; refresh to reconcile it"
@@ -2014,6 +2081,177 @@ impl VcsStore {
         )
     }
 
+    pub fn run_staging_batch(
+        &mut self,
+        key: VcsRepositoryId,
+        operation: FileOperation,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let checked = (|| {
+            ensure!(
+                matches!(operation, FileOperation::Stage | FileOperation::Unstage),
+                "Only staging and unstaging support batches"
+            );
+            self.check_mutation_available(&key, None, cx)?;
+            ensure!(
+                self.file_operations(&key).contains(&operation),
+                "The provider does not support this staging operation"
+            );
+            let repository = self
+                .repositories
+                .get(&key)
+                .context("VCS repository closed")?;
+            let baseline = repository
+                .view
+                .descriptor
+                .baselines
+                .iter()
+                .find(|baseline| baseline.purpose == Some(vcs::ComparisonPurpose::Working))
+                .context("The provider has no working comparison for staging")?
+                .id
+                .clone();
+            let scope = self
+                .file_operation_scope(&key)
+                .context("VCS repository closed")?;
+            let stores = GlobalRegistry::global(cx).0.read(cx).stores.clone();
+            for other in stores.iter().filter_map(WeakEntity::upgrade) {
+                if other.entity_id() != cx.entity().entity_id() {
+                    let other = other.read(cx);
+                    ensure!(
+                        !other.file_operation_running
+                            || !other.repositories.keys().any(|key| {
+                                other.file_operation_scope(key).is_some_and(|other_scope| {
+                                    other_scope.same_provider(&scope)
+                                        && other_scope.root_uri == scope.root_uri
+                                })
+                            }),
+                        "Another project is modifying this checkout"
+                    );
+                }
+            }
+            Ok((baseline, scope, repository.connection.clone()))
+        })();
+        let (baseline, scope, connection) = match checked {
+            Ok(checked) => checked,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let owner = Arc::new(());
+        self.staging_batch = Some(StagingBatch {
+            scope: scope.clone(),
+            owner: owner.clone(),
+        });
+        self.file_operation_errors.remove(&key);
+        self.notify(cx);
+        let fs = self.fs.clone();
+        let journal = self.operation_journal.clone();
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        // The owner outlives the UI waiter, just like an individual journaled write.
+        cx.spawn(async move |this, cx| {
+            let mut completed = 0;
+            let mut total = 0;
+            let mut current_path = None;
+            let result: Result<()> = async {
+                journal.load().await?;
+                ensure!(journal.blocking(&scope, true)?.is_none(), "The previous operation has an unknown outcome; refresh to reconcile it");
+                let snapshot = this.update(cx, |this, cx| this.load_comparison(key.clone(), baseline.clone(), cx))?;
+                let state = async {
+                    if connection.capabilities().is_some_and(|capabilities| !capabilities.repository_operations.is_empty()) {
+                        Ok(Some(connection.repository_state(key.repository_id.clone()).await?))
+                    } else {
+                        Ok::<_, anyhow::Error>(None)
+                    }
+                };
+                let (snapshot, state) = futures::try_join!(snapshot, state)?;
+                let targets = this.update(cx, |this, cx| {
+                    this.check_staging_batch_identity(&key, &scope, &connection, &owner)?;
+                    let changes = snapshot.changes.iter()
+                        .filter(|change| this.check_read_path(&key, &change.path, cx).is_ok())
+                        .cloned().collect();
+                    let targets = staging_batch_targets(changes, state.as_ref().map_or(&[][..], |state| state.staged_paths.as_slice()), operation)?;
+                    for change in &targets {
+                        this.check_file_operation(&key, &change.path, operation, &baseline, cx)?;
+                    }
+                    if let Some(state) = state {
+                        let repository = this.repositories.get_mut(&key).context("VCS repository closed")?;
+                        repository.view.repository_state = Some(Arc::new(state));
+                        repository.view.repository_state_error = None;
+                    }
+                    Ok::<_, anyhow::Error>(targets)
+                })??;
+                total = targets.len();
+                let root = vcs::local_path(&scope.scope_uri)?;
+                for change in &targets {
+                    validate_file_metadata(&root, change, &fs).await?;
+                }
+                for change in targets {
+                    current_path = Some(change.path.clone());
+                    let prepared = this.update(cx, |this, cx| {
+                        this.check_staging_batch_identity(&key, &scope, &connection, &owner)?;
+                        Ok::<_, anyhow::Error>(this.prepare_file_operation_for_owner(
+                            key.clone(), change.path.clone(), operation, baseline.clone(), Some(&owner), cx,
+                        ))
+                    })??.await?;
+                    ensure!(prepared.change.old_path == change.old_path
+                        && prepared.affected_paths.iter().all(|path| path == &change.path || Some(path) == change.old_path.as_ref()),
+                        "The file's rename paths changed after the batch started");
+                    this.update(cx, |this, cx| {
+                        this.check_staging_batch_identity(&key, &scope, &connection, &owner)?;
+                        Ok::<_, anyhow::Error>(this.apply_prepared_file_operation_for_owner(prepared, Some(&owner), cx))
+                    })??.await?;
+                    completed += 1;
+                }
+                Ok(())
+            }.await;
+            let action = if operation == FileOperation::Stage { "Stage All" } else { "Unstage All" };
+            let result = result.with_context(|| match current_path {
+                Some(path) => format!("{action} stopped at {path}: {completed} of {total} file operations confirmed; {} not started", total.saturating_sub(completed + 1)),
+                None => format!("{action} stopped before any files were modified"),
+            });
+            this.update(cx, |this, cx| {
+                if this.staging_batch.as_ref().is_some_and(|batch| Arc::ptr_eq(&batch.owner, &owner)) {
+                    this.staging_batch = None;
+                }
+                if let Err(error) = &result {
+                    this.file_operation_errors.insert(key.clone(), format!("{error:#}").into());
+                }
+                if connection.is_alive() {
+                    this.refresh_with_reason(&key, RefreshReason::Explicit, cx);
+                }
+                this.notify(cx);
+            }).log_err();
+            if sender.send(result).is_err() {
+                log::debug!("VCS staging batch waiter closed after completion");
+            }
+        }).detach();
+        cx.spawn(async move |_, _| {
+            receiver
+                .await
+                .context("VCS staging batch was interrupted")?
+        })
+    }
+
+    fn check_staging_batch_identity(
+        &self,
+        key: &VcsRepositoryId,
+        scope: &FileOperationScope,
+        connection: &Arc<ProviderConnection>,
+        owner: &Arc<()>,
+    ) -> Result<()> {
+        ensure!(
+            self.staging_batch
+                .as_ref()
+                .is_some_and(|batch| Arc::ptr_eq(&batch.owner, owner))
+                && self.file_operation_scope(key).as_ref() == Some(scope)
+                && self
+                    .repositories
+                    .get(key)
+                    .is_some_and(|repository| Arc::ptr_eq(&repository.connection, connection))
+                && connection.is_alive(),
+            "VCS provider or scope changed during the staging batch"
+        );
+        Ok(())
+    }
+
     pub fn run_file_operation(
         &mut self,
         key: VcsRepositoryId,
@@ -2036,8 +2274,8 @@ impl VcsStore {
         baseline: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        if self.file_operation_running {
-            return Task::ready(Err(anyhow!("Another VCS file operation is running")));
+        if let Err(error) = self.check_mutation_available(&key, None, cx) {
+            return Task::ready(Err(error));
         }
         let prepare =
             self.prepare_file_operation_for_baseline(key.clone(), path, operation, baseline, cx);
@@ -2074,7 +2312,7 @@ impl VcsStore {
     }
 
     fn reconcile_file_operation(&mut self, key: &VcsRepositoryId, cx: &mut Context<Self>) {
-        if self.file_operation_running {
+        if self.file_operation_running() {
             return;
         }
         let Some(current_scope) = self.file_operation_scope(key) else {
@@ -2334,7 +2572,8 @@ impl VcsStore {
                 if repository.comparison_generations.get(&baseline_id) != Some(&generation) {
                     if let Some(current) = repository.comparisons.get(&baseline_id) {
                         ensure!(
-                            same_comparison(current, &snapshot),
+                            same_comparison(current, &snapshot)
+                                && current.changes == snapshot.changes,
                             "VCS comparison request was superseded"
                         );
                         return Ok(current.clone());
@@ -3550,6 +3789,44 @@ async fn validate_ignore_config(root: &Path, path: &str, fs: &Arc<dyn Fs>) -> Re
         "Ignore configuration must be a regular file"
     );
     Ok(())
+}
+
+fn staging_batch_targets(
+    mut changes: Vec<vcs::Change>,
+    staged_paths: &[String],
+    operation: FileOperation,
+) -> Result<Vec<vcs::Change>> {
+    changes.retain(|change| {
+        let staged = change.staged_status.is_some() || staged_paths.contains(&change.path);
+        match operation {
+            FileOperation::Stage => !staged || change.unstaged_status.is_some(),
+            FileOperation::Unstage => staged,
+            _ => false,
+        }
+    });
+    changes.sort_by(|left, right| {
+        left.old_path
+            .is_none()
+            .cmp(&right.old_path.is_none())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut covered = HashSet::default();
+    let mut targets = Vec::new();
+    for change in changes {
+        if let Some(old_path) = &change.old_path {
+            ensure!(
+                !covered.contains(&change.path) && !covered.contains(old_path),
+                "Overlapping rename paths prevent staging this batch"
+            );
+            covered.insert(old_path.clone());
+        } else if covered.contains(&change.path) {
+            continue;
+        }
+        covered.insert(change.path.clone());
+        targets.push(change);
+    }
+    targets.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(targets)
 }
 
 fn legacy_file_change(change: &vcs::Change) -> bool {

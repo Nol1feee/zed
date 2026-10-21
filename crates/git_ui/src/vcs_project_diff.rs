@@ -479,6 +479,30 @@ impl VcsProjectDiff {
         }
     }
 
+    fn run_staging_batch(
+        &mut self,
+        operation: FileOperation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preparing_discard {
+            return;
+        }
+        let workspace = self.workspace.clone();
+        let repository = self.repository.clone();
+        window.defer(cx, move |_, cx| {
+            let panel = workspace
+                .upgrade()
+                .and_then(|workspace| workspace.read(cx).panel::<GitPanel>(cx))
+                .map(|panel| panel.read(cx).vcs_panel());
+            if let Some(panel) = panel {
+                panel.update(cx, |panel, cx| {
+                    panel.run_staging_batch(repository, operation, cx)
+                });
+            }
+        });
+    }
+
     fn discard_selected_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Header menus have their own target; a shortcut must not fall back to the editor cursor.
         if !self
@@ -983,6 +1007,14 @@ impl Render for VcsProjectDiff {
         v_flex()
             .size_full()
             .key_context("GitDiff")
+            .capture_action(cx.listener(|this, _: &git::StageAll, window, cx| {
+                cx.stop_propagation();
+                this.run_staging_batch(FileOperation::Stage, window, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &git::UnstageAll, window, cx| {
+                cx.stop_propagation();
+                this.run_staging_batch(FileOperation::Unstage, window, cx);
+            }))
             .capture_action(cx.listener(|this, _: &git::RestoreFile, window, cx| {
                 cx.stop_propagation();
                 this.discard_selected_file(window, cx);

@@ -1447,6 +1447,117 @@ impl VcsPanel {
         );
     }
 
+    fn staging_batch_unavailable_reason(
+        &self,
+        repository: &VcsRepositoryId,
+        operation: FileOperation,
+        cx: &App,
+    ) -> Option<&'static str> {
+        let Some(store) = self.store.as_ref().map(|store| store.read(cx)) else {
+            return Some("Source-control provider is unavailable.");
+        };
+        if self.preparing_operation || store.file_operation_running() {
+            return Some("Another source-control operation is running.");
+        }
+        if self.project.read(cx).is_read_only(cx) {
+            return Some("You do not have write access to this project.");
+        }
+        if store.file_operation_unresolved(repository)
+            || store.repository_operation_unresolved(repository)
+        {
+            return Some("Refresh source control to reconcile the previous operation.");
+        }
+        if !store.file_operations(repository).contains(&operation) {
+            return Some("The provider does not support this action.");
+        }
+        let Some(snapshot) = store
+            .repositories()
+            .into_iter()
+            .find(|snapshot| &snapshot.key == repository)
+        else {
+            return Some("Source-control repository is no longer available.");
+        };
+        let Some(baseline) = snapshot
+            .descriptor
+            .baselines
+            .iter()
+            .find(|baseline| baseline.purpose == Some(ComparisonPurpose::Working))
+        else {
+            return Some("The provider does not expose working changes.");
+        };
+        if snapshot.selected_baseline == baseline.id
+            && let Some(changes) = &snapshot.snapshot
+        {
+            let staged_paths = snapshot
+                .repository_state
+                .as_ref()
+                .map_or(&[][..], |state| state.staged_paths.as_slice());
+            let has_targets = changes.changes.iter().any(|change| {
+                let state = staging_state(change, staged_paths);
+                match operation {
+                    FileOperation::Stage => state != ToggleState::Selected,
+                    FileOperation::Unstage => state != ToggleState::Unselected,
+                    _ => false,
+                }
+            });
+            if !has_targets {
+                return Some(if operation == FileOperation::Stage {
+                    "No unstaged changes to stage."
+                } else {
+                    "No staged changes to unstage."
+                });
+            }
+        }
+        None
+    }
+
+    pub(crate) fn change_all_files_stage(&mut self, stage: bool, cx: &mut Context<Self>) {
+        let Some(repository) = self.selected_repository_id() else {
+            return;
+        };
+        self.run_staging_batch(
+            repository,
+            if stage {
+                FileOperation::Stage
+            } else {
+                FileOperation::Unstage
+            },
+            cx,
+        );
+    }
+
+    pub(crate) fn run_staging_batch(
+        &mut self,
+        repository: VcsRepositoryId,
+        operation: FileOperation,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(reason) = self.staging_batch_unavailable_reason(&repository, operation, cx) {
+            self.error = Some(reason.into());
+            cx.notify();
+            return;
+        }
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        self.error = None;
+        let task = store.update(cx, |store, cx| {
+            store.run_staging_batch(repository, operation, cx)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.error = Some(format!("{error:#}").into());
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn run_path_operation(
         &mut self,
         repository: VcsRepositoryId,
@@ -2041,15 +2152,26 @@ impl VcsPanel {
                 .filter_map(|row| row.change.as_ref())
                 .all(|change| staging_state(change, &staged_paths) == ToggleState::Selected);
         let title = if unstage { "Unstage All" } else { "Stage All" };
+        let operation = if unstage {
+            FileOperation::Unstage
+        } else {
+            FileOperation::Stage
+        };
+        let unavailable = self
+            .selected_repository_id()
+            .map_or(Some("No repository available."), |repository| {
+                self.staging_batch_unavailable_reason(&repository, operation, cx)
+            });
         SplitButton::new(
             ButtonLike::new_rounded_left("git-changes-actions-split-button-left")
                 .layer(ElevationIndex::ModalSurface)
                 .size(ButtonSize::Compact)
                 .child(Label::new(title).size(LabelSize::Small).mr_0p5())
-                .disabled(true)
-                .tooltip(Tooltip::text(
-                    "The provider supports staging individual files",
-                )),
+                .disabled(unavailable.is_some())
+                .tooltip(Tooltip::text(unavailable.unwrap_or(title)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.change_all_files_stage(!unstage, cx);
+                })),
             PopoverMenu::new("git-changes-actions-split-button-menu")
                 .trigger(crate::render_split_button_chevron_trigger(
                     "changes-actions-split-button-right",
@@ -2068,13 +2190,49 @@ impl VcsPanel {
                         });
                         let mut menu = menu;
                         if let Some(repository) = &repository {
+                            for (title, operation) in [
+                                ("Stage All", FileOperation::Stage),
+                                ("Unstage All", FileOperation::Unstage),
+                            ] {
+                                let key = repository.key.clone();
+                                let panel = panel.clone();
+                                let disabled = panel
+                                    .read(cx)
+                                    .staging_batch_unavailable_reason(&key, operation, cx)
+                                    .is_some();
+                                menu = menu.item(
+                                    ContextMenuEntry::new(title).disabled(disabled).handler(
+                                        move |_, cx| {
+                                            panel.update(cx, |panel, cx| {
+                                                panel.run_staging_batch(key.clone(), operation, cx)
+                                            });
+                                        },
+                                    ),
+                                );
+                            }
+                            menu = menu.separator();
                             menu = menu.header("Comparison");
+                            let busy = panel.read(cx).store.as_ref().is_some_and(|store| {
+                                store.read(cx).file_operation_running()
+                            });
                             for baseline in repository.descriptor.baselines.clone() {
                                 let key = repository.key.clone();
                                 let panel = panel.clone();
                                 let selected = repository.selected_baseline == baseline.id;
                                 menu = menu.item(
                                     ContextMenuEntry::new(baseline.label)
+                                        .disabled(busy)
+                                        .when(busy, |entry| {
+                                            entry.documentation_aside(
+                                                ui::DocumentationSide::Right,
+                                                |_| {
+                                                    div().p_2().max_w_64().child(
+                                                        Label::new("Another source-control operation is running.")
+                                                            .size(LabelSize::Small),
+                                                    ).into_any_element()
+                                                },
+                                            )
+                                        })
                                         .toggle(IconPosition::End, selected)
                                         .handler(move |_, cx| {
                                             panel.update(cx, |panel, cx| {

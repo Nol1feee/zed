@@ -240,10 +240,7 @@ impl VcsStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<VcsPreparedCheckoutOperation>> {
         let checked = (|| {
-            ensure!(
-                !self.file_operation_running,
-                "Another VCS operation is running"
-            );
+            self.check_mutation_available(&key, None, cx)?;
             let connection = self.check_checkout_operation(&key, &operation, None, cx)?;
             let scope = self
                 .file_operation_scope(&key)
@@ -315,10 +312,7 @@ impl VcsStore {
         cx: &mut Context<Self>,
     ) -> Task<Result<CheckoutOperationResult>> {
         let checked = (|| {
-            ensure!(
-                !self.file_operation_running,
-                "Another VCS operation is running"
-            );
+            self.check_mutation_available(&prepared.key, None, cx)?;
             ensure!(
                 self.operation_journal
                     .blocking_request(&prepared.scope, &prepared.request())?

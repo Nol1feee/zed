@@ -1136,6 +1136,557 @@ async fn outer_git_cannot_claim_an_excluded_repository_opened_in_multiple_scopes
     stop(&fixture, cx).await;
 }
 
+async fn staging_fixture(cx: &mut TestAppContext, scenario: &str) -> Fixture {
+    let fixture = fixture(cx, false).await;
+    for path in [
+        "a-mixed.txt",
+        "b-unstaged.txt",
+        "c-staged.txt",
+        "d-renamed.txt",
+    ] {
+        fixture
+            .fs
+            .insert_file(fixture.directory.path().join(path), b"working\n".to_vec())
+            .await;
+    }
+    trust(&fixture, cx);
+    FixtureExtension::new("staging", fixture.directory.path(), scenario).register(cx);
+    ready(&fixture, cx).await;
+    fixture
+}
+
+fn staging_events(fixture: &Fixture) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(fixture.directory.path().join("staging.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["event"] == "file-operation-applied")
+        .collect()
+}
+
+#[gpui::test]
+async fn staging_batch_uses_working_state_and_deduplicates_renames(cx: &mut TestAppContext) {
+    let fixture = staging_fixture(cx, "staging-batch").await;
+    let repository = ready(&fixture, cx).await;
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.set_baseline(&repository.key, "staged".into(), cx)
+        })
+        .unwrap();
+    ready(&fixture, cx).await;
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        staging_events(&fixture)
+            .iter()
+            .map(|event| event["path"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["a-mixed.txt", "b-unstaged.txt", "d-renamed.txt"]
+    );
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        staging_events(&fixture).len(),
+        3,
+        "Repeated Stage All must not toggle or restage files"
+    );
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_staging_batch(repository.key.clone(), FileOperation::Unstage, cx)
+        })
+        .await
+        .unwrap();
+    let events = staging_events(&fixture);
+    assert_eq!(events.len(), 7);
+    assert!(
+        events[3..]
+            .iter()
+            .all(|event| event["operation"] == "unstage" && event["staged"] == false)
+    );
+    assert!(!events.iter().any(|event| event["path"] == "old.txt"));
+    assert!(
+        !fixture
+            .store
+            .read_with(cx, |store, _| store.file_operation_running())
+    );
+    for path in [
+        "a-mixed.txt",
+        "b-unstaged.txt",
+        "c-staged.txt",
+        "d-renamed.txt",
+    ] {
+        assert_eq!(
+            fixture
+                .fs
+                .load(&fixture.directory.path().join(path))
+                .await
+                .unwrap(),
+            "working\n"
+        );
+    }
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn staging_batch_stops_after_first_failure_and_releases_owner(cx: &mut TestAppContext) {
+    let fixture = staging_fixture(cx, "staging-batch-failure").await;
+    let repository = ready(&fixture, cx).await;
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
+        })
+        .await
+        .unwrap_err();
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("b-unstaged.txt")
+            && error.contains("1 of 3")
+            && error.contains("1 not started"),
+        "{error}"
+    );
+    let events = staging_events(&fixture);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["path"], "a-mixed.txt");
+    fixture.store.read_with(cx, |store, _| {
+        assert!(!store.file_operation_running());
+        assert!(!store.file_operation_unresolved(&repository.key));
+    });
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_file_operation_for_baseline(
+                repository.key.clone(),
+                "a-mixed.txt".into(),
+                FileOperation::Unstage,
+                "working".into(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(staging_events(&fixture).len(), 2);
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn staging_batch_checks_all_dirty_buffers_before_first_write(cx: &mut TestAppContext) {
+    let fixture = staging_fixture(cx, "staging-batch").await;
+    let repository = ready(&fixture, cx).await;
+    let buffer = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("b-unstaged.txt"), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "unsaved\n")], None, cx)
+    });
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
+        })
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("unsaved"));
+    assert!(staging_events(&fixture).is_empty());
+    assert!(
+        !fixture
+            .store
+            .read_with(cx, |store, _| store.file_operation_running())
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn staging_batch_rejects_superseded_working_snapshot_with_new_paths(cx: &mut TestAppContext) {
+    let fixture = staging_fixture(cx, "staging-batch-freshness").await;
+    let repository = ready(&fixture, cx).await;
+    let cached = repository.snapshot.unwrap();
+    assert!(
+        !cached
+            .changes
+            .iter()
+            .any(|change| change.path == "b-unstaged.txt")
+    );
+    std::fs::write(
+        fixture.directory.path().join("staging.jsonl.fresh"),
+        "fresh",
+    )
+    .unwrap();
+    let task = fixture.store.update(cx, |store, cx| {
+        store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
+    });
+    provider_event(
+        fixture.directory.path().join("staging.jsonl"),
+        "fresh-snapshot-held",
+    )
+    .await;
+    fixture.store.update(cx, |store, cx| {
+        drop(store.load_comparison(repository.key.clone(), "working".into(), cx));
+    });
+    std::fs::write(
+        fixture.directory.path().join("staging.jsonl.release"),
+        "release",
+    )
+    .unwrap();
+    let error = task.await.unwrap_err();
+    assert!(format!("{error:#}").contains("superseded"));
+    assert!(staging_events(&fixture).is_empty());
+    assert!(
+        !fixture
+            .store
+            .read_with(cx, |store, _| store.file_operation_running())
+    );
+    let fresh = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.load_comparison(repository.key.clone(), "working".into(), cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(cached.revision_id, fresh.revision_id);
+    assert_eq!(cached.current_revision_id, fresh.current_revision_id);
+    assert!(
+        fresh
+            .changes
+            .iter()
+            .any(|change| change.path == "b-unstaged.txt")
+    );
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(staging_events(&fixture).len(), 3);
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn staging_batch_refuses_other_store_operation_and_other_scope_journal(
+    cx: &mut TestAppContext,
+) {
+    let fixture = staging_fixture(cx, "staging-batch-pending").await;
+    let repository = ready(&fixture, cx).await;
+    let parts = fixture.store.read_with(cx, |store, _| {
+        (
+            store.project.clone(),
+            store.worktrees.clone(),
+            store.git.clone(),
+            store.environment.clone(),
+        )
+    });
+    let other =
+        cx.new(|cx| VcsStore::new(parts.0, parts.1, parts.2, parts.3, fixture.fs.clone(), cx));
+    cx.condition(&other, |store, _| {
+        store
+            .repositories()
+            .iter()
+            .any(|repository| repository.snapshot.is_some() && !repository.loading)
+    })
+    .await;
+    let other_key = other.read_with(cx, |store, _| store.repositories()[0].key.clone());
+    let single = other.update(cx, |store, cx| {
+        store.run_file_operation(other_key, "a-mixed.txt".into(), FileOperation::Stage, cx)
+    });
+    provider_event(
+        fixture.directory.path().join("staging.jsonl"),
+        "prepare-held",
+    )
+    .await;
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("Another project"));
+    assert!(staging_events(&fixture).is_empty());
+    std::fs::write(
+        fixture.directory.path().join("staging.jsonl.release"),
+        "release",
+    )
+    .unwrap();
+    single.await.unwrap();
+    let (journal, scope) = fixture.store.read_with(cx, |store, _| {
+        (
+            store.operation_journal.clone(),
+            store.file_operation_scope(&repository.key).unwrap(),
+        )
+    });
+    let mut foreign_scope = scope.clone();
+    foreign_scope.scope_uri = url::Url::from_directory_path(fixture.directory.path().join("other"))
+        .unwrap()
+        .to_string();
+    let token = "foreign-scope-pending";
+    let claim = journal
+        .record(
+            foreign_scope.clone(),
+            PendingOperation {
+                token: token.into(),
+                request: OperationRequest::File {
+                    path: "outside.txt".into(),
+                    operation: FileOperation::Stage,
+                    affected_paths: vec!["outside.txt".into()],
+                },
+            },
+        )
+        .await
+        .unwrap();
+    drop(claim);
+    assert!(journal.blocking(&scope, false).unwrap().is_none());
+    let error = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
+        })
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("unknown outcome"));
+    assert_eq!(staging_events(&fixture).len(), 1);
+    assert!(
+        !fixture
+            .store
+            .read_with(cx, |store, _| store.file_operation_running())
+    );
+    assert!(journal.pending(&foreign_scope).unwrap().is_some());
+    journal.clear(&foreign_scope, token).await.unwrap();
+    let connections = other.read_with(cx, |store, _| {
+        store
+            .sessions
+            .values()
+            .filter_map(|session| session.connection.clone())
+            .collect::<Vec<_>>()
+    });
+    for connection in connections {
+        connection.shutdown().await.unwrap();
+    }
+    other.update(cx, |store, cx| store.stop_all(cx));
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn staging_batch_stops_when_preparing_provider_is_replaced(cx: &mut TestAppContext) {
+    let fixture = staging_fixture(cx, "staging-batch-pending").await;
+    let repository = ready(&fixture, cx).await;
+    let task = fixture.store.update(cx, |store, cx| {
+        store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
+    });
+    provider_event(
+        fixture.directory.path().join("staging.jsonl"),
+        "prepare-held",
+    )
+    .await;
+    FixtureExtension::new("staging", fixture.directory.path(), "staging-batch").register(cx);
+    assert!(task.await.is_err());
+    assert!(
+        !fixture
+            .store
+            .read_with(cx, |store, _| store.file_operation_running())
+    );
+    assert!(staging_events(&fixture).is_empty());
+    ready(&fixture, cx).await;
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn staging_batch_blocks_prepared_writes_and_survives_closed_waiter(cx: &mut TestAppContext) {
+    let fixture = staging_fixture(cx, "staging-batch-pending").await;
+    let repository = ready(&fixture, cx).await;
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_file_operation(
+                repository.key.clone(),
+                "c-staged.txt".into(),
+                FileOperation::Unstage,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    let (scope, connection) = (prepared.scope.clone(), prepared.connection.clone());
+    let operation = RepositoryOperation::Commit {
+        message: "Concurrent commit".into(),
+    };
+    let checkout_operation = CheckoutOperation::Create {
+        name: "concurrent".into(),
+        branch: "main".into(),
+        base: "main".into(),
+    };
+    let prepared_repository = VcsPreparedRepositoryOperation {
+        key: repository.key.clone(),
+        scope: scope.clone(),
+        connection: connection.clone(),
+        operation: operation.clone(),
+        prepared: vcs::PreparedRepositoryOperation {
+            operation_token: "prepared-before-batch".into(),
+            summary: "Commit".into(),
+            affected_paths: vec!["c-staged.txt".into()],
+        },
+    };
+    let prepared_checkout = VcsPreparedCheckoutOperation {
+        key: repository.key.clone(),
+        scope: scope.clone(),
+        connection,
+        operation: checkout_operation.clone(),
+        prepared: vcs::PreparedCheckoutOperation {
+            operation_token: "checkout-before-batch".into(),
+            summary: "Create".into(),
+            target_root_uri: scope.root_uri,
+            checkout: None,
+        },
+    };
+    let snapshot_count = || {
+        std::fs::read_to_string(fixture.directory.path().join("staging.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|line| line.contains("\"method\": \"vcs/snapshot\""))
+            .count()
+    };
+    let snapshots_before = snapshot_count();
+    let generation_before = fixture.store.read_with(cx, |store, _| {
+        store.repositories[&repository.key].generation
+    });
+    let task = fixture.store.update(cx, |store, cx| {
+        store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
+    });
+    provider_event(
+        fixture.directory.path().join("staging.jsonl"),
+        "prepare-held",
+    )
+    .await;
+    assert!(
+        fixture
+            .store
+            .read_with(cx, |store, _| store.file_operation_running())
+    );
+    fixture.store.update(cx, |store, cx| {
+        let snapshot = store.repositories[&repository.key]
+            .view
+            .snapshot
+            .clone()
+            .unwrap();
+        for baseline in ["staged", "working"] {
+            let error = store
+                .set_baseline(&repository.key, baseline.into(), cx)
+                .unwrap_err();
+            assert!(error.to_string().contains("finish"));
+            let view = &store.repositories[&repository.key].view;
+            assert_eq!(view.selected_baseline, "working");
+            assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &snapshot));
+        }
+        store.refresh_with_reason(&repository.key, RefreshReason::Explicit, cx);
+        store.refresh_with_reason(&repository.key, RefreshReason::Background, cx);
+    });
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.condition(&fixture.store, |store, _| {
+        !store.repositories[&repository.key].view.loading
+    })
+    .await;
+    assert_eq!(
+        snapshot_count(),
+        snapshots_before + 1,
+        "Only the batch's fresh preflight may query status while it owns the checkout"
+    );
+    let blocked = fixture.store.update(cx, |store, cx| {
+        vec![
+            store.run_staging_batch(repository.key.clone(), FileOperation::Unstage, cx),
+            store.run_file_operation(
+                repository.key.clone(),
+                "c-staged.txt".into(),
+                FileOperation::Unstage,
+                cx,
+            ),
+            store.apply_prepared_file_operation(prepared, cx),
+            store.apply_prepared_repository_operation(prepared_repository, cx),
+        ]
+    });
+    for blocked in blocked {
+        assert!(blocked.await.unwrap_err().to_string().contains("running"));
+    }
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store.prepare_repository_operation(
+                repository.key.clone(),
+                operation,
+                cx
+            ))
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("running")
+    );
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store.prepare_checkout_operation(
+                repository.key.clone(),
+                checkout_operation,
+                cx
+            ))
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("running")
+    );
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store
+                .apply_prepared_checkout_operation(prepared_checkout, cx))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("running")
+    );
+    drop(task);
+    std::fs::write(
+        fixture.directory.path().join("staging.jsonl.release"),
+        "release",
+    )
+    .unwrap();
+    cx.condition(&fixture.store, |store, _| !store.file_operation_running())
+        .await;
+    assert_eq!(staging_events(&fixture).len(), 3);
+    assert!(!fixture.store.read_with(cx, |store, _| {
+        store.file_operation_unresolved(&repository.key)
+    }));
+    ready(&fixture, cx).await;
+    assert_eq!(
+        snapshot_count(),
+        snapshots_before + 2,
+        "Exactly one full refresh follows the batch"
+    );
+    fixture.store.read_with(cx, |store, _| {
+        assert_eq!(
+            store.repositories[&repository.key].generation,
+            generation_before + 1
+        );
+    });
+    stop(&fixture, cx).await;
+}
+
 #[gpui::test]
 async fn file_operations_preserve_scope_and_refuse_dirty_conflicted_and_git_files(
     cx: &mut TestAppContext,
@@ -1727,17 +2278,28 @@ async fn prepared_branch_switch_is_rejected_after_git_takes_scope_ownership(
         .update(cx, |project, cx| project.git_scans_complete(cx))
         .await;
     let git = fixture.store.read_with(cx, |store, _| store.git.clone());
-    cx.condition(&git, |git, cx| {
-        git.repository_and_path_for_project_path(
-            &ProjectPath {
-                worktree_id: fixture.worktree_id,
-                path: Arc::from(RelPath::empty()),
-            },
-            cx,
-        )
-        .is_some()
-    })
-    .await;
+    {
+        // RepositoryAdded is an event, not an entity notification.
+        let ownership = git.condition::<crate::git_store::GitStoreEvent>(cx, |git, cx| {
+            git.repository_and_path_for_project_path(
+                &ProjectPath {
+                    worktree_id: fixture.worktree_id,
+                    path: Arc::from(RelPath::empty()),
+                },
+                cx,
+            )
+            .is_some()
+        });
+        let timeout = cx.executor().timer(Duration::from_secs(3));
+        futures::pin_mut!(ownership, timeout);
+        assert!(
+            matches!(
+                futures::future::select(ownership, timeout).await,
+                futures::future::Either::Left(_)
+            ),
+            "Git ownership discovery timed out"
+        );
+    }
     fixture.store.read_with(cx, |store, cx| {
         assert!(store.repositories.contains_key(&repository.key));
         assert!(

@@ -10,7 +10,7 @@ and comparison contents to Zed's native source-control UI. Git keeps its existin
 backend. A provider does not emulate Git or create `.git` metadata.
 
 The API is local. Protocol 1 is read-only; protocol 2 can explicitly enable
-selected-file staging, unstaging, discarding unstaged changes, scoped commits, and
+whole-file staging and unstaging, discarding unstaged changes, scoped commits, and
 branch switching, and checkout catalog/create/open/prepare/suspend/remove operations.
 Agent archive and remote transport are not provided.
 Read-only capabilities constrain Zed's calls; they are not an operating-system
@@ -36,6 +36,11 @@ selected file in the diff.
 With the changes list focused, {#action git::StageFile},
 {#action git::UnstageFile}, and {#action git::RestoreFile} use the selected file's
 provider capabilities. The checkbox stages or unstages the whole file.
+Use **Stage All** or **Unstage All**, also available as {#action git::StageAll}
+and {#action git::UnstageAll}, to process the selected repository's scope. These
+actions use fresh working changes even when you are viewing another comparison.
+See [Stage All and Unstage All](#stage-all-and-unstage-all) for partial failures
+and recovery.
 
 Type a message in the standard commit editor, then choose **Commit** or run
 {#action git::Commit} with the editor focused. {#action git::ExpandCommitEditor}
@@ -71,8 +76,8 @@ the available history; the view indicates truncation instead of presenting it as
 complete. **Add to ignore file** uses the provider's declared configuration path
 and requires confirmation before updating that file.
 
-Repository-wide history, hunk and batch mutations, stash, amend, signoff, hook
-options, AI commit-message generation, and remote Git operations are unavailable
+Repository-wide history, section and folder staging, hunk mutations, stash, amend,
+signoff, hook options, AI commit-message generation, and remote Git operations are unavailable
 for external repositories. Shared native controls do not enable capabilities the
 provider does not expose. Unsupported commands report that limitation instead of
 operating on another Git repository in the project. Use the provider's own tools
@@ -315,6 +320,30 @@ its in-flight reconciliation. Before applying an operation, Zed persists its tok
 in the current user profile. An unresolved operation remains blocked across
 provider reconnects, folder reopening, and Zed restarts until reconciliation
 establishes its outcome.
+
+### Stage All and Unstage All {#stage-all-and-unstage-all}
+
+Stage All and Unstage All compose the provider's existing `stage` and `unstage`
+file capabilities; they do not require a separate batch protocol method. Zed loads
+a fresh Working comparison and fixes a list of unique paths within the selected
+repository scope, regardless of the displayed comparison. Partially staged files
+can participate in either action. A rename and its source are handled together
+as one file operation.
+
+Before the first write, Zed checks every candidate's capabilities, ownership,
+file metadata, and open buffers. An unsupported candidate, unsaved edit, or disk
+conflict rejects the batch before any file is modified. Zed then prepares and
+applies each file sequentially, using the same durable journal and reconciliation
+rules as selected-file operations.
+
+The batch stops at the first error. The error reports how many file operations
+were confirmed, the current path when one was started, and how many were not
+started. Confirmed operations remain applied; Zed does not automatically roll
+them back or resume the remaining batch. Recovery reconciles individual recorded
+operations only. Review the refreshed changes before starting a new batch.
+
+Section, folder, and hunk staging remain unavailable. Use individual file actions
+or Stage All and Unstage All for the repository scope.
 
 ### Repository operations
 
