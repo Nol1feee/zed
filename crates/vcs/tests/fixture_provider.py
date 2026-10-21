@@ -69,6 +69,9 @@ SCENARIOS += tuple(sorted(FILE_KIND_SCENARIOS))
 WRITABLE_SCENARIOS.update(FILE_KIND_SCENARIOS)
 BLAME_SCENARIOS = {"blame", "blame-malformed", "blame-stale", "blame-pending", "blame-missing-head"}
 SCENARIOS += tuple(sorted(BLAME_SCENARIOS))
+WORKFLOW_SCENARIOS = {"file-workflow", "file-workflow-stale", "file-workflow-bad-ignore"}
+SCENARIOS += tuple(sorted(WORKFLOW_SCENARIOS))
+WRITABLE_SCENARIOS.update(WORKFLOW_SCENARIOS)
 SEND_LOCK = threading.Lock()
 
 
@@ -307,8 +310,17 @@ def main():
                     capabilities.update(checkoutCatalog=True, checkoutOperations=["create", "open", "prepare", "suspend", "remove"])
             if args.scenario in BLAME_SCENARIOS:
                 capabilities["blame"] = True
+            if args.scenario in WORKFLOW_SCENARIOS:
+                capabilities.update(fileHistory=True, fileOperations=["stage", "unstage", "discard", "ignore"])
             reply(identifier, {"protocolVersion": version, "serverInfo": {"name": "fixture", "version": "1"}, "capabilities": capabilities})
         elif method == "vcs/discover":
+            if args.scenario in WORKFLOW_SCENARIOS:
+                reply(identifier, [{"id": "fixture-repository", "rootUri": params["scopeUri"], "scopeUri": params["scopeUri"],
+                                    "displayName": "Fixture", "ignoreConfigPath": ".fixtureignore",
+                                    "baselines": [{"id": purpose, "label": purpose.title(), "purpose": purpose,
+                                                   "currentContent": "snapshot" if purpose == "staged" else "working"}
+                                                  for purpose in ("working", "staged", "unstaged")]}])
+                continue
             reply(identifier, [{"id": "fixture-repository", "rootUri": params["scopeUri"], "scopeUri": params["scopeUri"],
                                 "displayName": "Fixture", "baselines": [{"id": "submitted", "label": "Submitted changes"},
                                                                           {"id": "previous", "label": "Previous changes"}]}])
@@ -361,6 +373,14 @@ def main():
             if args.scenario == "changing-slow-content":
                 snapshot["id"] = f"snapshot:changing:{snapshots}"
                 snapshot["revisionId"] = f"r{42 + snapshots}"
+            if args.scenario in WORKFLOW_SCENARIOS:
+                marker = Path(str(args.events) + ".index")
+                index = marker.read_text() if marker.is_file() else "B\n"
+                snapshot.update(id=f"workflow:{snapshots}", revisionId="index:" + index.strip() if params["baselineId"] == "unstaged" else "revision:A",
+                                headRevisionId="revision:A", currentRevisionId="index:" + index.strip() if params["baselineId"] == "staged" else None)
+                snapshot["changes"][0].update(stagedStatus="modified", unstagedStatus="modified", fileOperations=["stage", "unstage", "discard"])
+                snapshot["changes"].append({"path": "new.txt", "status": "untracked", "kind": "file", "unstagedStatus": "untracked", "fileOperations": ["stage", "discard", "ignore"]})
+                snapshot_contents[snapshot["id"]] = {"base": index if params["baselineId"] == "unstaged" else "A\n", "current": index}
             if args.scenario == "reordered" and snapshots == 1:
                 held_snapshot = (identifier, snapshot)
                 record("snapshot-held", id=identifier)
@@ -386,6 +406,14 @@ def main():
             else:
                 reply(identifier, result)
         elif method == "vcs/readContent":
+            if args.scenario in WORKFLOW_SCENARIOS:
+                content = {"kind": "text", "text": snapshot_contents[params["snapshotId"]][params.get("side", "base")]}
+                if args.scenario == "file-workflow-stale" and params.get("side") == "current" and content["text"] == "B\n":
+                    record("content-held", id=identifier)
+                    threading.Thread(target=release_reply, args=(identifier, content, "content-released"), daemon=True).start()
+                else:
+                    reply(identifier, content)
+                continue
             if args.scenario == "changing-slow-content":
                 record("content-held", id=identifier, snapshot_id=params["snapshotId"])
                 continue
@@ -413,7 +441,7 @@ def main():
                 continue
             path, operation = params.get("path"), params.get("operation")
             if (params.get("repositoryId") != "fixture-repository" or not isinstance(path, str)
-                    or not path or operation not in ("stage", "unstage", "discard")
+                    or not path or operation not in ("stage", "unstage", "discard", "ignore")
                     or args.scenario == "v2-stage-only" and operation != "stage"):
                 reply(identifier, error={"code": -32602, "message": "Invalid file operation"})
                 continue
@@ -428,6 +456,8 @@ def main():
                                      args=(identifier, {"operationToken": token}, "prepare-released"), daemon=True).start()
                 else:
                     prepared_result = {"operationToken": "" if args.scenario == "invalid-token" else token}
+                    if operation == "ignore":
+                        prepared_result.update(affectedPaths=[path, "neighbor.txt" if args.scenario == "file-workflow-bad-ignore" else ".fixtureignore"], summary="Add selected file to .fixtureignore")
                     if args.scenario in FILE_KIND_SCENARIOS:
                         affected = [path]
                         if path == "renamed.txt" and args.scenario != "file-kinds-missing-old-path":
@@ -500,6 +530,17 @@ def main():
                 prepared["terminal"] = outcome
                 persist_operations()
             reply(identifier, {"outcome": outcome})
+        elif method == "vcs/fileHistory" and args.scenario in WORKFLOW_SCENARIOS:
+            cursor = params.get("cursor")
+            if cursor not in (None, "history:" + params["path"]):
+                reply(identifier, error={"code": -32602, "message": "Cursor belongs to another file"})
+                continue
+            revision = "revision:A" if cursor else "revision:B"
+            reply(identifier, {"entries": [{"commit": {"revisionId": revision, "author": "Fixture author", "summary": revision},
+                                           "parentRevisionId": None if cursor else "revision:A"}],
+                               "nextCursor": None if cursor else "history:" + params["path"], "truncated": False})
+        elif method == "vcs/readRevision" and args.scenario in WORKFLOW_SCENARIOS:
+            reply(identifier, {"kind": "text", "text": "A\n" if params["revisionId"] == "revision:A" else "B\n"})
         elif method == "vcs/repositoryState":
             if args.scenario not in REPOSITORY_SCENARIOS:
                 reply(identifier, error={"code": -32601, "message": "Repository state unavailable"})

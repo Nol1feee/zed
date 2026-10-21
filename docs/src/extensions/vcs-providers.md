@@ -27,8 +27,9 @@ the same panel and keybindings; there is no separate Source Control dock.
 
 Choose a provider's comparison baseline in the Changes tab, then click **View
 Diff** or run {#action git::Diff}. The diff combines the selected repository's
-changed text files in one editor. It shares live buffers with ordinary file
-editors, preserving unsaved edits. Navigating the changes list moves to the
+changed text files in one editor. Working comparisons share live buffers with ordinary file
+editors, preserving unsaved edits. Staged comparisons use a read-only snapshot of
+the index; editing or saving that snapshot cannot change a working file. Navigating the changes list moves to the
 selected file in the diff.
 
 With the changes list focused, {#action git::StageFile},
@@ -45,9 +46,22 @@ Providers that support blame use the existing {#action git::Blame},
 The hover shows the author and commit details, with an external commit link when
 the provider supplies one. Previous-revision blame remains Git-only.
 
-External repositories do not expose Git's History, separate staged or unstaged
-index views, or hunk and batch mutations. Stash, amend, and remote Git operations
-are also unavailable. Unsupported commands report that limitation instead of
+The context menu includes file navigation, path copying, and the operations the
+provider supports. Tracked and untracked files are grouped separately. A checked
+box means staged, an empty box means unstaged, and a mixed box means both.
+**Staged Changes** compares the committed version with the index; **Unstaged
+Changes** compares the index with the working buffer. These views keep their own
+comparison when the panel selection changes. Providers without index comparisons
+do not offer these entries.
+
+**View File History** opens a native, paginated history list when supported. Select
+a revision to compare it with its parent in a read-only diff. A provider can bound
+the available history; the view indicates truncation instead of presenting it as
+complete. **Add to ignore file** uses the provider's declared configuration path
+and requires confirmation before updating that file.
+
+Repository-wide history, hunk and batch mutations, stash, amend, and remote Git
+operations are unavailable for external repositories. Unsupported commands report that limitation instead of
 operating on another Git repository in the project. Use the provider's own tools
 for operations it does not expose to Zed.
 
@@ -108,14 +122,16 @@ components, `.`/`..`, NUL, backslashes and colon-containing components are rejec
 by the initial portable-path contract. Report an unsupported path rather than
 silently omitting it. File URIs identify local paths only.
 
-| Method            | Parameters                                                                    | Result                                                |
-| ----------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------- |
-| `initialize`      | `protocolVersion`, `supportedProtocolVersions`, `clientInfo: {name, version}` | `protocolVersion`, `serverInfo`, `capabilities`       |
-| `vcs/discover`    | `scopeUri`                                                                    | Array of repository descriptors                       |
-| `vcs/snapshot`    | `repositoryId`, `baselineId`                                                  | A snapshot of changes for that comparison             |
-| `vcs/readContent` | `repositoryId`, `snapshotId`, `baselineId`, `path`                            | Baseline-side content                                 |
-| `vcs/blame`       | `repositoryId`, `path`                                                        | Committed content and line attribution when supported |
-| `shutdown`        | Empty object                                                                  | `null`, after provider cleanup                        |
+| Method             | Parameters                                                                    | Result                                                |
+| ------------------ | ----------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `initialize`       | `protocolVersion`, `supportedProtocolVersions`, `clientInfo: {name, version}` | `protocolVersion`, `serverInfo`, `capabilities`       |
+| `vcs/discover`     | `scopeUri`                                                                    | Array of repository descriptors                       |
+| `vcs/snapshot`     | `repositoryId`, `baselineId`                                                  | A snapshot of changes for that comparison             |
+| `vcs/readContent`  | `repositoryId`, `snapshotId`, `baselineId`, `path`, optional `side`           | Immutable base or current-side content                |
+| `vcs/blame`        | `repositoryId`, `path`                                                        | Committed content and line attribution when supported |
+| `vcs/fileHistory`  | `repositoryId`, `path`, optional `cursor`, `limit`                            | A bounded page of file revisions                      |
+| `vcs/readRevision` | `repositoryId`, `path`, `revisionId`                                          | Immutable revision content                            |
+| `shutdown`         | Empty object                                                                  | `null`, after provider cleanup                        |
 
 After shutdown, the client sends an `exit` notification. Dropping a request sends
 `$/cancelRequest` with its `id`. Shutdown and process exit have bounded deadlines;
@@ -128,6 +144,35 @@ invalidates the visible snapshot; Zed also refreshes after relevant file changes
 and supports explicit refresh. Request failure, timeout, malformed data and process
 EOF are errors, not empty successful snapshots. Error `code`, `message`, and
 optional `data` retain provider details. Responses received before EOF remain valid.
+
+### Index comparisons and file history {#provider-file-workflow}
+
+A baseline can declare `purpose` as `working`, `staged`, `unstaged`, or `branch`.
+Its `currentContent` defaults to `working`. Use `snapshot` for an immutable
+current side, such as the index in a staged comparison. Such snapshots require
+`currentRevisionId` in addition to the baseline's `revisionId`; both identities
+must change whenever their respective content changes. A working-side comparison
+against the index uses the index identity as `revisionId`. `headRevisionId` still
+identifies the committed revision for blame.
+
+`vcs/readContent` accepts `side: "base"` (the default) or `"current"`. Both sides
+must be frozen to the requested snapshot, including after the live index changes.
+Zed never attaches snapshot-backed current content to a writable filesystem file.
+Changes may include `stagedStatus` and `unstagedStatus` to describe index and
+working changes independently, including changes that cancel each other.
+
+Set `capabilities.fileHistory` to enable file history. A request's `limit` is
+between 1 and 100. The response contains `entries`, optional `nextCursor`, and
+`truncated` (default false). Each entry contains `commit` using the blame commit
+schema, optional `parentRevisionId`, and optional scope-relative `path` and
+`parentPath` for renames. A missing parent revision means the empty base for the
+file's initial revision. Cursors must preserve a consistent history session.
+`truncated: true` means older entries may exist outside the provider's bound.
+
+`vcs/readRevision` returns the usual `Content` at an immutable revision. A file
+absent at that revision returns `kind: "absent"`; actual command failures remain
+errors. The host validates ownership and rejects stale responses after discovery
+or provider connection changes.
 
 ### Line attribution {#provider-blame}
 
@@ -181,7 +226,7 @@ Protocol 1 cannot advertise file operations. A protocol 2 provider opts in with:
   "serverInfo": { "name": "Example", "version": "2" },
   "capabilities": {
     "readOnly": false,
-    "fileOperations": ["stage", "unstage", "discard"]
+    "fileOperations": ["stage", "unstage", "discard", "ignore"]
   }
 }
 ```
@@ -214,7 +259,11 @@ unreviewed state.
 | `vcs/reconcileFileOperation` | Same fields plus `operationToken`   | `{outcome}`                                  |
 
 `affectedPaths` defaults to the requested path for older providers. It must contain the
-requested path and may additionally include its known rename source. The host validates
+requested path and may additionally include its known rename source. For `ignore`,
+the repository must declare `ignoreConfigPath`, and `affectedPaths` must contain
+exactly the selected untracked path and that configuration path, with a nonempty
+summary. The provider preserves unrelated rules and file contents; changes to the
+selection or configuration after preparation must invalidate the token. The host validates
 ownership and checks buffers for all affected absolute paths in every open Project.
 Providers must bind the complete set into the token and mutate rename pairs together.
 If a historical comparison rename no longer represents a current operation pair,

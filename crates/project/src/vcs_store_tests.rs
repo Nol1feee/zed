@@ -92,6 +92,495 @@ struct Fixture {
     worktree_id: WorktreeId,
 }
 
+#[gpui::test]
+async fn file_operation_keeps_its_comparison_after_panel_baseline_changes(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "comparison-operation",
+        fixture.directory.path(),
+        "file-workflow",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.load_comparison(repository.key.clone(), "staged".into(), cx)
+        })
+        .await
+        .unwrap();
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_file_operation_for_baseline(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Unstage,
+                "staged".into(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.set_baseline(&repository.key, "unstaged".into(), cx)
+        })
+        .unwrap();
+    ready(&fixture, cx).await;
+    fixture.store.update(cx, |store, _| {
+        let current = store.repositories.get_mut(&repository.key).unwrap();
+        Arc::make_mut(current.view.snapshot.as_mut().unwrap())
+            .changes
+            .clear();
+        assert!(
+            store
+                .file_operations_for_path(&repository.key, "src/example.txt")
+                .is_empty()
+        );
+        assert!(
+            store
+                .file_operations_for_baseline(&repository.key, "src/example.txt", "staged")
+                .contains(&FileOperation::Unstage)
+        );
+    });
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.apply_prepared_file_operation(prepared, cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(ready(&fixture, cx).await.selected_baseline, "unstaged");
+    let events =
+        std::fs::read_to_string(fixture.directory.path().join("comparison-operation.jsonl"))
+            .unwrap();
+    let applied = events
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["event"] == "file-operation-applied")
+        .unwrap();
+    assert_eq!(applied["operation"], "unstage");
+    assert_eq!(applied["path"], "src/example.txt");
+    assert_eq!(applied["staged"], false);
+    assert_eq!(applied["disk"], "working");
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn comparison_sides_preserve_index_and_dirty_working_buffer(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, true).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("workflow", fixture.directory.path(), "file-workflow").register(cx);
+    let repository = ready(&fixture, cx).await;
+    let buffer = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..buffer.len(), "C\n")], None, cx)
+    });
+    let staged = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.open_diff_for_purpose(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                vcs::ComparisonPurpose::Staged,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(staged.current_content, vcs::ContentSource::Snapshot);
+    staged.buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "B\n");
+        assert_eq!(buffer.capability(), language::Capability::ReadOnly);
+        assert!(
+            buffer.file().is_none(),
+            "snapshot must never acquire a save target"
+        );
+    });
+    assert_eq!(
+        staged
+            .diff
+            .read_with(cx, |diff, cx| diff.base_text(cx).text()),
+        "A\n"
+    );
+    let unstaged = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.open_diff_for_purpose(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                vcs::ComparisonPurpose::Unstaged,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(unstaged.buffer, buffer);
+    assert_eq!(
+        unstaged
+            .diff
+            .read_with(cx, |diff, cx| diff.base_text(cx).text()),
+        "B\n"
+    );
+    let working = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.open_diff_for_purpose(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                vcs::ComparisonPurpose::Working,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(working.buffer, buffer);
+    assert_ne!(working.diff, unstaged.diff);
+    assert_eq!(
+        working
+            .diff
+            .read_with(cx, |diff, cx| diff.base_text(cx).text()),
+        "A\n"
+    );
+    std::fs::write(
+        fixture.directory.path().join("workflow.jsonl.index"),
+        "B2\n",
+    )
+    .unwrap();
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.load_comparison(repository.key.clone(), "staged".into(), cx)
+        })
+        .await
+        .unwrap();
+    let refreshed = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.open_diff_for_purpose(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                vcs::ComparisonPurpose::Staged,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        refreshed.buffer.read_with(cx, |buffer, _| buffer.text()),
+        "B2\n"
+    );
+    assert_eq!(
+        staged.buffer.read_with(cx, |buffer, _| buffer.text()),
+        "B\n",
+        "already opened immutable revision remains pinned"
+    );
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "C\n");
+        assert!(buffer.is_dirty());
+    });
+    fixture
+        .fs
+        .remove_file(
+            &fixture.directory.path().join("src/example.txt"),
+            fs::RemoveOptions::default(),
+        )
+        .await
+        .unwrap();
+    let deleted = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.open_diff_for_purpose(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                vcs::ComparisonPurpose::Unstaged,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted.buffer, buffer,
+        "missing disk file must preserve the open dirty buffer"
+    );
+    assert_eq!(
+        deleted.buffer.read_with(cx, |buffer, _| buffer.text()),
+        "C\n"
+    );
+    fixture
+        .project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store.open_diff_for_purpose(
+                repository.key.clone(),
+                "nested/file.txt".into(),
+                vcs::ComparisonPurpose::Staged,
+                cx
+            ))
+            .await
+            .is_err()
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn delayed_index_content_is_rejected_after_new_index_snapshot(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "stale-workflow",
+        fixture.directory.path(),
+        "file-workflow-stale",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    let stale = fixture.store.update(cx, |store, cx| {
+        store.open_diff_for_purpose(
+            repository.key.clone(),
+            "src/example.txt".into(),
+            vcs::ComparisonPurpose::Staged,
+            cx,
+        )
+    });
+    let events = fixture.directory.path().join("stale-workflow.jsonl");
+    provider_event(events.clone(), "content-held").await;
+    std::fs::write(events.with_extension("jsonl.index"), "B2\n").unwrap();
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.load_comparison(repository.key.clone(), "staged".into(), cx)
+        })
+        .await
+        .unwrap();
+    std::fs::write(events.with_extension("jsonl.release"), "release").unwrap();
+    assert!(
+        stale
+            .await
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("comparison changed")
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn file_history_is_bounded_and_revision_diff_has_no_working_file(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("history", fixture.directory.path(), "file-workflow").register(cx);
+    let repository = ready(&fixture, cx).await;
+    let first = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.file_history(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                None,
+                1,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    let second = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.file_history(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                first.next_cursor.clone(),
+                1,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(second.entries[0].commit.revision_id, "revision:A");
+    assert!(second.next_cursor.is_none());
+    let diff = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.open_revision_diff(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                first.entries[0].clone(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        diff.diff
+            .read_with(cx, |diff, cx| diff.base_text(cx).text()),
+        "A\n"
+    );
+    diff.buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "B\n");
+        assert!(buffer.file().is_none());
+        assert_eq!(buffer.capability(), language::Capability::ReadOnly);
+    });
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store.file_history(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                None,
+                101,
+                cx
+            ))
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store.file_history(
+                repository.key.clone(),
+                "new.txt".into(),
+                first.next_cursor,
+                1,
+                cx
+            ))
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store.file_history(
+                repository.key.clone(),
+                "../outside".into(),
+                None,
+                1,
+                cx
+            ))
+            .await
+            .is_err()
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn ignore_checks_declared_target_and_dirty_configuration(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    fixture
+        .fs
+        .insert_file(
+            fixture.directory.path().join("new.txt"),
+            b"untracked\n".to_vec(),
+        )
+        .await;
+    fixture
+        .fs
+        .insert_file(
+            fixture.directory.path().join(".fixtureignore"),
+            b"existing\n".to_vec(),
+        )
+        .await;
+    trust(&fixture, cx);
+    FixtureExtension::new("ignore", fixture.directory.path(), "file-workflow").register(cx);
+    let repository = ready(&fixture, cx).await;
+    let prepared = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.prepare_file_operation(
+                repository.key.clone(),
+                "new.txt".into(),
+                FileOperation::Ignore,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(prepared.affected_paths, ["new.txt", ".fixtureignore"]);
+    let config = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join(".fixtureignore"), cx)
+        })
+        .await
+        .unwrap();
+    config.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "unsaved\n")], None, cx)
+    });
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store
+                .apply_prepared_file_operation(prepared, cx))
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .store
+            .update(cx, |store, cx| store.prepare_file_operation(
+                repository.key.clone(),
+                "new.txt".into(),
+                FileOperation::Ignore,
+                cx
+            ))
+            .await
+            .is_err()
+    );
+    fixture.store.read_with(cx, |store, _| {
+        assert!(
+            store
+                .validate_file_targets(
+                    &repository.key,
+                    "new.txt",
+                    FileOperation::Ignore,
+                    &["new.txt".into(), "neighbor.txt".into()],
+                    Some("wrong target"),
+                    "working",
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .validate_file_targets(
+                    &repository.key,
+                    "src/example.txt",
+                    FileOperation::Ignore,
+                    &["src/example.txt".into(), ".fixtureignore".into()],
+                    Some("tracked file"),
+                    "working",
+                )
+                .is_err()
+        );
+    });
+    let events = std::fs::read_to_string(fixture.directory.path().join("ignore.jsonl")).unwrap();
+    assert!(!events.contains("vcs/applyFileOperation"));
+    fixture
+        .fs
+        .insert_symlink(
+            fixture.directory.path().join("config-link"),
+            "src/example.txt".into(),
+        )
+        .await;
+    let fs: Arc<dyn Fs> = fixture.fs.clone();
+    assert!(
+        validate_ignore_config(fixture.directory.path(), "config-link", &fs)
+            .await
+            .is_err()
+    );
+    stop(&fixture, cx).await;
+}
+
 async fn fixture(cx: &mut TestAppContext, nested_git: bool) -> Fixture {
     cx.executor().allow_parking();
     cx.update(|cx| {
@@ -1731,6 +2220,41 @@ async fn late_snapshot_cannot_replace_new_baseline(cx: &mut TestAppContext) {
         assert_eq!(current.selected_baseline, "previous");
         assert_eq!(current.snapshot.as_ref().unwrap().id, "snapshot:previous");
     });
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn comparison_load_does_not_supersede_repository_state_refresh(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "comparison-state",
+        fixture.directory.path(),
+        "repository-operations",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    assert!(repository.repository_state.is_some());
+    let comparison = fixture.store.update(cx, |store, cx| {
+        store
+            .repositories
+            .get_mut(&repository.key)
+            .unwrap()
+            .view
+            .repository_state = None;
+        store.refresh(&repository.key, cx);
+        store.load_comparison(
+            repository.key.clone(),
+            repository.selected_baseline.clone(),
+            cx,
+        )
+    });
+    comparison.await.unwrap();
+    let refreshed = ready(&fixture, cx).await;
+    assert_eq!(
+        refreshed.repository_state.unwrap().staged_paths,
+        ["src/example.txt"]
+    );
     stop(&fixture, cx).await;
 }
 

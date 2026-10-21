@@ -36,6 +36,7 @@ enum Step {
     Keys { keys: String },
     Input { text: String },
     Click { x: f32, y: f32 },
+    RightClick { x: f32, y: f32 },
     OpenFile { path: PathBuf },
     SelectWorkspace { path: PathBuf },
     CloseWindow,
@@ -52,6 +53,7 @@ impl Step {
             Self::Keys { keys } => format!("Keys {keys}"),
             Self::Input { text } => format!("Input ({} characters)", text.chars().count()),
             Self::Click { x, y } => format!("Click {x}, {y}"),
+            Self::RightClick { x, y } => format!("Right click {x}, {y}"),
             Self::OpenFile { path } => format!("Open file {}", path.display()),
             Self::SelectWorkspace { path } => format!("Select workspace {}", path.display()),
             Self::CloseWindow => "Close window".into(),
@@ -309,6 +311,21 @@ impl Scenario {
             Step::Click { x, y } => {
                 cx.simulate_click(*window, point(px(*x), px(*y)), Modifiers::default())
             }
+            Step::RightClick { x, y } => {
+                let position = point(px(*x), px(*y));
+                cx.simulate_mouse_down(
+                    *window,
+                    position,
+                    gpui::MouseButton::Right,
+                    Modifiers::default(),
+                );
+                cx.simulate_mouse_up(
+                    *window,
+                    position,
+                    gpui::MouseButton::Right,
+                    Modifiers::default(),
+                );
+            }
             Step::OpenFile { path } => {
                 ensure!(
                     !path.is_absolute()
@@ -545,6 +562,8 @@ fn observe(
                 dock.read(cx).visible_panel().map(|panel| panel.persistent_name())
             }).collect::<Vec<_>>();
             let active_item = workspace.active_item(cx);
+            let history = workspace.active_item_as::<git_ui::vcs_file_history::VcsFileHistory>(cx)
+                .map(|history| history.read(cx).diagnostics());
             let editor = active_item.as_ref().and_then(|item| item.act_as::<editor::Editor>(cx));
             let split_editor = active_item.as_ref().and_then(|item| item.act_as::<editor::SplittableEditor>(cx));
             let mut buffers = editor.as_ref().map(|editor| {
@@ -555,6 +574,8 @@ fn observe(
                         "id": id,
                         "path": buffer.file().map(|file| file.full_path(cx)),
                         "dirty": buffer.is_dirty(),
+                        "read_only": buffer.read_only(),
+                        "text": buffer.snapshot().text().chars().take(8192).collect::<String>(),
                     })
                 }).collect::<Vec<_>>()
             }).unwrap_or_default();
@@ -591,8 +612,10 @@ fn observe(
                 "worktree_entry_count": project.visible_worktrees(cx).map(|worktree| worktree.read(cx).snapshot().entry_count()).sum::<usize>(),
                 "active_item_dirty": active_item.as_ref().map(|item| item.is_dirty(cx)),
                 "active_item_kind": active_item_kind,
+                "active_editor_read_only": editor.as_ref().map(|editor| editor.read(cx).read_only(cx)),
                 "active_item_title": active_item.as_ref().map(|item| item.tab_content_text(0, cx)),
                 "active_item_buffers": buffers,
+                "file_history": history,
                 "blame": blame_state,
                 "active_diff_split": split_editor.as_ref().map(|editor| editor.read(cx).is_split()),
                 "panels": {

@@ -1,10 +1,11 @@
 use crate::{
-    Blame, CheckoutCatalog, CheckoutOperation, CheckoutOperationResult, Content, FileOperation,
-    FileOperationResult, InitializeParams, InitializeResult, MAX_MESSAGE_BYTES, OperationProgress,
-    PROTOCOL_VERSION, PreparedCheckoutOperation, PreparedFileOperation,
-    PreparedRepositoryOperation, ProviderCapabilities, ProviderError, ProviderInfo,
-    RepositoryDescriptor, RepositoryOperation, RepositoryState, SUPPORTED_PROTOCOL_VERSIONS,
-    Snapshot, validate_operation_token, validate_path,
+    Blame, CheckoutCatalog, CheckoutOperation, CheckoutOperationResult, Content, ContentSide,
+    FileHistory, FileOperation, FileOperationResult, InitializeParams, InitializeResult,
+    MAX_MESSAGE_BYTES, OperationProgress, PROTOCOL_VERSION, PreparedCheckoutOperation,
+    PreparedFileOperation, PreparedRepositoryOperation, ProviderCapabilities, ProviderError,
+    ProviderInfo, RepositoryDescriptor, RepositoryOperation, RepositoryState,
+    SUPPORTED_PROTOCOL_VERSIONS, Snapshot, validate_history_request, validate_operation_token,
+    validate_path, validate_revision_id,
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use collections::HashMap;
@@ -371,9 +372,86 @@ impl ProviderConnection {
         baseline_id: String,
         path: String,
     ) -> Result<Content> {
+        self.read_content_side(
+            repository_id,
+            snapshot_id,
+            baseline_id,
+            path,
+            ContentSide::Base,
+        )
+        .await
+    }
+
+    pub async fn read_content_side(
+        &self,
+        repository_id: String,
+        snapshot_id: String,
+        baseline_id: String,
+        path: String,
+        side: ContentSide,
+    ) -> Result<Content> {
         self.ensure_initialized()?;
         validate_path(&path)?;
-        self.request("vcs/readContent", json!({"repositoryId":repository_id,"snapshotId":snapshot_id,"baselineId":baseline_id,"path":path}), REQUEST_TIMEOUT).await
+        let mut params = json!({"repositoryId":repository_id,"snapshotId":snapshot_id,"baselineId":baseline_id,"path":path});
+        if side != ContentSide::Base {
+            params["side"] = serde_json::to_value(side)?;
+        }
+        let content: Content = self
+            .request("vcs/readContent", params, REQUEST_TIMEOUT)
+            .await?;
+        content.validate()?;
+        Ok(content)
+    }
+
+    pub async fn file_history(
+        &self,
+        repository_id: String,
+        path: String,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<FileHistory> {
+        self.ensure_initialized()?;
+        ensure!(
+            self.capabilities()
+                .is_some_and(|capabilities| capabilities.file_history),
+            "VCS provider does not support file history"
+        );
+        validate_path(&path)?;
+        validate_history_request(cursor.as_deref(), limit)?;
+        let history: FileHistory = self
+            .request(
+                "vcs/fileHistory",
+                json!({"repositoryId":repository_id,"path":path,"cursor":cursor,"limit":limit}),
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        history.validate(cursor.as_deref(), limit)?;
+        Ok(history)
+    }
+
+    pub async fn read_revision(
+        &self,
+        repository_id: String,
+        path: String,
+        revision_id: String,
+    ) -> Result<Content> {
+        self.ensure_initialized()?;
+        ensure!(
+            self.capabilities()
+                .is_some_and(|capabilities| capabilities.file_history),
+            "VCS provider does not support file history"
+        );
+        validate_path(&path)?;
+        validate_revision_id(&revision_id)?;
+        let content: Content = self
+            .request(
+                "vcs/readRevision",
+                json!({"repositoryId":repository_id,"path":path,"revisionId":revision_id}),
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        content.validate()?;
+        Ok(content)
     }
 
     pub async fn prepare_file_operation(

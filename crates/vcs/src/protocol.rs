@@ -29,6 +29,8 @@ pub struct ProviderCapabilities {
     #[serde(default)]
     pub blame: bool,
     #[serde(default)]
+    pub file_history: bool,
+    #[serde(default)]
     pub file_operations: Vec<FileOperation>,
     #[serde(default)]
     pub repository_operations: Vec<RepositoryOperationKind>,
@@ -58,6 +60,7 @@ pub enum FileOperation {
     Stage,
     Unstage,
     Discard,
+    Ignore,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -534,6 +537,35 @@ impl InitializeResult {
 pub struct Baseline {
     pub id: String,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<ComparisonPurpose>,
+    #[serde(default)]
+    pub current_content: ContentSource,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum ComparisonPurpose {
+    Working,
+    Staged,
+    Unstaged,
+    Branch,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContentSource {
+    #[default]
+    Working,
+    Snapshot,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ContentSide {
+    #[default]
+    Base,
+    Current,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -544,6 +576,8 @@ pub struct RepositoryDescriptor {
     pub scope_uri: String,
     pub display_name: String,
     pub baselines: Vec<Baseline>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignore_config_path: Option<String>,
 }
 
 impl RepositoryDescriptor {
@@ -561,7 +595,7 @@ impl RepositoryDescriptor {
             "VCS scope is outside its repository"
         );
         ensure!(
-            !self.baselines.is_empty(),
+            !self.baselines.is_empty() && self.baselines.len() <= 32,
             "VCS repository has no comparison baseline"
         );
         let mut ids = std::collections::HashSet::new();
@@ -570,6 +604,28 @@ impl RepositoryDescriptor {
                 !baseline.id.is_empty() && ids.insert(&baseline.id),
                 "invalid or duplicate VCS baseline id"
             );
+            ensure!(
+                baseline.purpose != Some(ComparisonPurpose::Staged)
+                    || baseline.current_content == ContentSource::Snapshot,
+                "staged VCS comparison requires immutable current content"
+            );
+        }
+        for purpose in [
+            ComparisonPurpose::Working,
+            ComparisonPurpose::Staged,
+            ComparisonPurpose::Unstaged,
+        ] {
+            ensure!(
+                self.baselines
+                    .iter()
+                    .filter(|baseline| baseline.purpose == Some(purpose))
+                    .count()
+                    <= 1,
+                "duplicate VCS comparison purpose"
+            );
+        }
+        if let Some(path) = &self.ignore_config_path {
+            validate_path(path)?;
         }
         Ok(())
     }
@@ -638,6 +694,10 @@ pub struct Change {
     pub file_operations: Option<Vec<FileOperation>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staged_status: Option<ChangeStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unstaged_status: Option<ChangeStatus>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -652,6 +712,9 @@ pub struct Snapshot {
     /// Current committed revision, independent of the selected comparison baseline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_revision_id: Option<String>,
+    /// Immutable identity of snapshot-backed current content, independent of HEAD.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_revision_id: Option<String>,
     pub changes: Vec<Change>,
 }
 
@@ -667,6 +730,10 @@ impl Snapshot {
         );
         if let Some(head) = &self.head_revision_id {
             validate_revision_id(head)?;
+        }
+        validate_revision_id(&self.revision_id)?;
+        if let Some(current) = &self.current_revision_id {
+            validate_revision_id(current)?;
         }
         let mut paths = std::collections::HashSet::new();
         for change in &self.changes {
@@ -691,6 +758,94 @@ pub enum Content {
     Text { text: String },
     Binary,
     Symlink { target: String },
+}
+
+impl Content {
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Text { text } => ensure!(
+                text.len() <= MAX_BLAME_CONTENT_BYTES && !text.contains('\0'),
+                "VCS text content is too large or binary"
+            ),
+            Self::Symlink { target } => ensure!(
+                target.len() <= 16 * 1024 && !target.contains('\0'),
+                "invalid VCS symlink target"
+            ),
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+pub const MAX_FILE_HISTORY_ENTRIES: u32 = 100;
+pub type Commit = BlameCommit;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileHistoryEntry {
+    pub commit: Commit,
+    pub parent_revision_id: Option<String>,
+    pub path: Option<String>,
+    pub parent_path: Option<String>,
+}
+
+impl FileHistoryEntry {
+    pub fn validate(&self) -> Result<()> {
+        self.commit.validate()?;
+        if let Some(revision) = &self.parent_revision_id {
+            validate_revision_id(revision)?;
+        }
+        for path in [&self.path, &self.parent_path].into_iter().flatten() {
+            validate_path(path)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileHistory {
+    pub entries: Vec<FileHistoryEntry>,
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+pub fn validate_history_request(cursor: Option<&str>, limit: u32) -> Result<()> {
+    ensure!(
+        (1..=MAX_FILE_HISTORY_ENTRIES).contains(&limit),
+        "invalid VCS file history page size"
+    );
+    if let Some(cursor) = cursor {
+        validate_revision_id(cursor)?;
+    }
+    Ok(())
+}
+
+impl FileHistory {
+    pub fn validate(&self, cursor: Option<&str>, limit: u32) -> Result<()> {
+        validate_history_request(cursor, limit)?;
+        ensure!(
+            self.entries.len() <= limit as usize,
+            "VCS file history exceeds its page limit"
+        );
+        if let Some(next) = &self.next_cursor {
+            validate_revision_id(next)?;
+            ensure!(
+                Some(next.as_str()) != cursor && !self.entries.is_empty(),
+                "VCS file history pagination did not advance"
+            );
+        }
+        let mut revisions = std::collections::HashSet::new();
+        for entry in &self.entries {
+            entry.validate()?;
+            ensure!(
+                revisions.insert(&entry.commit.revision_id),
+                "duplicate VCS file history revision"
+            );
+        }
+        Ok(())
+    }
 }
 
 pub const MAX_BLAME_CONTENT_BYTES: usize = 4 * 1024 * 1024;
@@ -725,12 +880,46 @@ pub struct BlameCommit {
     pub commit_url: Option<String>,
 }
 
-fn validate_revision_id(revision: &str) -> Result<()> {
+pub fn validate_revision_id(revision: &str) -> Result<()> {
     ensure!(
         !revision.is_empty() && revision.len() <= 4096 && !revision.chars().any(char::is_control),
         "invalid VCS revision identity"
     );
     Ok(())
+}
+
+impl BlameCommit {
+    pub fn validate(&self) -> Result<()> {
+        validate_revision_id(&self.revision_id)?;
+        for (value, limit) in [
+            (self.author.as_deref(), 4096),
+            (self.summary.as_deref(), 16 * 1024),
+            (self.message.as_deref(), 64 * 1024),
+        ] {
+            ensure!(
+                value.is_none_or(|value| value.len() <= limit && !value.contains('\0')),
+                "invalid VCS commit metadata"
+            );
+        }
+        if let Some(timestamp) = self.author_time {
+            ensure!(
+                (-62_135_596_800..=253_402_300_799).contains(&timestamp),
+                "invalid VCS commit author timestamp"
+            );
+        }
+        if let Some(commit_url) = &self.commit_url {
+            ensure!(commit_url.len() <= 8192, "VCS commit URL is too long");
+            let url = url::Url::parse(commit_url).context("invalid VCS commit URL")?;
+            ensure!(
+                url.scheme() == "https"
+                    && url.host_str().is_some()
+                    && url.username().is_empty()
+                    && url.password().is_none(),
+                "VCS commit URL must use HTTPS without credentials"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Blame {
@@ -846,6 +1035,59 @@ pub struct ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comparison_metadata_is_optional_and_ignore_target_is_scoped() {
+        let legacy: Baseline =
+            serde_json::from_value(serde_json::json!({"id":"submitted","label":"Submitted"}))
+                .unwrap();
+        assert_eq!(legacy.current_content, ContentSource::Working);
+        assert_eq!(legacy.purpose, None);
+        let mut descriptor: RepositoryDescriptor = serde_json::from_value(serde_json::json!({
+            "id":"repository", "rootUri":"file:///repository", "scopeUri":"file:///repository/project", "displayName":"Fixture",
+            "baselines":[{"id":"staged", "label":"Staged", "purpose":"staged", "currentContent":"snapshot"}], "ignoreConfigPath":".fixtureignore"
+        })).unwrap();
+        descriptor.validate("file:///repository/project").unwrap();
+        descriptor.ignore_config_path = Some("../outside".into());
+        assert!(descriptor.validate("file:///repository/project").is_err());
+        descriptor.ignore_config_path = None;
+        descriptor.baselines[0].current_content = ContentSource::Working;
+        assert!(descriptor.validate("file:///repository/project").is_err());
+        descriptor.baselines[0].current_content = ContentSource::Snapshot;
+        let mut duplicate = descriptor.baselines[0].clone();
+        duplicate.id = "other-staged".into();
+        descriptor.baselines.push(duplicate);
+        assert!(descriptor.validate("file:///repository/project").is_err());
+    }
+
+    #[test]
+    fn history_validates_opaque_revisions_pagination_and_content_limits() {
+        let page: FileHistory = serde_json::from_value(serde_json::json!({
+            "entries":[{"commit":{"revisionId":"revision:topic/17","summary":"Commit"}, "parentRevisionId":"revision:topic/16", "path":"file.txt", "parentPath":"old.txt"}],
+            "nextCursor":"cursor:page/2"
+        })).unwrap();
+        page.validate(None, 1).unwrap();
+        assert!(!page.truncated);
+        assert!(page.validate(Some("cursor:page/2"), 1).is_err());
+        assert!(page.validate(None, 0).is_err());
+        assert!(page.validate(None, 101).is_err());
+        let mut invalid = page.clone();
+        invalid.entries[0].parent_path = Some("../outside".into());
+        assert!(invalid.validate(None, 1).is_err());
+        let mut invalid = page.clone();
+        invalid.entries[0].commit.revision_id = "bad\nrevision".into();
+        assert!(invalid.validate(None, 1).is_err());
+        let mut invalid = page.clone();
+        invalid.entries.push(page.entries[0].clone());
+        assert!(invalid.validate(None, 2).is_err());
+        assert!(
+            Content::Text {
+                text: "x".repeat(MAX_BLAME_CONTENT_BYTES + 1)
+            }
+            .validate()
+            .is_err()
+        );
+    }
 
     #[test]
     fn blame_is_optional_and_independent_of_writes() {

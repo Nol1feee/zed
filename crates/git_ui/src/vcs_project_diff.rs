@@ -20,12 +20,12 @@ use language::{Anchor, Capability, OffsetRangeExt as _, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::{
     Project, ProjectPath,
-    vcs_store::{VcsDiff, VcsRepositoryId, VcsStore},
+    vcs_store::{VcsDiff, VcsRepositoryId, VcsStore, VcsStoreEvent},
 };
 use settings::Settings as _;
-use ui::{Button, ContextMenu, Label, Tooltip, prelude::*};
+use ui::{Button, Checkbox, ContextMenu, Label, ToggleState, Tooltip, prelude::*};
 use util::{ResultExt as _, rel_path::RelPath};
-use vcs::{Change, ChangeStatus, ContentKind};
+use vcs::{Change, ChangeStatus, ComparisonPurpose, ContentKind, ContentSource, FileOperation};
 use workspace::{
     Item, ItemNavHistory, Workspace,
     item::{ItemEvent, SaveOptions},
@@ -35,7 +35,8 @@ use workspace::{
 use crate::{
     git_panel::GitPanel,
     vcs_panel::{
-        DiscardFile, discard_context_menu, discard_file_changes, discard_unavailable_reason,
+        DiscardFile, FileAction, FileTarget, discard_file_changes, discard_unavailable_reason,
+        file_context_menu, staging_state,
     },
 };
 
@@ -115,6 +116,32 @@ pub(crate) fn deploy_at_with_focus(
     }
 }
 
+pub(crate) fn deploy_baseline(
+    workspace: &mut Workspace,
+    repository: VcsRepositoryId,
+    baseline: String,
+    path: Option<String>,
+    focus: bool,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(store) = workspace.project().read(cx).vcs_store().cloned() else {
+        return;
+    };
+    let item = open_item_for_baseline(
+        workspace,
+        repository,
+        baseline,
+        Some(store),
+        focus,
+        window,
+        cx,
+    );
+    if let Some(path) = path {
+        item.update(cx, |item, cx| item.move_to_path(path, window, cx));
+    }
+}
+
 fn open_item(
     workspace: &mut Workspace,
     repository: VcsRepositoryId,
@@ -123,9 +150,32 @@ fn open_item(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Entity<VcsProjectDiff> {
+    let baseline = store
+        .as_ref()
+        .and_then(|store| {
+            store
+                .read(cx)
+                .repositories()
+                .into_iter()
+                .find(|entry| entry.key == repository)
+        })
+        .map(|repository| repository.selected_baseline)
+        .unwrap_or_default();
+    open_item_for_baseline(workspace, repository, baseline, store, focus, window, cx)
+}
+
+fn open_item_for_baseline(
+    workspace: &mut Workspace,
+    repository: VcsRepositoryId,
+    baseline: String,
+    store: Option<Entity<VcsStore>>,
+    focus: bool,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Entity<VcsProjectDiff> {
     let existing = workspace
         .items_of_type::<VcsProjectDiff>(cx)
-        .find(|item| item.read(cx).repository == repository);
+        .find(|item| item.read(cx).repository == repository && item.read(cx).baseline == baseline);
     if let Some(item) = existing {
         item.update(cx, |item, cx| {
             if item.error.is_some() && !item.loading {
@@ -138,8 +188,17 @@ fn open_item(
     }
     let project = workspace.project().clone();
     let workspace_entity = cx.entity();
-    let item =
-        cx.new(|cx| VcsProjectDiff::new(repository, store, project, workspace_entity, window, cx));
+    let item = cx.new(|cx| {
+        VcsProjectDiff::new(
+            repository,
+            baseline,
+            store,
+            project,
+            workspace_entity,
+            window,
+            cx,
+        )
+    });
     workspace.add_item_to_active_pane(Box::new(item.clone()), None, focus, window, cx);
     item
 }
@@ -152,6 +211,10 @@ struct LoadedDiff {
 
 pub(crate) struct VcsProjectDiff {
     repository: VcsRepositoryId,
+    baseline: String,
+    title: SharedString,
+    current_content: ContentSource,
+    workspace: WeakEntity<Workspace>,
     store: Option<Entity<VcsStore>>,
     editor: Entity<SplittableEditor>,
     multibuffer: Entity<MultiBuffer>,
@@ -160,6 +223,7 @@ pub(crate) struct VcsProjectDiff {
     pending_path: Option<String>,
     generation: u64,
     loading: bool,
+    refresh_pending: bool,
     preparing_discard: bool,
     metadata_count: usize,
     error: Option<SharedString>,
@@ -175,16 +239,50 @@ impl VcsProjectDiff {
 
     fn new(
         repository: VcsRepositoryId,
+        baseline: String,
         store: Option<Entity<VcsStore>>,
         project: Entity<Project>,
         workspace: Entity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let comparison = store
+            .as_ref()
+            .and_then(|store| {
+                store
+                    .read(cx)
+                    .repositories()
+                    .into_iter()
+                    .find(|entry| entry.key == repository)
+            })
+            .and_then(|repository| {
+                repository
+                    .descriptor
+                    .baselines
+                    .into_iter()
+                    .find(|entry| entry.id == baseline)
+            });
+        let current_content = comparison
+            .as_ref()
+            .map(|comparison| comparison.current_content)
+            .unwrap_or(ContentSource::Working);
+        let title: SharedString = comparison
+            .as_ref()
+            .map(|comparison| match comparison.purpose {
+                Some(ComparisonPurpose::Staged) => "Staged Changes".into(),
+                Some(ComparisonPurpose::Unstaged) => "Unstaged Changes".into(),
+                _ => comparison.label.clone().into(),
+            })
+            .unwrap_or_else(|| "Uncommitted Changes".into());
+        let workspace_handle = workspace.downgrade();
         let multibuffer = cx.new(|cx| {
-            let mut buffer = MultiBuffer::new(Capability::ReadWrite);
+            let mut buffer = MultiBuffer::new(if current_content == ContentSource::Snapshot {
+                Capability::ReadOnly
+            } else {
+                Capability::ReadWrite
+            });
             buffer.set_all_diff_hunks_expanded(cx);
-            buffer.set_title("Uncommitted Changes".into(), cx);
+            buffer.set_title(title.to_string(), cx);
             buffer
         });
         let diff_view = cx.entity().downgrade();
@@ -215,12 +313,48 @@ impl VcsProjectDiff {
             },
         )];
         if let Some(store) = &store {
-            subscriptions.push(cx.subscribe_in(store, window, |this, _, _, window, cx| {
-                this.refresh(window, cx);
-            }));
+            subscriptions.push(
+                cx.subscribe_in(
+                    store,
+                    window,
+                    |this, store, event, window, cx| match event {
+                        VcsStoreEvent::DiffChanged { worktree_id }
+                            if *worktree_id == this.repository.worktree_id =>
+                        {
+                            this.refresh(window, cx)
+                        }
+                        VcsStoreEvent::Updated => {
+                            let repository = store
+                                .read(cx)
+                                .repositories()
+                                .into_iter()
+                                .find(|repository| repository.key == this.repository);
+                            if let Some(repository) = repository {
+                                let retry =
+                                    this.error.is_some() && !this.loading && !repository.loading;
+                                this.repository_error = repository.error;
+                                if retry {
+                                    this.refresh(window, cx);
+                                }
+                            } else {
+                                this.cancel_refresh();
+                                this.repository_error = Some(
+                                    "Source-control repository is no longer available.".into(),
+                                );
+                            }
+                            cx.notify();
+                        }
+                        _ => {}
+                    },
+                ),
+            );
         }
         let mut this = Self {
             repository,
+            baseline,
+            title,
+            current_content,
+            workspace: workspace_handle,
             store,
             editor,
             multibuffer,
@@ -229,6 +363,7 @@ impl VcsProjectDiff {
             pending_path: None,
             generation: 0,
             loading: false,
+            refresh_pending: false,
             preparing_discard: false,
             metadata_count: 0,
             error: None,
@@ -267,7 +402,80 @@ impl VcsProjectDiff {
         if self.preparing_discard {
             return Some("Another discard operation is being prepared.".into());
         }
-        discard_unavailable_reason(self.store.as_ref(), &self.repository, path, cx)
+        discard_unavailable_reason(
+            self.store.as_ref(),
+            &self.repository,
+            path,
+            Some(&self.baseline),
+            cx,
+        )
+    }
+
+    fn discard_label(&self) -> &'static str {
+        if self.current_content == ContentSource::Snapshot {
+            "Discard Unstaged Changes"
+        } else {
+            "Discard Changes"
+        }
+    }
+
+    fn target_for_path(&self, path: &str) -> Option<FileTarget> {
+        let change = self
+            .snapshot
+            .as_ref()?
+            .2
+            .iter()
+            .find(|change| change.path == path)?
+            .clone();
+        Some(FileTarget {
+            repository: self.repository.clone(),
+            baseline: self.baseline.clone(),
+            change,
+        })
+    }
+
+    fn dispatch_file_action(
+        &mut self,
+        target: FileTarget,
+        action: FileAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(action, FileAction::Discard) {
+            self.discard_path(target.change.path, window, cx);
+            return;
+        }
+        let workspace = self.workspace.clone();
+        // Navigation may activate this same diff, so release both the item and workspace leases.
+        window.defer(cx, move |window, cx| {
+            let panel = workspace
+                .upgrade()
+                .and_then(|workspace| workspace.read(cx).panel::<GitPanel>(cx))
+                .map(|panel| panel.read(cx).vcs_panel());
+            if let Some(panel) = panel {
+                panel.update(cx, |panel, cx| {
+                    panel.dispatch_file_action(target, action, window, cx)
+                });
+            }
+        });
+    }
+
+    fn selected_action(&mut self, action: FileAction, window: &mut Window, cx: &mut Context<Self>) {
+        if !self
+            .editor
+            .read(cx)
+            .focused_editor()
+            .focus_handle(cx)
+            .is_focused(window)
+        {
+            return;
+        }
+        if let Some(target) = self
+            .selected_path(cx)
+            .and_then(|path| self.target_for_path(&path))
+        {
+            self.dispatch_file_action(target, action, window, cx);
+        }
     }
 
     fn discard_selected_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -297,7 +505,14 @@ impl VcsProjectDiff {
         };
         self.error = None;
         self.preparing_discard = true;
-        let operation = discard_file_changes(store, self.repository.clone(), path, window, cx);
+        let operation = discard_file_changes(
+            store,
+            self.repository.clone(),
+            path,
+            Some(self.baseline.clone()),
+            window,
+            cx,
+        );
         cx.spawn(async move |this, cx| {
             let result = operation.await;
             this.update(cx, |this, cx| {
@@ -314,6 +529,10 @@ impl VcsProjectDiff {
     }
 
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.loading {
+            self.refresh_pending = true;
+            return;
+        }
         let Some(store) = self.store.clone() else {
             return;
         };
@@ -329,40 +548,76 @@ impl VcsProjectDiff {
             cx.notify();
             return;
         };
-        self.repository_error = repository.error.clone();
-        let Some(snapshot) = repository.snapshot else {
-            self.cancel_refresh();
-            self.loading = repository.loading;
-            cx.notify();
-            return;
-        };
-        let mut changes = store.read(cx).changes(&self.repository, cx);
-        changes.sort_by(|left, right| left.path.cmp(&right.path));
-        let fingerprint = (
-            snapshot.baseline_id.clone(),
-            snapshot.revision_id.clone(),
-            changes,
-        );
-        let Some(changes) = self.prepare_refresh(fingerprint, cx) else {
-            cx.notify();
-            return;
-        };
-        if changes.is_empty() {
-            cx.notify();
-            return;
-        }
-        let generation = self.generation;
+        self.repository_error = repository.error;
+        self.refresh_pending = false;
+        self.loading = true;
         let repository = self.repository.clone();
+        let baseline = self.baseline.clone();
+        let snapshot = store.read(cx).comparison_snapshot(&repository, &baseline);
+        let load = if let Some(snapshot) = snapshot {
+            Task::ready(Ok(snapshot))
+        } else {
+            store.update(cx, |store, cx| {
+                store.load_comparison(repository.clone(), baseline.clone(), cx)
+            })
+        };
         self.task = Some(cx.spawn_in(window, async move |this, cx| {
+            let snapshot = match load.await {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    this.update_in(cx, |this, window, cx| {
+                        this.loading = false;
+                        this.error = Some(format!("{error:#}").into());
+                        this.finish_pending_refresh(window, cx);
+                        cx.notify();
+                    })
+                    .log_err();
+                    return;
+                }
+            };
+            let changes = store.read_with(cx, |store, cx| {
+                store.changes_for_baseline(&repository, &baseline, cx)
+            });
+            let fingerprint = (
+                snapshot.baseline_id.clone(),
+                format!(
+                    "{}:{}",
+                    snapshot.revision_id,
+                    snapshot.current_revision_id.as_deref().unwrap_or_default()
+                ),
+                changes,
+            );
+            let Some((generation, changes)) = this
+                .update(cx, |this, cx| {
+                    this.loading = false;
+                    this.prepare_refresh(fingerprint, cx)
+                        .map(|changes| (this.generation, changes))
+                })
+                .ok()
+                .flatten()
+            else {
+                this.update_in(cx, |this, window, cx| {
+                    this.finish_pending_refresh(window, cx);
+                    cx.notify();
+                })
+                .log_err();
+                return;
+            };
             let async_cx = cx.clone();
             let loads = changes.into_iter().map(move |change| {
                 let store = store.clone();
                 let repository = repository.clone();
+                let baseline = baseline.clone();
                 let mut cx = async_cx.clone();
                 async move {
                     let result = store
                         .update(&mut cx, |store, cx| {
-                            store.open_diff(repository, change.path.clone(), cx)
+                            store.open_diff_for_baseline(
+                                repository,
+                                change.path.clone(),
+                                baseline,
+                                cx,
+                            )
                         })
                         .await;
                     (change, result)
@@ -373,20 +628,31 @@ impl VcsProjectDiff {
                 futures_lite::future::yield_now().await;
                 if this
                     .update_in(cx, |this, window, cx| {
-                        this.apply_loaded(generation, change, result, window, cx);
+                        this.apply_loaded(generation, change, result, window, cx)
                     })
                     .is_err()
                 {
                     return;
                 }
             }
-            this.update(cx, |this, cx| this.finish_refresh(generation, cx))
-                .log_err();
+            this.update_in(cx, |this, window, cx| {
+                this.finish_refresh(generation, cx);
+                this.finish_pending_refresh(window, cx);
+            })
+            .log_err();
         }));
         cx.notify();
     }
 
+    fn finish_pending_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.refresh_pending && !self.loading {
+            self.refresh_pending = false;
+            self.refresh(window, cx);
+        }
+    }
+
     fn cancel_refresh(&mut self) {
+        self.refresh_pending = false;
         self.task = None;
         self.snapshot = None;
         self.generation += 1;
@@ -398,6 +664,10 @@ impl VcsProjectDiff {
         fingerprint: (String, String, Vec<Change>),
         cx: &mut Context<Self>,
     ) -> Option<Vec<Change>> {
+        let comparison_changed = self
+            .snapshot
+            .as_ref()
+            .is_some_and(|previous| previous.0 != fingerprint.0 || previous.1 != fingerprint.1);
         let changes = fingerprint
             .2
             .iter()
@@ -408,9 +678,10 @@ impl VcsProjectDiff {
         let changes = changes
             .into_iter()
             .filter(|change| {
-                self.loaded.get(&change.path).is_none_or(|loaded| {
-                    loaded.status != change.status && !loaded.opened.buffer.read(cx).is_dirty()
-                })
+                comparison_changed
+                    || self.loaded.get(&change.path).is_none_or(|loaded| {
+                        loaded.status != change.status && !loaded.opened.buffer.read(cx).is_dirty()
+                    })
             })
             .collect::<Vec<_>>();
         if self.snapshot.as_ref() == Some(&fingerprint) && (self.loading || changes.is_empty()) {
@@ -423,7 +694,6 @@ impl VcsProjectDiff {
             .count();
         self.snapshot = Some(fingerprint);
         self.error = None;
-        self.task = None;
         self.generation += 1;
         self.loading = !changes.is_empty();
         Some(changes)
@@ -600,21 +870,77 @@ impl editor::Addon for VcsDiffAddon {
     ) -> Option<AnyElement> {
         let view = self.view.upgrade()?;
         let path = view.read(cx).path_for_buffer(buffer.remote_id(), cx)?;
+        let target = view.read(cx).target_for_path(&path)?;
+        let store = view.read(cx).store.as_ref()?;
+        let repository = store
+            .read(cx)
+            .repositories()
+            .into_iter()
+            .find(|repository| repository.key == target.repository)?;
+        let staged_paths = repository
+            .repository_state
+            .as_ref()
+            .map(|state| state.staged_paths.as_slice())
+            .unwrap_or_default();
+        let state = staging_state(&target.change, staged_paths);
+        let operation = if state == ToggleState::Selected {
+            FileOperation::Unstage
+        } else {
+            FileOperation::Stage
+        };
+        let disabled = store.read(cx).file_operation_running()
+            || !store
+                .read(cx)
+                .file_operations_for_baseline(&target.repository, &path, &target.baseline)
+                .contains(&operation);
         let reason = view.read(cx).discard_reason(&path, cx);
+        let discard_label = view.read(cx).discard_label();
         let weak_view = self.view.clone();
+        let checkbox_view = self.view.clone();
         Some(
-            Button::new("vcs-discard-file", "Discard Changes")
-                .label_size(LabelSize::Small)
-                .disabled(reason.is_some())
-                .tooltip(Tooltip::text(reason.unwrap_or_else(|| {
-                    "Discard unstaged changes to this file".into()
-                })))
-                .on_click(move |_, window, cx| {
-                    cx.stop_propagation();
-                    weak_view
-                        .update(cx, |view, cx| view.discard_path(path.clone(), window, cx))
-                        .log_err();
-                })
+            h_flex()
+                .gap_1()
+                .child(
+                    Checkbox::new("vcs-stage-file", state)
+                        .disabled(disabled)
+                        .fill()
+                        .tooltip(Tooltip::text(if operation == FileOperation::Unstage {
+                            "Unstage File"
+                        } else {
+                            "Stage File"
+                        }))
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            checkbox_view
+                                .update(cx, |view, cx| {
+                                    view.dispatch_file_action(
+                                        target.clone(),
+                                        if operation == FileOperation::Unstage {
+                                            FileAction::Unstage
+                                        } else {
+                                            FileAction::Stage
+                                        },
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .log_err();
+                        }),
+                )
+                .child(
+                    Button::new("vcs-discard-file", discard_label)
+                        .label_size(LabelSize::Small)
+                        .disabled(reason.is_some())
+                        .tooltip(Tooltip::text(reason.unwrap_or_else(|| {
+                            "Discard unstaged changes to this file".into()
+                        })))
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            weak_view
+                                .update(cx, |view, cx| view.discard_path(path.clone(), window, cx))
+                                .log_err();
+                        }),
+                )
                 .into_any_element(),
         )
     }
@@ -632,13 +958,28 @@ impl editor::Addon for VcsDiffAddon {
         let Some(path) = view.read(cx).path_for_buffer(buffer.remote_id(), cx) else {
             return menu;
         };
-        let reason = view.read(cx).discard_reason(&path, cx);
+        let Some(target) = view.read(cx).target_for_path(&path) else {
+            return menu;
+        };
         let weak_view = self.view.clone();
-        discard_context_menu(menu.separator(), reason, move |window, cx| {
-            weak_view
-                .update(cx, |view, cx| view.discard_path(path.clone(), window, cx))
-                .log_err();
-        })
+        let state = view.read(cx);
+        file_context_menu(
+            menu.separator(),
+            &target,
+            state.store.as_ref(),
+            state.preparing_discard,
+            cx,
+            {
+                let target = target.clone();
+                move |action, window, cx| {
+                    weak_view
+                        .update(cx, |view, cx| {
+                            view.dispatch_file_action(target.clone(), action, window, cx)
+                        })
+                        .log_err();
+                }
+            },
+        )
     }
 }
 
@@ -671,6 +1012,50 @@ impl Render for VcsProjectDiff {
                 cx.stop_propagation();
                 this.discard_selected_file(window, cx);
             }))
+            .capture_action(cx.listener(
+                |this, _: &zed_actions::workspace::CopyPath, window, cx| {
+                    cx.stop_propagation();
+                    this.selected_action(FileAction::CopyPath, window, cx);
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &zed_actions::workspace::CopyRelativePath, window, cx| {
+                    cx.stop_propagation();
+                    this.selected_action(FileAction::CopyRelativePath, window, cx);
+                },
+            ))
+            .capture_action(cx.listener(|this, _: &git::StageFile, window, cx| {
+                cx.stop_propagation();
+                this.selected_action(FileAction::Stage, window, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &git::UnstageFile, window, cx| {
+                cx.stop_propagation();
+                this.selected_action(FileAction::Unstage, window, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &git::FileHistory, window, cx| {
+                cx.stop_propagation();
+                this.selected_action(FileAction::History, window, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &git::AddToGitignore, window, cx| {
+                cx.stop_propagation();
+                this.selected_action(FileAction::Ignore, window, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &git::ViewFile, window, cx| {
+                cx.stop_propagation();
+                this.selected_action(FileAction::ViewFile, window, cx);
+            }))
+            .capture_action(cx.listener(
+                |this, _: &crate::git_panel::ViewStagedChanges, window, cx| {
+                    cx.stop_propagation();
+                    this.selected_action(FileAction::StagedChanges, window, cx);
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &crate::git_panel::ViewUnstagedChanges, window, cx| {
+                    cx.stop_propagation();
+                    this.selected_action(FileAction::UnstagedChanges, window, cx);
+                },
+            ))
             .when_some(self.repository_error.clone(), |element, error| {
                 element.child(Label::new(error).color(Color::Error))
             })
@@ -694,7 +1079,7 @@ impl Item for VcsProjectDiff {
     type Event = EditorEvent;
 
     fn tab_content_text(&self, _: usize, _: &App) -> SharedString {
-        "Uncommitted Changes".into()
+        self.title.clone()
     }
 
     fn to_item_events(event: &EditorEvent, emit: &mut dyn FnMut(ItemEvent)) {
@@ -702,7 +1087,7 @@ impl Item for VcsProjectDiff {
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
-        self.editor.read(cx).is_dirty(cx)
+        self.current_content == ContentSource::Working && self.editor.read(cx).is_dirty(cx)
     }
 
     fn has_conflict(&self, cx: &App) -> bool {
@@ -714,7 +1099,7 @@ impl Item for VcsProjectDiff {
     }
 
     fn can_save(&self, cx: &App) -> bool {
-        self.editor.read(cx).can_save(cx)
+        self.current_content == ContentSource::Working && self.editor.read(cx).can_save(cx)
     }
 
     fn save(
@@ -809,6 +1194,7 @@ impl Item for VcsProjectDiff {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vcs_panel::discard_context_menu;
     use buffer_diff::{BufferDiff, DiffOperations};
     use gpui::{TestAppContext, VisualTestContext};
     use language::Buffer;
@@ -860,6 +1246,8 @@ mod tests {
             new_mode: None,
             file_operations: None,
             unavailable_reason: None,
+            staged_status: None,
+            unstaged_status: None,
         }
     }
 
@@ -875,7 +1263,117 @@ mod tests {
             diff.set_base_text(Some(base.into()), snapshot, cx)
         })
         .await;
-        VcsDiff { buffer, diff }
+        VcsDiff {
+            buffer,
+            diff,
+            current_content: ContentSource::Working,
+        }
+    }
+
+    #[gpui::test]
+    async fn aggregate_navigation_releases_workspace_and_item(cx: &mut TestAppContext) {
+        use project::vcs_store::VcsRepositorySnapshot;
+        use vcs::{Baseline, RepositoryDescriptor};
+
+        init(cx);
+        let fs = FakeFs::new(cx.executor());
+        let root = std::path::Path::new(util::path!("/project"));
+        fs.insert_tree(root, serde_json::json!({"file.txt": "working file\n"}))
+            .await;
+        let project = Project::test(fs, [root], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let repository = project.read_with(cx, |project, cx| {
+            repository(project.worktrees(cx).next().unwrap().read(cx).id())
+        });
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = GitPanel::new_test(workspace, window, cx);
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        panel
+            .read_with(cx, |panel, _| panel.vcs_panel())
+            .update(cx, |panel, _| {
+                panel.set_test_repository(VcsRepositorySnapshot {
+                    key: repository.clone(),
+                    descriptor: RepositoryDescriptor {
+                        id: repository.repository_id.clone(),
+                        root_uri: "file:///project".into(),
+                        scope_uri: "file:///project".into(),
+                        display_name: "Fixture".into(),
+                        ignore_config_path: None,
+                        baselines: vec![
+                            Baseline {
+                                id: "staged".into(),
+                                label: "Staged Changes".into(),
+                                purpose: Some(ComparisonPurpose::Staged),
+                                current_content: ContentSource::Snapshot,
+                            },
+                            Baseline {
+                                id: "unstaged".into(),
+                                label: "Unstaged Changes".into(),
+                                purpose: Some(ComparisonPurpose::Unstaged),
+                                current_content: ContentSource::Working,
+                            },
+                        ],
+                    },
+                    selected_baseline: "staged".into(),
+                    snapshot: None,
+                    loading: false,
+                    show_loading: false,
+                    error: None,
+                    repository_state: None,
+                    repository_state_error: None,
+                    checkouts: None,
+                    checkout_error: None,
+                    checkout_loading: false,
+                });
+            });
+        let item = workspace.update_in(cx, |workspace, window, cx| {
+            open_item_for_baseline(
+                workspace,
+                repository.clone(),
+                "staged".into(),
+                None,
+                true,
+                window,
+                cx,
+            )
+        });
+        item.update(cx, |item, _| {
+            item.current_content = ContentSource::Snapshot;
+            assert_eq!(item.discard_label(), "Discard Unstaged Changes");
+        });
+        for action in [
+            FileAction::StagedChanges,
+            FileAction::UnstagedChanges,
+            FileAction::OpenDiff,
+            FileAction::History,
+            FileAction::ViewFile,
+        ] {
+            item.update_in(cx, |item, window, cx| {
+                item.dispatch_file_action(
+                    FileTarget {
+                        repository: repository.clone(),
+                        baseline: "staged".into(),
+                        change: change("file.txt"),
+                    },
+                    action,
+                    window,
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+        }
+        workspace.read_with(cx, |workspace, cx| {
+            let editor = workspace
+                .active_item(cx)
+                .and_then(|item| item.act_as::<Editor>(cx))
+                .expect("View File opens the actual working file");
+            assert_eq!(editor.read(cx).text(cx), "working file\n");
+        });
     }
 
     #[gpui::test]
@@ -1060,7 +1558,7 @@ mod tests {
             assert!(item.is_dirty(cx));
         });
         let reopened = workspace.update_in(cx, |workspace, window, cx| {
-            open_item(workspace, key, None, true, window, cx)
+            open_item(workspace, key.clone(), None, true, window, cx)
         });
         assert_eq!(item, reopened);
         workspace.update_in(cx, |workspace, window, cx| {
@@ -1079,6 +1577,28 @@ mod tests {
             assert!(active.to_searchable_item_handle(cx).is_some());
         });
         assert_eq!(fs.load(&root.join("a.txt")).await.unwrap(), "working a\n");
+        let pinned = workspace.update_in(cx, |workspace, window, cx| {
+            open_item_for_baseline(
+                workspace,
+                key.clone(),
+                "staged".into(),
+                None,
+                true,
+                window,
+                cx,
+            )
+        });
+        assert_ne!(
+            item, pinned,
+            "different comparisons must use independent tabs"
+        );
+        let same = workspace.update_in(cx, |workspace, window, cx| {
+            open_item_for_baseline(workspace, key, "staged".into(), None, true, window, cx)
+        });
+        assert_eq!(
+            pinned, same,
+            "reopening the same pinned comparison reuses its tab"
+        );
     }
 
     #[gpui::test]
@@ -1247,6 +1767,7 @@ mod tests {
                 Ok(VcsDiff {
                     buffer: opened_c.buffer.clone(),
                     diff: opened_c.diff.clone(),
+                    current_content: opened_c.current_content,
                 }),
                 window,
                 cx,
@@ -1258,6 +1779,17 @@ mod tests {
             assert_eq!(item.loaded.len(), 3);
             assert_eq!(item.loaded["a.txt"].opened.buffer, buffer_a);
             assert_eq!(buffer_a.read(cx).text(), "unsaved a\n");
+            assert!(!item.loading);
+            item.loading = true;
+            item.refresh(window, cx);
+            item.refresh(window, cx);
+            assert!(
+                item.refresh_pending,
+                "changes arriving during a load need one follow-up refresh"
+            );
+            item.finish_refresh(item.generation, cx);
+            item.finish_pending_refresh(window, cx);
+            assert!(!item.refresh_pending);
             assert!(!item.loading);
         });
     }

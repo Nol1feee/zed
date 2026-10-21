@@ -9,7 +9,7 @@ use extension::{Extension, ExtensionHostProxy, ExtensionVcsProviderProxy, Worktr
 use fs::Fs;
 use gpui::{
     App, AppContext, Context, Entity, EventEmitter, Global, ReadGlobal, SharedString, Subscription,
-    Task, WeakEntity,
+    Task, TaskExt as _, WeakEntity,
 };
 use language::{Buffer, BufferEvent};
 use serde::{Deserialize, Serialize};
@@ -139,6 +139,13 @@ pub enum VcsStoreEvent {
 pub struct VcsDiff {
     pub buffer: Entity<Buffer>,
     pub diff: Entity<BufferDiff>,
+    pub current_content: vcs::ContentSource,
+}
+
+struct ComparisonDiff {
+    buffer: WeakEntity<Buffer>,
+    diff: WeakEntity<BufferDiff>,
+    _subscription: Subscription,
 }
 
 struct Repository {
@@ -151,6 +158,9 @@ struct Repository {
     blames: HashMap<String, Arc<vcs::Blame>>,
     checkout_generation: u64,
     checkout_task: Option<Task<()>>,
+    comparisons: HashMap<String, Arc<Snapshot>>,
+    comparison_generations: HashMap<String, u64>,
+    comparison_diffs: HashMap<(String, String), ComparisonDiff>,
 }
 
 struct Session {
@@ -327,6 +337,7 @@ impl FileOperationScope {
 
 pub struct VcsPreparedFileOperation {
     key: VcsRepositoryId,
+    baseline: String,
     scope: FileOperationScope,
     path: String,
     operation: FileOperation,
@@ -898,6 +909,9 @@ impl VcsStore {
                     blames: HashMap::default(),
                     checkout_generation: 0,
                     checkout_task: None,
+                    comparisons: HashMap::default(),
+                    comparison_generations: HashMap::default(),
+                    comparison_diffs: HashMap::default(),
                 },
             );
             self.refresh(&id, cx);
@@ -1111,6 +1125,12 @@ impl VcsStore {
         repository.generation += 1;
         let generation = repository.generation;
         let baseline = repository.view.selected_baseline.clone();
+        let comparison_generation = repository
+            .comparison_generations
+            .entry(baseline.clone())
+            .or_default();
+        *comparison_generation += 1;
+        let comparison_generation = *comparison_generation;
         let connection = repository.connection.clone();
         let key = key.clone();
         repository.view.show_loading = (repository.view.loading && repository.view.show_loading)
@@ -1165,6 +1185,7 @@ impl VcsStore {
                 };
                 if repository.generation != generation
                     || repository.view.selected_baseline != baseline
+                    || !Arc::ptr_eq(&repository.connection, &connection)
                 {
                     return;
                 }
@@ -1182,8 +1203,26 @@ impl VcsStore {
                         }
                     }
                 }
+                if repository.comparison_generations.get(&baseline) != Some(&comparison_generation)
+                {
+                    this.notify(cx);
+                    return;
+                }
                 let diff_changed = match result.and_then(|snapshot| {
                     snapshot.validate(&key.repository_id, &baseline)?;
+                    let source = repository
+                        .view
+                        .descriptor
+                        .baselines
+                        .iter()
+                        .find(|candidate| candidate.id == baseline)
+                        .context("Unknown VCS comparison")?
+                        .current_content;
+                    ensure!(
+                        source != vcs::ContentSource::Snapshot
+                            || snapshot.current_revision_id.is_some(),
+                        "Snapshot comparison omitted its current content identity"
+                    );
                     Ok(snapshot)
                 }) {
                     Ok(snapshot) => {
@@ -1192,10 +1231,15 @@ impl VcsStore {
                             || repository.view.snapshot.as_ref().is_none_or(|previous| {
                                 previous.baseline_id != snapshot.baseline_id
                                     || previous.revision_id != snapshot.revision_id
+                                    || previous.current_revision_id != snapshot.current_revision_id
                                     || previous.changes != snapshot.changes
                             });
                         let head = snapshot.head_revision_id.clone();
-                        repository.view.snapshot = Some(Arc::new(snapshot));
+                        let snapshot = Arc::new(snapshot);
+                        repository
+                            .comparisons
+                            .insert(baseline.clone(), snapshot.clone());
+                        repository.view.snapshot = Some(snapshot);
                         repository.view.error = None;
                         this.set_blame_head(&key, head, cx);
                         if changed {
@@ -1234,9 +1278,22 @@ impl VcsStore {
                 };
                 this.notify(cx);
                 if diff_changed {
+                    this.refresh_open_comparison_diffs(&key, &baseline, cx);
                     cx.emit(VcsStoreEvent::DiffChanged {
                         worktree_id: key.worktree_id,
                     });
+                }
+                let other_baselines: Vec<_> = this
+                    .repositories
+                    .get(&key)
+                    .into_iter()
+                    .flat_map(|repository| repository.comparisons.keys())
+                    .filter(|candidate| **candidate != baseline)
+                    .cloned()
+                    .collect();
+                for baseline in other_baselines {
+                    this.load_comparison(key.clone(), baseline, cx)
+                        .detach_and_log_err(cx);
                 }
             })
             .log_err();
@@ -1489,13 +1546,22 @@ impl VcsStore {
         Some(scope)
     }
 
-    fn file_change(&self, key: &VcsRepositoryId, path: &str) -> Result<&vcs::Change> {
-        self.repositories
+    fn file_change(
+        &self,
+        key: &VcsRepositoryId,
+        path: &str,
+        baseline: &str,
+    ) -> Result<&vcs::Change> {
+        let repository = self
+            .repositories
             .get(key)
-            .context("VCS repository closed")?
-            .view
-            .snapshot
-            .as_ref()
+            .context("VCS repository closed")?;
+        let snapshot = if repository.view.selected_baseline == baseline {
+            repository.view.snapshot.as_ref()
+        } else {
+            repository.comparisons.get(baseline)
+        };
+        snapshot
             .context("Refresh changes before modifying a file")?
             .changes
             .iter()
@@ -1508,14 +1574,26 @@ impl VcsStore {
         key: &VcsRepositoryId,
         path: &str,
     ) -> Vec<FileOperation> {
-        let Ok(change) = self.file_change(key, path) else {
+        let Some(repository) = self.repositories.get(key) else {
+            return Vec::new();
+        };
+        self.file_operations_for_baseline(key, path, &repository.view.selected_baseline)
+    }
+
+    pub fn file_operations_for_baseline(
+        &self,
+        key: &VcsRepositoryId,
+        path: &str,
+        baseline: &str,
+    ) -> Vec<FileOperation> {
+        let Ok(change) = self.file_change(key, path, baseline) else {
             return Vec::new();
         };
         if change.kind == vcs::ContentKind::Submodule {
             return Vec::new();
         }
         let provider = self.file_operations(key);
-        match &change.file_operations {
+        let operations = match &change.file_operations {
             Some(operations) => operations
                 .iter()
                 .copied()
@@ -1523,7 +1601,21 @@ impl VcsStore {
                 .collect(),
             None if legacy_file_change(change) => provider,
             None => Vec::new(),
-        }
+        };
+        operations
+            .into_iter()
+            .filter(|operation| {
+                *operation != FileOperation::Ignore
+                    || (change.status == ChangeStatus::Untracked
+                        && self
+                            .repositories
+                            .get(key)
+                            .and_then(|repository| {
+                                repository.view.descriptor.ignore_config_path.as_ref()
+                            })
+                            .is_some_and(|config| config != path))
+            })
+            .collect()
     }
 
     fn check_file_buffers(
@@ -1556,13 +1648,34 @@ impl VcsStore {
         operation: FileOperation,
         affected_paths: &[String],
         summary: Option<&str>,
+        baseline: &str,
     ) -> Result<()> {
         vcs::validate_paths(affected_paths)?;
         ensure!(
             affected_paths.iter().any(|affected| affected == path),
             "Prepared operation omitted the selected file"
         );
-        let change = self.file_change(key, path)?;
+        let change = self.file_change(key, path, baseline)?;
+        if operation == FileOperation::Ignore {
+            let config = self
+                .repositories
+                .get(key)
+                .and_then(|repository| repository.view.descriptor.ignore_config_path.as_ref())
+                .context("Provider has not declared an ignore configuration file")?;
+            ensure!(
+                change.status == ChangeStatus::Untracked && config != path,
+                "Only untracked files can be ignored"
+            );
+            ensure!(
+                affected_paths.len() == 2 && affected_paths.contains(config),
+                "Ignore must affect only the selected file and the declared ignore configuration"
+            );
+            ensure!(
+                summary.is_some_and(|summary| !summary.trim().is_empty()),
+                "Ignore requires an explicit summary"
+            );
+            return Ok(());
+        }
         ensure!(
             affected_paths
                 .iter()
@@ -1589,6 +1702,7 @@ impl VcsStore {
         key: &VcsRepositoryId,
         path: &str,
         operation: FileOperation,
+        baseline: &str,
         cx: &mut Context<Self>,
     ) -> Result<(Arc<ProviderConnection>, Arc<Path>)> {
         vcs::validate_path(path)?;
@@ -1598,7 +1712,7 @@ impl VcsStore {
         );
         ensure!(self.project.upgrade().is_some(), "VCS project closed");
         ensure!(
-            self.file_operations_for_path(key, path)
+            self.file_operations_for_baseline(key, path, baseline)
                 .contains(&operation),
             "File operation is unavailable for the selected change"
         );
@@ -1610,12 +1724,22 @@ impl VcsStore {
             repository.connection.is_alive(),
             "VCS provider is no longer running"
         );
-        let change = self.file_change(key, path)?;
+        let change = self.file_change(key, path, baseline)?;
         let mut paths = vec![path.to_owned()];
         if let Some(old_path) = &change.old_path {
             if old_path != path {
                 paths.push(old_path.clone());
             }
+        }
+        if operation == FileOperation::Ignore {
+            paths.push(
+                repository
+                    .view
+                    .descriptor
+                    .ignore_config_path
+                    .clone()
+                    .context("Provider has not declared an ignore configuration file")?,
+            );
         }
         for path in &paths {
             ensure!(
@@ -1652,19 +1776,42 @@ impl VcsStore {
         operation: FileOperation,
         cx: &mut Context<Self>,
     ) -> Task<Result<VcsPreparedFileOperation>> {
+        let Some(repository) = self.repositories.get(&key) else {
+            return Task::ready(Err(anyhow!("VCS repository closed")));
+        };
+        let baseline = repository.view.selected_baseline.clone();
+        self.prepare_file_operation_for_baseline(key, path, operation, baseline, cx)
+    }
+
+    pub fn prepare_file_operation_for_baseline(
+        &mut self,
+        key: VcsRepositoryId,
+        path: String,
+        operation: FileOperation,
+        baseline: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<VcsPreparedFileOperation>> {
         let result = (|| {
             ensure!(
                 !self.file_operation_running,
                 "Another VCS file operation is running"
             );
-            let (connection, root) = self.check_file_operation(&key, &path, operation, cx)?;
+            let (connection, root) =
+                self.check_file_operation(&key, &path, operation, &baseline, cx)?;
             let scope = self
                 .file_operation_scope(&key)
                 .context("VCS repository closed")?;
-            let change = self.file_change(&key, &path)?.clone();
-            Ok((connection, root, scope, change))
+            let change = self.file_change(&key, &path, &baseline)?.clone();
+            let ignore_config = if operation == FileOperation::Ignore {
+                self.repositories
+                    .get(&key)
+                    .and_then(|repository| repository.view.descriptor.ignore_config_path.clone())
+            } else {
+                None
+            };
+            Ok((connection, root, scope, change, ignore_config))
         })();
-        let (connection, root, scope, change) = match result {
+        let (connection, root, scope, change, ignore_config) = match result {
             Ok(result) => result,
             Err(error) => return Task::ready(Err(error)),
         };
@@ -1677,6 +1824,9 @@ impl VcsStore {
                 "The previous operation has an unknown outcome; refresh to reconcile it"
             );
             validate_file_metadata(&root, &change, &fs).await?;
+            if let Some(config) = &ignore_config {
+                validate_ignore_config(&root, config, &fs).await?;
+            }
             let prepared = connection
                 .prepare_file_operation(key.repository_id.clone(), path.clone(), operation)
                 .await?;
@@ -1684,7 +1834,8 @@ impl VcsStore {
                 .affected_paths
                 .unwrap_or_else(|| vec![path.clone()]);
             this.update(cx, |this, cx| {
-                let (current, _) = this.check_file_operation(&key, &path, operation, cx)?;
+                let (current, _) =
+                    this.check_file_operation(&key, &path, operation, &baseline, cx)?;
                 ensure!(
                     Arc::ptr_eq(&current, &connection),
                     "VCS provider changed while preparing the operation"
@@ -1695,10 +1846,13 @@ impl VcsStore {
                     operation,
                     &affected_paths,
                     prepared.summary.as_deref(),
-                )
+                    &baseline,
+                )?;
+                this.check_file_buffers(&scope, &affected_paths, cx)
             })??;
             Ok(VcsPreparedFileOperation {
                 key,
+                baseline,
                 scope,
                 path,
                 operation,
@@ -1753,6 +1907,11 @@ impl VcsStore {
                 let _claim = journal.record(prepared.scope.clone(), pending.clone()).await?;
                 let checked: Result<()> = async {
                     validate_file_metadata(&vcs::local_path(&prepared.scope.scope_uri)?, &prepared.change, &fs).await?;
+                    if prepared.operation == FileOperation::Ignore {
+                        for path in &prepared.affected_paths {
+                            if path != &prepared.path { validate_ignore_config(&vcs::local_path(&prepared.scope.scope_uri)?, path, &fs).await?; }
+                        }
+                    }
                     this.update(cx, |this, cx| {
                         this.pending_file_operations.insert(prepared.scope.clone(), pending.clone());
                         this.check_prepared_file_operation(&prepared, cx)
@@ -1777,7 +1936,7 @@ impl VcsStore {
                 journal.clear(&prepared.scope, &prepared.token).await.context(
                     "File operation completed, but its recovery record could not be cleared; refresh to reconcile",
                 )?;
-                if outcome == FileOperationOutcome::Applied && prepared.operation == FileOperation::Discard {
+                if outcome == FileOperationOutcome::Applied && matches!(prepared.operation, FileOperation::Discard | FileOperation::Ignore) {
                     this.update(cx, |this, cx| {
                         this.check_discarded_buffers(&prepared.scope, &prepared.affected_paths, cx)
                     })??;
@@ -1817,8 +1976,13 @@ impl VcsStore {
         prepared: &VcsPreparedFileOperation,
         cx: &mut Context<Self>,
     ) -> Result<()> {
-        let (connection, _) =
-            self.check_file_operation(&prepared.key, &prepared.path, prepared.operation, cx)?;
+        let (connection, _) = self.check_file_operation(
+            &prepared.key,
+            &prepared.path,
+            prepared.operation,
+            &prepared.baseline,
+            cx,
+        )?;
         ensure!(
             Arc::ptr_eq(&connection, &prepared.connection)
                 && self.file_operation_scope(&prepared.key).as_ref() == Some(&prepared.scope),
@@ -1830,7 +1994,9 @@ impl VcsStore {
             prepared.operation,
             &prepared.affected_paths,
             prepared.summary.as_deref(),
-        )
+            &prepared.baseline,
+        )?;
+        self.check_file_buffers(&prepared.scope, &prepared.affected_paths, cx)
     }
 
     fn check_discarded_buffers(
@@ -1840,7 +2006,7 @@ impl VcsStore {
         cx: &Context<Self>,
     ) -> Result<()> {
         self.check_file_buffers(scope, paths, cx).context(
-            "Discard was applied on disk; edits made in buffers during the operation were preserved. Review them before saving.",
+            "The operation was applied on disk; edits made in buffers during the operation were preserved. Review them before saving.",
         )
     }
 
@@ -1851,10 +2017,26 @@ impl VcsStore {
         operation: FileOperation,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        let Some(repository) = self.repositories.get(&key) else {
+            return Task::ready(Err(anyhow!("VCS repository closed")));
+        };
+        let baseline = repository.view.selected_baseline.clone();
+        self.run_file_operation_for_baseline(key, path, operation, baseline, cx)
+    }
+
+    pub fn run_file_operation_for_baseline(
+        &mut self,
+        key: VcsRepositoryId,
+        path: String,
+        operation: FileOperation,
+        baseline: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         if self.file_operation_running {
             return Task::ready(Err(anyhow!("Another VCS file operation is running")));
         }
-        let prepare = self.prepare_file_operation(key.clone(), path, operation, cx);
+        let prepare =
+            self.prepare_file_operation_for_baseline(key.clone(), path, operation, baseline, cx);
         self.file_operation_running = true;
         self.notify(cx);
         let (sender, receiver) = futures::channel::oneshot::channel();
@@ -1971,7 +2153,7 @@ impl VcsStore {
                         match outcome {
                             FileOperationOutcome::Applied => {
                                 this.file_operation_errors.remove(&key);
-                                if let OperationRequest::File { affected_paths, operation: FileOperation::Discard, .. } = &pending.request
+                                if let OperationRequest::File { affected_paths, operation: FileOperation::Discard | FileOperation::Ignore, .. } = &pending.request
                                     && let Err(error) = this.check_discarded_buffers(&scope, affected_paths, cx)
                                 {
                                     this.file_operation_errors.insert(key.clone(), format!("{error:#}").into());
@@ -2033,6 +2215,535 @@ impl VcsStore {
             })
             .cloned()
             .collect()
+    }
+
+    pub fn comparison_snapshot(
+        &self,
+        key: &VcsRepositoryId,
+        baseline_id: &str,
+    ) -> Option<Arc<Snapshot>> {
+        self.repositories
+            .get(key)
+            .and_then(|repository| repository.comparisons.get(baseline_id))
+            .cloned()
+    }
+
+    pub fn changes_for_baseline(
+        &self,
+        key: &VcsRepositoryId,
+        baseline_id: &str,
+        cx: &App,
+    ) -> Vec<vcs::Change> {
+        self.repositories
+            .get(key)
+            .and_then(|repository| repository.comparisons.get(baseline_id))
+            .into_iter()
+            .flat_map(|snapshot| &snapshot.changes)
+            .filter(|change| self.check_read_path(key, &change.path, cx).is_ok())
+            .cloned()
+            .collect()
+    }
+
+    fn check_read_path(
+        &self,
+        key: &VcsRepositoryId,
+        path: &str,
+        cx: &App,
+    ) -> Result<Arc<ProviderConnection>> {
+        vcs::validate_path(path)?;
+        let project_path = ProjectPath {
+            worktree_id: key.worktree_id,
+            path: Arc::from(RelPath::from_unix_str(path)?),
+        };
+        ensure!(
+            self.repository_for_path(&project_path, cx).as_ref() == Some(key),
+            "file belongs to another source-control provider"
+        );
+        let repository = self
+            .repositories
+            .get(key)
+            .context("VCS repository closed")?;
+        ensure!(
+            repository.connection.is_alive(),
+            "VCS provider is no longer running"
+        );
+        Ok(repository.connection.clone())
+    }
+
+    pub fn load_comparison(
+        &mut self,
+        key: VcsRepositoryId,
+        baseline_id: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Arc<Snapshot>>> {
+        let request = (|| {
+            ensure!(
+                self.trusted(key.worktree_id, cx),
+                "VCS worktree is not trusted"
+            );
+            let repository = self
+                .repositories
+                .get_mut(&key)
+                .context("VCS repository closed")?;
+            let baseline = repository
+                .view
+                .descriptor
+                .baselines
+                .iter()
+                .find(|baseline| baseline.id == baseline_id)
+                .context("Unknown VCS comparison")?;
+            let source = baseline.current_content;
+            let generation = repository
+                .comparison_generations
+                .entry(baseline_id.clone())
+                .or_default();
+            *generation += 1;
+            Ok((repository.connection.clone(), *generation, source))
+        })();
+        let (connection, generation, source) = match request {
+            Ok(request) => request,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        cx.spawn(async move |this, cx| {
+            let snapshot = Arc::new(
+                connection
+                    .snapshot(key.repository_id.clone(), baseline_id.clone())
+                    .await?,
+            );
+            ensure!(
+                source != vcs::ContentSource::Snapshot || snapshot.current_revision_id.is_some(),
+                "Snapshot comparison omitted its current content identity"
+            );
+            this.update(cx, |this, cx| {
+                ensure!(
+                    this.trusted(key.worktree_id, cx),
+                    "VCS worktree is not trusted"
+                );
+                let repository = this
+                    .repositories
+                    .get_mut(&key)
+                    .context("VCS repository closed")?;
+                ensure!(
+                    Arc::ptr_eq(&repository.connection, &connection),
+                    "VCS provider changed"
+                );
+                if repository.comparison_generations.get(&baseline_id) != Some(&generation) {
+                    if let Some(current) = repository.comparisons.get(&baseline_id) {
+                        ensure!(
+                            same_comparison(current, &snapshot),
+                            "VCS comparison request was superseded"
+                        );
+                        return Ok(current.clone());
+                    }
+                }
+                let changed = repository
+                    .comparisons
+                    .get(&baseline_id)
+                    .is_none_or(|previous| {
+                        !same_comparison(previous, &snapshot)
+                            || previous.changes != snapshot.changes
+                    });
+                repository
+                    .comparisons
+                    .insert(baseline_id.clone(), snapshot.clone());
+                if repository.view.selected_baseline == baseline_id {
+                    repository.view.snapshot = Some(snapshot.clone());
+                    repository.view.error = None;
+                }
+                if changed {
+                    this.refresh_open_comparison_diffs(&key, &baseline_id, cx);
+                    cx.emit(VcsStoreEvent::DiffChanged {
+                        worktree_id: key.worktree_id,
+                    });
+                }
+                Ok(snapshot)
+            })?
+        })
+    }
+
+    fn refresh_open_comparison_diffs(
+        &mut self,
+        key: &VcsRepositoryId,
+        baseline_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let paths: Vec<_> = self
+            .repositories
+            .get(key)
+            .into_iter()
+            .flat_map(|repository| repository.comparison_diffs.iter())
+            .filter(|((_, baseline), state)| {
+                baseline == baseline_id && state.diff.upgrade().is_some()
+            })
+            .map(|((path, _), _)| path.clone())
+            .collect();
+        for path in paths {
+            self.open_diff_for_baseline(key.clone(), path, baseline_id.to_owned(), cx)
+                .detach_and_log_err(cx);
+        }
+    }
+
+    pub fn file_history_available(&self, key: &VcsRepositoryId) -> bool {
+        self.repositories.get(key).is_some_and(|repository| {
+            repository
+                .connection
+                .capabilities()
+                .is_some_and(|capabilities| capabilities.file_history)
+        })
+    }
+
+    pub fn file_history(
+        &mut self,
+        key: VcsRepositoryId,
+        path: String,
+        cursor: Option<String>,
+        limit: u32,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<vcs::FileHistory>> {
+        if !self.trusted(key.worktree_id, cx) {
+            return Task::ready(Err(anyhow!("VCS worktree is not trusted")));
+        }
+        let connection = match self.check_read_path(&key, &path, cx) {
+            Ok(connection) => connection,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        cx.spawn(async move |this, cx| {
+            let history = connection
+                .file_history(key.repository_id.clone(), path.clone(), cursor, limit)
+                .await?;
+            this.update(cx, |this, cx| {
+                ensure!(
+                    this.trusted(key.worktree_id, cx),
+                    "VCS worktree is not trusted"
+                );
+                let current = this.check_read_path(&key, &path, cx)?;
+                ensure!(Arc::ptr_eq(&current, &connection), "VCS provider changed");
+                for entry in &history.entries {
+                    for path in [&entry.path, &entry.parent_path].into_iter().flatten() {
+                        this.check_read_path(&key, path, cx)?;
+                    }
+                }
+                Ok(history)
+            })?
+        })
+    }
+
+    pub fn open_revision_diff(
+        &mut self,
+        key: VcsRepositoryId,
+        path: String,
+        entry: vcs::FileHistoryEntry,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<VcsDiff>> {
+        let request = (|| {
+            ensure!(
+                self.trusted(key.worktree_id, cx),
+                "VCS worktree is not trusted"
+            );
+            entry.validate()?;
+            let connection = self.check_read_path(&key, &path, cx)?;
+            let current_path = entry.path.clone().unwrap_or(path.clone());
+            let parent_path = entry.parent_path.clone().unwrap_or(current_path.clone());
+            self.check_read_path(&key, &current_path, cx)?;
+            self.check_read_path(&key, &parent_path, cx)?;
+            Ok((connection, current_path, parent_path))
+        })();
+        let (connection, current_path, parent_path) = match request {
+            Ok(request) => request,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        cx.spawn(async move |this, cx| {
+            let base = match entry.parent_revision_id {
+                Some(revision) => {
+                    connection
+                        .read_revision(key.repository_id.clone(), parent_path, revision)
+                        .await?
+                }
+                None => Content::Absent,
+            };
+            let current = connection
+                .read_revision(
+                    key.repository_id.clone(),
+                    current_path,
+                    entry.commit.revision_id,
+                )
+                .await?;
+            this.update(cx, |this, cx| {
+                ensure!(
+                    this.trusted(key.worktree_id, cx),
+                    "VCS worktree is not trusted"
+                );
+                let active = this.check_read_path(&key, &path, cx)?;
+                ensure!(Arc::ptr_eq(&active, &connection), "VCS provider changed");
+                anyhow::Ok(this.create_snapshot_diff(base, current, cx))
+            })??
+            .await
+        })
+    }
+
+    fn create_snapshot_diff(
+        &mut self,
+        base: Content,
+        current: Content,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<VcsDiff>> {
+        let contents = (|| {
+            Ok((
+                content_text(base)?,
+                content_text(current)?.unwrap_or_default(),
+            ))
+        })();
+        let (base, current) = match contents {
+            Ok(contents) => contents,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let Some(project) = self.project.upgrade() else {
+            return Task::ready(Err(anyhow!("VCS project closed")));
+        };
+        let buffer = project.update(cx, |project, cx| {
+            project.create_local_buffer(&current, None, false, cx)
+        });
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_capability(language::Capability::ReadOnly, cx)
+        });
+        let snapshot = buffer.read(cx).snapshot();
+        let language_registry = buffer.read(cx).language_registry();
+        let diff = cx.new(|cx| {
+            let mut diff = BufferDiff::new(
+                &snapshot.text,
+                snapshot.language().cloned(),
+                language_registry,
+                cx,
+            );
+            diff.set_operations(Arc::new(ReadOnlyDiffOperations));
+            diff
+        });
+        let update = diff.update(cx, |diff, cx| diff.set_base_text(base, snapshot.text, cx));
+        cx.spawn(async move |_, _| {
+            update.await;
+            Ok(VcsDiff {
+                buffer,
+                diff,
+                current_content: vcs::ContentSource::Snapshot,
+            })
+        })
+    }
+
+    pub fn open_diff_for_purpose(
+        &mut self,
+        key: VcsRepositoryId,
+        path: String,
+        purpose: vcs::ComparisonPurpose,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<VcsDiff>> {
+        let baseline = self
+            .repositories
+            .get(&key)
+            .and_then(|repository| {
+                repository
+                    .view
+                    .descriptor
+                    .baselines
+                    .iter()
+                    .find(|baseline| baseline.purpose == Some(purpose))
+            })
+            .map(|baseline| baseline.id.clone());
+        match baseline {
+            Some(baseline) => self.open_diff_for_baseline(key, path, baseline, cx),
+            None => Task::ready(Err(anyhow!("VCS comparison is unavailable"))),
+        }
+    }
+
+    pub fn open_diff_for_baseline(
+        &mut self,
+        key: VcsRepositoryId,
+        path: String,
+        baseline_id: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<VcsDiff>> {
+        let request = (|| {
+            ensure!(
+                self.trusted(key.worktree_id, cx),
+                "VCS worktree is not trusted"
+            );
+            let connection = self.check_read_path(&key, &path, cx)?;
+            let repository = self
+                .repositories
+                .get(&key)
+                .context("VCS repository closed")?;
+            let source = repository
+                .view
+                .descriptor
+                .baselines
+                .iter()
+                .find(|baseline| baseline.id == baseline_id)
+                .context("Unknown VCS comparison")?
+                .current_content;
+            let root = vcs::local_path(&repository.view.descriptor.scope_uri)?;
+            Ok((connection, source, root))
+        })();
+        let (connection, source, root) = match request {
+            Ok(request) => request,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let snapshot = match self
+            .repositories
+            .get(&key)
+            .and_then(|repository| repository.comparisons.get(&baseline_id))
+            .cloned()
+        {
+            Some(snapshot) => Task::ready(Ok(snapshot)),
+            None => self.load_comparison(key.clone(), baseline_id.clone(), cx),
+        };
+        let fs = self.fs.clone();
+        let project = self.project.clone();
+        cx.spawn(async move |this, cx| {
+            let snapshot = snapshot.await?;
+            let base = connection
+                .read_content(
+                    snapshot.repository_id.clone(),
+                    snapshot.id.clone(),
+                    baseline_id.clone(),
+                    path.clone(),
+                )
+                .await?;
+            if source == vcs::ContentSource::Snapshot {
+                let current = connection
+                    .read_content_side(
+                        snapshot.repository_id.clone(),
+                        snapshot.id.clone(),
+                        baseline_id.clone(),
+                        path.clone(),
+                        vcs::ContentSide::Current,
+                    )
+                    .await?;
+                return this
+                    .update(cx, |this, cx| {
+                        this.check_comparison(&key, &path, &connection, &snapshot, cx)?;
+                        anyhow::Ok(this.create_snapshot_diff(base, current, cx))
+                    })??
+                    .await;
+            }
+            let base = content_text(base)?;
+            let project_path = ProjectPath {
+                worktree_id: key.worktree_id,
+                path: Arc::from(RelPath::from_unix_str(&path)?),
+            };
+            let metadata = scoped_metadata(&root, &path, &fs).await?;
+            let existing =
+                project.read_with(cx, |project, cx| project.get_open_buffer(&project_path, cx))?;
+            let buffer = if let Some(buffer) = existing {
+                buffer
+            } else {
+                match metadata {
+                    Some(metadata) => {
+                        ensure!(
+                            !metadata.is_dir && !metadata.is_symlink,
+                            "This change has no text diff"
+                        );
+                        project
+                            .update(cx, |project, cx| project.open_buffer(project_path, cx))?
+                            .await?
+                    }
+                    None => {
+                        let buffer = project.update(cx, |project, cx| {
+                            project.create_local_buffer("", None, false, cx)
+                        })?;
+                        buffer.update(cx, |buffer, cx| {
+                            buffer.set_capability(language::Capability::ReadOnly, cx)
+                        });
+                        buffer
+                    }
+                }
+            };
+            let (diff, update) = this.update(cx, |this, cx| {
+                this.check_comparison(&key, &path, &connection, &snapshot, cx)?;
+                let repository = this
+                    .repositories
+                    .get_mut(&key)
+                    .context("VCS repository closed")?;
+                repository.comparison_diffs.retain(|_, state| {
+                    state.buffer.upgrade().is_some() && state.diff.upgrade().is_some()
+                });
+                let cache_key = (path.clone(), baseline_id);
+                let existing = repository
+                    .comparison_diffs
+                    .get(&cache_key)
+                    .filter(|state| state.buffer.upgrade().as_ref() == Some(&buffer))
+                    .and_then(|state| state.diff.upgrade());
+                let diff = if let Some(diff) = existing {
+                    diff
+                } else {
+                    ensure!(
+                        repository.comparison_diffs.len() < 128,
+                        "Too many open VCS comparisons; close a comparison before opening another"
+                    );
+                    let snapshot = buffer.read(cx).snapshot();
+                    let language_registry = buffer.read(cx).language_registry();
+                    let diff = cx.new(|cx| {
+                        let mut diff = BufferDiff::new(
+                            &snapshot.text,
+                            snapshot.language().cloned(),
+                            language_registry,
+                            cx,
+                        );
+                        diff.set_operations(Arc::new(ReadOnlyDiffOperations));
+                        diff
+                    });
+                    diff
+                };
+                let weak_diff = diff.downgrade();
+                let current_base = base.clone();
+                let subscription = cx.subscribe(&buffer, move |_, buffer, event, cx| {
+                    if matches!(event, BufferEvent::Edited { .. } | BufferEvent::Reloaded) {
+                        if let Some(diff) = weak_diff.upgrade() {
+                            let text = buffer.read(cx).text_snapshot();
+                            diff.update(cx, |diff, cx| {
+                                diff.set_base_text(current_base.clone(), text, cx)
+                            })
+                            .detach();
+                        }
+                    }
+                });
+                repository.comparison_diffs.insert(
+                    cache_key,
+                    ComparisonDiff {
+                        buffer: buffer.downgrade(),
+                        diff: diff.downgrade(),
+                        _subscription: subscription,
+                    },
+                );
+                let text = buffer.read(cx).text_snapshot();
+                let update = diff.update(cx, |diff, cx| diff.set_base_text(base, text, cx));
+                Ok((diff, update))
+            })??;
+            update.await;
+            Ok(VcsDiff {
+                buffer,
+                diff,
+                current_content: vcs::ContentSource::Working,
+            })
+        })
+    }
+
+    fn check_comparison(
+        &self,
+        key: &VcsRepositoryId,
+        path: &str,
+        connection: &Arc<ProviderConnection>,
+        snapshot: &Snapshot,
+        cx: &App,
+    ) -> Result<()> {
+        let current = self.check_read_path(key, path, cx)?;
+        ensure!(Arc::ptr_eq(&current, connection), "VCS provider changed");
+        ensure!(
+            self.repositories
+                .get(key)
+                .and_then(|repository| repository.comparisons.get(&snapshot.baseline_id))
+                .is_some_and(|current| same_comparison(current, snapshot)),
+            "VCS comparison changed while reading its content"
+        );
+        Ok(())
     }
 
     pub fn owns_absolute_path(&self, path: &Path, cx: &App) -> bool {
@@ -2197,6 +2908,22 @@ impl VcsStore {
             return Task::ready(Err(anyhow!("buffer has no unambiguous VCS provider")));
         };
         let relative = path.path.as_unix_str().to_owned();
+        let working = self
+            .repositories
+            .get(&key)
+            .and_then(|repository| {
+                repository
+                    .view
+                    .descriptor
+                    .baselines
+                    .iter()
+                    .find(|baseline| baseline.purpose == Some(vcs::ComparisonPurpose::Working))
+            })
+            .map(|baseline| baseline.id.clone());
+        if let Some(baseline) = working {
+            let task = self.open_diff_for_baseline(key, relative, baseline, cx);
+            return cx.spawn(async move |_, _| Ok(task.await?.diff));
+        }
         self.ensure_diff(&key, &relative, &buffer, cx);
         self.load_diff_if_needed(buffer, cx)
     }
@@ -2207,6 +2934,25 @@ impl VcsStore {
         path: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<VcsDiff>> {
+        let selected = self
+            .repositories
+            .get(&key)
+            .and_then(|repository| {
+                repository
+                    .view
+                    .descriptor
+                    .baselines
+                    .iter()
+                    .find(|baseline| baseline.id == repository.view.selected_baseline)
+            })
+            .filter(|baseline| {
+                baseline.purpose.is_some()
+                    || baseline.current_content == vcs::ContentSource::Snapshot
+            })
+            .map(|baseline| baseline.id.clone());
+        if let Some(baseline) = selected {
+            return self.open_diff_for_baseline(key, path, baseline, cx);
+        }
         let result = (|| {
             vcs::validate_path(&path)?;
             let project_path = ProjectPath {
@@ -2249,7 +2995,7 @@ impl VcsStore {
                 this.load_diff_if_needed(buffer.clone(), cx)
             })?;
             let diff = diff_task.await?;
-            Ok(VcsDiff { buffer, diff })
+            Ok(VcsDiff { buffer, diff, current_content: vcs::ContentSource::Working })
         })
     }
 
@@ -2434,7 +3180,8 @@ impl VcsStore {
                             .get(&state.repository)
                             .and_then(|repository| repository.view.snapshot.as_ref())
                             .is_some_and(|current| current.revision_id == snapshot.revision_id
-                                && current.baseline_id == snapshot.baseline_id),
+                                && current.baseline_id == snapshot.baseline_id
+                                && current.current_revision_id == snapshot.current_revision_id),
                         "VCS snapshot changed"
                     );
                     Ok(base)
@@ -2661,6 +3408,28 @@ mod tests {
 #[path = "vcs_store_tests.rs"]
 mod integration_tests;
 
+fn same_comparison(left: &Snapshot, right: &Snapshot) -> bool {
+    left.repository_id == right.repository_id
+        && left.baseline_id == right.baseline_id
+        && left.revision_id == right.revision_id
+        && left.current_revision_id == right.current_revision_id
+}
+
+fn content_text(content: Content) -> Result<Option<Arc<str>>> {
+    content.validate()?;
+    match content {
+        Content::Absent => Ok(None),
+        Content::Text { mut text } => {
+            text::LineEnding::normalize(&mut text);
+            Ok(Some(text.into()))
+        }
+        Content::Binary => bail!("Binary file: no text diff is available"),
+        Content::Symlink { .. } => {
+            bail!("Symlink: target changes are displayed in the changes list")
+        }
+    }
+}
+
 async fn matches_markers(root: &Path, markers: &[String], fs: &Arc<dyn Fs>) -> Result<bool> {
     ensure!(
         !markers.is_empty(),
@@ -2710,6 +3479,15 @@ async fn validate_file_metadata(root: &Path, change: &vcs::Change, fs: &Arc<dyn 
             None => ensure!(explicit, "An affected file no longer exists"),
         }
     }
+    Ok(())
+}
+
+async fn validate_ignore_config(root: &Path, path: &str, fs: &Arc<dyn Fs>) -> Result<()> {
+    let metadata = scoped_metadata(root, path, fs).await?;
+    ensure!(
+        metadata.is_none_or(|metadata| !metadata.is_dir && !metadata.is_symlink),
+        "Ignore configuration must be a regular file"
+    );
     Ok(())
 }
 

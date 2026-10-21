@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::{any::TypeId, ops::Range, path::Path, sync::Arc};
+use std::{any::TypeId, ops::Range, path::Path, rc::Rc, sync::Arc};
 
 use crate::git_panel::{self, GitPanel};
 use crate::git_panel_settings::GitPanelSettings;
@@ -16,16 +16,17 @@ use multi_buffer::{MultiBuffer, PathKey};
 use project::vcs_store::VcsDiff;
 use project::{
     Project, ProjectPath,
-    vcs_store::{VcsRepositoryId, VcsRepositorySnapshot, VcsStore},
+    vcs_store::{VcsRepositoryId, VcsRepositorySnapshot, VcsStore, VcsStoreEvent},
 };
 use settings::{GitPanelClickBehavior, Settings};
 use ui::{
-    Button, ButtonLike, Color, ContextMenu, ContextMenuEntry, IconButton, IconName, Label,
-    ListItem, ListItemSpacing, Tab, Tooltip, prelude::*, right_click_menu,
+    Button, ButtonLike, Checkbox, Color, ContextMenu, ContextMenuEntry, IconButton, IconName,
+    Label, ListItem, ListItemSpacing, Tab, ToggleState, Tooltip, prelude::*, right_click_menu,
 };
 use util::{ResultExt as _, rel_path::RelPath};
 use vcs::{
-    Change, ChangeStatus, ContentKind, FileOperation, RepositoryOperation, RepositoryOperationKind,
+    Change, ChangeStatus, ComparisonPurpose, ContentKind, ContentSource, FileOperation,
+    RepositoryOperation, RepositoryOperationKind,
 };
 use workspace::{Item, Workspace, notifications::NotifyTaskExt, searchable::SearchableItemHandle};
 
@@ -73,6 +74,7 @@ pub(crate) fn discard_unavailable_reason(
     store: Option<&Entity<VcsStore>>,
     repository: &VcsRepositoryId,
     path: &str,
+    baseline: Option<&str>,
     cx: &App,
 ) -> Option<SharedString> {
     let Some(store) = store else {
@@ -87,15 +89,26 @@ pub(crate) fn discard_unavailable_reason(
     {
         return Some("Refresh source control to reconcile the previous operation.".into());
     }
-    if store
-        .file_operations_for_path(repository, path)
-        .contains(&FileOperation::Discard)
-    {
+    let operations = baseline
+        .map(|baseline| store.file_operations_for_baseline(repository, path, baseline))
+        .unwrap_or_else(|| store.file_operations_for_path(repository, path));
+    if operations.contains(&FileOperation::Discard) {
+        let changes = baseline
+            .map(|baseline| store.changes_for_baseline(repository, baseline, cx))
+            .unwrap_or_else(|| store.changes(repository, cx));
+        if changes.iter().any(|change| {
+            change.path == path
+                && change.staged_status.is_some()
+                && change.unstaged_status.is_none()
+        }) {
+            return Some("This file has no unstaged changes to discard.".into());
+        }
         return None;
     }
     Some(
-        store
-            .changes(repository, cx)
+        baseline
+            .map(|baseline| store.changes_for_baseline(repository, baseline, cx))
+            .unwrap_or_else(|| store.changes(repository, cx))
             .into_iter()
             .find(|change| change.path == path)
             .and_then(|change| change.unavailable_reason)
@@ -107,6 +120,7 @@ pub(crate) fn discard_unavailable_reason(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn discard_context_menu(
     mut menu: ContextMenu,
     unavailable_reason: Option<SharedString>,
@@ -127,12 +141,35 @@ pub(crate) fn discard_file_changes(
     store: Entity<VcsStore>,
     repository: VcsRepositoryId,
     path: String,
+    baseline: Option<String>,
     window: &mut Window,
     cx: &mut App,
 ) -> Task<Result<()>> {
-    if let Some(reason) = discard_unavailable_reason(Some(&store), &repository, &path, cx) {
+    if let Some(reason) =
+        discard_unavailable_reason(Some(&store), &repository, &path, baseline.as_deref(), cx)
+    {
         return Task::ready(Err(anyhow::anyhow!(reason.to_string())));
     }
+    confirm_file_operation(
+        store,
+        repository,
+        path,
+        baseline,
+        FileOperation::Discard,
+        window,
+        cx,
+    )
+}
+
+fn confirm_file_operation(
+    store: Entity<VcsStore>,
+    repository: VcsRepositoryId,
+    path: String,
+    baseline: Option<String>,
+    operation: FileOperation,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Result<()>> {
     let Some(snapshot) = store
         .read(cx)
         .repositories()
@@ -143,8 +180,35 @@ pub(crate) fn discard_file_changes(
             "Source-control repository is no longer available."
         )));
     };
-    let preparation = store.update(cx, |store, cx| {
-        store.prepare_file_operation(repository, path.clone(), FileOperation::Discard, cx)
+    let (title, confirm, fallback) = match operation {
+        FileOperation::Discard => (
+            format!("Discard unstaged changes to {path}?"),
+            "Discard Unstaged Changes",
+            "The working file will be restored to its staged version. Staged changes will be preserved.",
+        ),
+        FileOperation::Ignore => {
+            let Some(config) = &snapshot.descriptor.ignore_config_path else {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "The provider did not declare an ignore configuration."
+                )));
+            };
+            (
+                format!("Add {path} to {config}?"),
+                "Add Ignore Rule",
+                "The selected file will be kept.",
+            )
+        }
+        _ => {
+            return Task::ready(Err(anyhow::anyhow!(
+                "This operation does not use file-change confirmation."
+            )));
+        }
+    };
+    let preparation = store.update(cx, |store, cx| match baseline {
+        Some(baseline) => {
+            store.prepare_file_operation_for_baseline(repository, path, operation, baseline, cx)
+        }
+        None => store.prepare_file_operation(repository, path, operation, cx),
     });
     window.spawn(cx, async move |cx| {
         let prepared = preparation.await?;
@@ -152,18 +216,26 @@ pub(crate) fn discard_file_changes(
             "Project: {}\nScope: {}\n\n{}\n\nAffected paths:\n{}",
             snapshot.descriptor.display_name,
             snapshot.descriptor.scope_uri,
-            prepared.summary().unwrap_or("The working file will be restored to its staged version. Staged changes will be preserved."),
+            prepared.summary().unwrap_or(fallback),
             prepared.affected_paths().join("\n"),
         );
-        let answer = cx.update(|window, cx| window.prompt(
-            PromptLevel::Warning,
-            &format!("Discard unstaged changes to {path}?"),
-            Some(&detail),
-            &["Discard Unstaged Changes", "Cancel"],
-            cx,
-        ))?.await?;
+        let answer = cx
+            .update(|window, cx| {
+                window.prompt(
+                    PromptLevel::Warning,
+                    &title,
+                    Some(&detail),
+                    &[confirm, "Cancel"],
+                    cx,
+                )
+            })?
+            .await?;
         if answer == 0 {
-            store.update(cx, |store, cx| store.apply_prepared_file_operation(prepared, cx)).await?;
+            store
+                .update(cx, |store, cx| {
+                    store.apply_prepared_file_operation(prepared, cx)
+                })
+                .await?;
         }
         Ok(())
     })
@@ -276,6 +348,229 @@ struct Row {
     change: Option<Change>,
 }
 
+#[derive(Clone)]
+pub(crate) struct FileTarget {
+    pub repository: VcsRepositoryId,
+    pub baseline: String,
+    pub change: Change,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum FileAction {
+    Stage,
+    Unstage,
+    Discard,
+    UnstagedChanges,
+    StagedChanges,
+    CopyPath,
+    CopyRelativePath,
+    Ignore,
+    OpenDiff,
+    OpenFileDiff,
+    ViewFile,
+    History,
+}
+
+pub(crate) fn staging_state(change: &Change, staged_paths: &[String]) -> ToggleState {
+    let staged = change.staged_status.is_some() || staged_paths.contains(&change.path);
+    match (staged, change.unstaged_status.is_some()) {
+        (true, true) => ToggleState::Indeterminate,
+        (true, false) => ToggleState::Selected,
+        (false, _) => ToggleState::Unselected,
+    }
+}
+
+fn staging_operation(state: ToggleState) -> FileOperation {
+    if state == ToggleState::Selected {
+        FileOperation::Unstage
+    } else {
+        FileOperation::Stage
+    }
+}
+
+pub(crate) fn file_context_menu(
+    mut menu: ContextMenu,
+    target: &FileTarget,
+    store: Option<&Entity<VcsStore>>,
+    busy: bool,
+    cx: &App,
+    handler: impl Fn(FileAction, &mut Window, &mut App) + 'static,
+) -> ContextMenu {
+    let handler = Rc::new(handler);
+    let repository = store.and_then(|store| {
+        store
+            .read(cx)
+            .repositories()
+            .into_iter()
+            .find(|repository| repository.key == target.repository)
+    });
+    let operations = store
+        .map(|store| {
+            store.read(cx).file_operations_for_baseline(
+                &target.repository,
+                &target.change.path,
+                &target.baseline,
+            )
+        })
+        .unwrap_or_default();
+    let staged_paths = repository
+        .as_ref()
+        .and_then(|repository| repository.repository_state.as_ref())
+        .map(|state| state.staged_paths.as_slice())
+        .unwrap_or_default();
+    let state = staging_state(&target.change, staged_paths);
+    let operation = staging_operation(state);
+    let entry = |label: SharedString, action, reason: Option<SharedString>| {
+        let handler = handler.clone();
+        let mut entry = ContextMenuEntry::new(label)
+            .disabled(reason.is_some())
+            .handler(move |window, cx| handler(action, window, cx));
+        if let Some(reason) = reason {
+            entry = entry.documentation_aside(ui::DocumentationSide::Right, move |_| {
+                div()
+                    .p_2()
+                    .max_w_64()
+                    .child(Label::new(reason.clone()).size(LabelSize::Small))
+                    .into_any_element()
+            });
+        }
+        entry
+    };
+    let unavailable = |operation: FileOperation| -> Option<SharedString> {
+        if busy || store.is_some_and(|store| store.read(cx).file_operation_running()) {
+            Some("Another source-control operation is running.".into())
+        } else if !operations.contains(&operation) {
+            Some(
+                target
+                    .change
+                    .unavailable_reason
+                    .clone()
+                    .unwrap_or_else(|| {
+                        "The provider does not support this action for this file.".into()
+                    })
+                    .into(),
+            )
+        } else {
+            None
+        }
+    };
+    let (stage_label, stage_action) = if operation == FileOperation::Unstage {
+        ("Unstage File", FileAction::Unstage)
+    } else {
+        ("Stage File", FileAction::Stage)
+    };
+    menu.push_item(entry(
+        stage_label.into(),
+        stage_action,
+        unavailable(operation),
+    ));
+    if state == ToggleState::Indeterminate {
+        menu.push_item(entry(
+            "Unstage File".into(),
+            FileAction::Unstage,
+            unavailable(FileOperation::Unstage),
+        ));
+    }
+    let discard_reason = if busy {
+        Some("Another source-control operation is running.".into())
+    } else {
+        discard_unavailable_reason(
+            store,
+            &target.repository,
+            &target.change.path,
+            Some(&target.baseline),
+            cx,
+        )
+    };
+    let discard_label = if repository.as_ref().is_some_and(|repository| {
+        repository.descriptor.baselines.iter().any(|baseline| {
+            baseline.id == target.baseline && baseline.current_content == ContentSource::Snapshot
+        })
+    }) {
+        "Discard Unstaged Changes"
+    } else {
+        "Discard Changes"
+    };
+    menu.push_item(entry(
+        discard_label.into(),
+        FileAction::Discard,
+        discard_reason,
+    ));
+    menu = menu.separator();
+    for (label, purpose, action) in [
+        (
+            "Unstaged Changes",
+            ComparisonPurpose::Unstaged,
+            FileAction::UnstagedChanges,
+        ),
+        (
+            "Staged Changes",
+            ComparisonPurpose::Staged,
+            FileAction::StagedChanges,
+        ),
+    ] {
+        let reason = repository
+            .as_ref()
+            .is_none_or(|repository| {
+                !repository
+                    .descriptor
+                    .baselines
+                    .iter()
+                    .any(|baseline| baseline.purpose == Some(purpose))
+            })
+            .then(|| "This comparison is unavailable from the provider.".into());
+        menu.push_item(entry(label.into(), action, reason));
+    }
+    menu = menu.separator();
+    menu.push_item(entry("Copy Path".into(), FileAction::CopyPath, None));
+    menu.push_item(entry(
+        "Copy Relative Path".into(),
+        FileAction::CopyRelativePath,
+        None,
+    ));
+    if let Some(config) = repository
+        .as_ref()
+        .and_then(|repository| repository.descriptor.ignore_config_path.as_ref())
+    {
+        menu = menu.separator();
+        menu.push_item(entry(
+            format!("Add to {config}").into(),
+            FileAction::Ignore,
+            unavailable(FileOperation::Ignore),
+        ));
+    }
+    menu = menu.separator();
+    let text_reason = (target.change.kind != ContentKind::File)
+        .then(|| "Text comparison is unavailable for this file type.".into());
+    menu.push_item(entry(
+        "Open Diff".into(),
+        FileAction::OpenDiff,
+        text_reason.clone(),
+    ));
+    menu.push_item(entry(
+        "Open File Diff".into(),
+        FileAction::OpenFileDiff,
+        text_reason,
+    ));
+    let deleted = (target.change.status == ChangeStatus::Deleted)
+        .then(|| "This file no longer exists in the working tree.".into());
+    menu.push_item(entry("View File".into(), FileAction::ViewFile, deleted));
+    menu = menu.separator();
+    let history_reason = if target.change.status == ChangeStatus::Untracked {
+        Some("Untracked files have no revision history.".into())
+    } else if store.is_none_or(|store| !store.read(cx).file_history_available(&target.repository)) {
+        Some("File history is unavailable from the provider.".into())
+    } else {
+        None
+    };
+    menu.push_item(entry(
+        "View File History".into(),
+        FileAction::History,
+        history_reason,
+    ));
+    menu
+}
+
 pub struct VcsPanel {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
@@ -288,20 +583,32 @@ pub struct VcsPanel {
     scroll_handle: UniformListScrollHandle,
     error: Option<SharedString>,
     preparing_operation: bool,
-    opened: HashMap<(VcsRepositoryId, String), WeakEntity<SplittableEditor>>,
+    refreshing_comparisons: bool,
+    comparison_refresh_pending: bool,
+    opened: HashMap<(VcsRepositoryId, String, String), WeakEntity<SplittableEditor>>,
     _subscription: Option<Subscription>,
 }
 
 impl VcsPanel {
+    #[cfg(test)]
+    pub(crate) fn set_test_repository(&mut self, snapshot: VcsRepositorySnapshot) {
+        self.repositories = vec![snapshot];
+    }
+
     pub(crate) fn new(
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Self {
         let store = project.read(cx).vcs_store().cloned();
-        let subscription = store
-            .as_ref()
-            .map(|store| cx.subscribe(store, |this, _, _, cx| this.update_entries(cx)));
+        let subscription = store.as_ref().map(|store| {
+            cx.subscribe(store, |this, _, event, cx| {
+                this.update_entries(cx);
+                if matches!(event, VcsStoreEvent::DiffChanged { .. }) {
+                    this.refresh_snapshot_comparisons(cx);
+                }
+            })
+        });
         let mut panel = Self {
             workspace,
             project,
@@ -314,6 +621,8 @@ impl VcsPanel {
             scroll_handle: UniformListScrollHandle::new(),
             error: None,
             preparing_operation: false,
+            refreshing_comparisons: false,
+            comparison_refresh_pending: false,
             opened: HashMap::new(),
             _subscription: subscription,
         };
@@ -365,6 +674,83 @@ impl VcsPanel {
         cx.notify();
     }
 
+    fn refresh_snapshot_comparisons(&mut self, cx: &mut Context<Self>) {
+        if self.refreshing_comparisons {
+            self.comparison_refresh_pending = true;
+            return;
+        }
+        self.comparison_refresh_pending = false;
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        self.opened.retain(|_, editor| editor.upgrade().is_some());
+        let comparisons = self
+            .opened
+            .iter()
+            .filter_map(|((repository, path, baseline), editor)| {
+                let descriptor = self
+                    .repositories
+                    .iter()
+                    .find(|entry| &entry.key == repository)?
+                    .descriptor
+                    .baselines
+                    .iter()
+                    .find(|entry| &entry.id == baseline)?;
+                (descriptor.current_content == ContentSource::Snapshot).then(|| {
+                    (
+                        repository.clone(),
+                        path.clone(),
+                        baseline.clone(),
+                        editor.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if comparisons.is_empty() {
+            return;
+        }
+        self.refreshing_comparisons = true;
+        cx.spawn(async move |this, cx| {
+            for (repository, path, baseline, editor) in comparisons {
+                let result = store
+                    .update(cx, |store, cx| {
+                        store.open_diff_for_baseline(repository, path, baseline, cx)
+                    })
+                    .await;
+                this.update(cx, |this, cx| match result {
+                    Ok(opened) => {
+                        if let Some(editor) = editor.upgrade() {
+                            let buffer = editor.read(cx).rhs_editor().read(cx).buffer().clone();
+                            buffer.update(cx, |multibuffer, cx| {
+                                let end = opened.buffer.read(cx).max_point();
+                                multibuffer.set_excerpts_for_path(
+                                    PathKey::sorted(0),
+                                    opened.buffer,
+                                    [language::Point::zero()..end],
+                                    0,
+                                    cx,
+                                );
+                                multibuffer.add_diff(opened.diff, cx);
+                                multibuffer.set_all_diff_hunks_expanded(cx);
+                            });
+                        }
+                    }
+                    Err(error) => this.error = Some(format!("{error:#}").into()),
+                })
+                .log_err();
+            }
+            this.update(cx, |this, cx| {
+                this.refreshing_comparisons = false;
+                if this.comparison_refresh_pending {
+                    this.refresh_snapshot_comparisons(cx);
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+    }
+
     fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         let start = self.selected.map_or(0, |index| index + 1);
         self.selected = (start..self.rows.len())
@@ -411,25 +797,45 @@ impl VcsPanel {
         }
     }
 
-    fn stage_file(&mut self, _: &StageFile, _: &mut Window, cx: &mut Context<Self>) {
-        self.run_file_operation(FileOperation::Stage, cx);
+    fn stage_file(&mut self, _: &StageFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_action(FileAction::Stage, window, cx);
     }
 
-    fn unstage_file(&mut self, _: &UnstageFile, _: &mut Window, cx: &mut Context<Self>) {
-        self.run_file_operation(FileOperation::Unstage, cx);
+    fn unstage_file(&mut self, _: &UnstageFile, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected_action(FileAction::Unstage, window, cx);
     }
 
     fn discard_file(&mut self, _: &DiscardFile, window: &mut Window, cx: &mut Context<Self>) {
         let Some(row) = self.selected_file().cloned() else {
             return;
         };
-        self.discard_path(row.repository, row.path, window, cx);
+        self.discard_path(row.repository, row.path, None, window, cx);
     }
 
     fn discard_path(
         &mut self,
         repository: VcsRepositoryId,
         path: String,
+        baseline: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm_path_operation(
+            repository,
+            path,
+            baseline,
+            FileOperation::Discard,
+            window,
+            cx,
+        );
+    }
+
+    fn confirm_path_operation(
+        &mut self,
+        repository: VcsRepositoryId,
+        path: String,
+        baseline: Option<String>,
+        operation: FileOperation,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -441,7 +847,12 @@ impl VcsPanel {
         };
         self.error = None;
         self.preparing_operation = true;
-        let operation = discard_file_changes(store, repository, path, window, cx);
+        let operation = match operation {
+            FileOperation::Discard => {
+                discard_file_changes(store, repository, path, baseline, window, cx)
+            }
+            _ => confirm_file_operation(store, repository, path, baseline, operation, window, cx),
+        };
         cx.spawn(async move |this, cx| {
             let result = operation.await;
             this.update(cx, |this, cx| {
@@ -643,29 +1054,42 @@ impl VcsPanel {
         let Some(row) = self.selected_file().cloned() else {
             return;
         };
+        self.run_path_operation(row.repository, row.path, operation, None, cx);
+    }
+
+    fn run_path_operation(
+        &mut self,
+        repository: VcsRepositoryId,
+        path: String,
+        operation: FileOperation,
+        baseline: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preparing_operation {
+            return;
+        }
         let Some(store) = self.store.clone() else {
             return;
         };
-        if !store
-            .read(cx)
-            .file_operations_for_path(&row.repository, &row.path)
-            .contains(&operation)
-        {
-            self.error = Some(
-                row.change
-                    .as_ref()
-                    .and_then(|change| change.unavailable_reason.clone())
-                    .unwrap_or_else(|| {
-                        "This operation is unavailable for this file or checkout.".into()
-                    })
-                    .into(),
-            );
+        let operations = baseline
+            .as_deref()
+            .map(|baseline| {
+                store
+                    .read(cx)
+                    .file_operations_for_baseline(&repository, &path, baseline)
+            })
+            .unwrap_or_else(|| store.read(cx).file_operations_for_path(&repository, &path));
+        if !operations.contains(&operation) {
+            self.error = Some("This operation is unavailable for this file or checkout.".into());
             cx.notify();
             return;
         }
         self.error = None;
-        let task = store.update(cx, |store, cx| {
-            store.run_file_operation(row.repository, row.path, operation, cx)
+        let task = store.update(cx, |store, cx| match baseline {
+            Some(baseline) => {
+                store.run_file_operation_for_baseline(repository, path, operation, baseline, cx)
+            }
+            None => store.run_file_operation(repository, path, operation, cx),
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -748,24 +1172,48 @@ impl VcsPanel {
         }
     }
 
+    fn target_for_row(&self, row: &Row) -> Option<FileTarget> {
+        Some(FileTarget {
+            repository: row.repository.clone(),
+            baseline: self
+                .repositories
+                .iter()
+                .find(|repository| repository.key == row.repository)
+                .map(|repository| repository.selected_baseline.clone())
+                .unwrap_or_default(),
+            change: row.change.clone()?,
+        })
+    }
+
     fn open_file_diff(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(row) = self.rows.get(index).cloned() else {
-            return;
-        };
-        let Some(change) = &row.change else {
+        let Some(target) = self
+            .rows
+            .get(index)
+            .and_then(|row| self.target_for_row(row))
+        else {
             return;
         };
         self.selected = Some(index);
+        self.open_target_diff(target, window, cx);
+    }
+
+    fn open_target_diff(
+        &mut self,
+        target: FileTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.error = None;
         cx.notify();
-        if change.kind != ContentKind::File {
+        if target.change.kind != ContentKind::File {
             return;
         }
-        if let Some(item) = self
-            .opened
-            .get(&(row.repository.clone(), row.path.clone()))
-            .and_then(WeakEntity::upgrade)
-        {
+        let key = (
+            target.repository.clone(),
+            target.change.path.clone(),
+            target.baseline.clone(),
+        );
+        if let Some(item) = self.opened.get(&key).and_then(WeakEntity::upgrade) {
             self.workspace
                 .update(cx, |workspace, cx| {
                     workspace.activate_item(&item, true, true, window, cx)
@@ -776,9 +1224,8 @@ impl VcsPanel {
         let Some(store) = self.store.clone() else {
             return;
         };
-        let key = (row.repository.clone(), row.path.clone());
         let task = store.update(cx, |store, cx| {
-            store.open_diff(row.repository, row.path, cx)
+            store.open_diff_for_baseline(target.repository, target.change.path, target.baseline, cx)
         });
         cx.spawn_in(window, async move |this, cx| {
             let result: Result<()> = async {
@@ -800,26 +1247,165 @@ impl VcsPanel {
         .detach();
     }
 
+    pub(crate) fn dispatch_file_action(
+        &mut self,
+        target: FileTarget,
+        action: FileAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            FileAction::Stage => self.run_path_operation(
+                target.repository,
+                target.change.path,
+                FileOperation::Stage,
+                Some(target.baseline),
+                cx,
+            ),
+            FileAction::Unstage => self.run_path_operation(
+                target.repository,
+                target.change.path,
+                FileOperation::Unstage,
+                Some(target.baseline),
+                cx,
+            ),
+            FileAction::Ignore => self.confirm_path_operation(
+                target.repository,
+                target.change.path,
+                Some(target.baseline),
+                FileOperation::Ignore,
+                window,
+                cx,
+            ),
+            FileAction::Discard => self.discard_path(
+                target.repository,
+                target.change.path,
+                Some(target.baseline),
+                window,
+                cx,
+            ),
+            FileAction::OpenFileDiff => self.open_target_diff(target, window, cx),
+            FileAction::CopyRelativePath => {
+                cx.write_to_clipboard(ClipboardItem::new_string(target.change.path))
+            }
+            FileAction::CopyPath => {
+                if let Some(repository) = self
+                    .repositories
+                    .iter()
+                    .find(|repository| repository.key == target.repository)
+                {
+                    match vcs::local_path(&repository.descriptor.scope_uri) {
+                        Ok(scope) => cx.write_to_clipboard(ClipboardItem::new_string(
+                            scope
+                                .join(&target.change.path)
+                                .to_string_lossy()
+                                .into_owned(),
+                        )),
+                        Err(error) => self.error = Some(format!("{error:#}").into()),
+                    }
+                }
+            }
+            FileAction::ViewFile => {
+                self.open_working_file(target.repository, target.change.path, window, cx)
+            }
+            FileAction::History => {
+                if target.change.status == ChangeStatus::Untracked {
+                    return;
+                }
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        crate::vcs_file_history::deploy(
+                            workspace,
+                            target.repository,
+                            target.change.path,
+                            window,
+                            cx,
+                        )
+                    })
+                    .log_err();
+            }
+            FileAction::OpenDiff | FileAction::StagedChanges | FileAction::UnstagedChanges => {
+                let baseline = match action {
+                    FileAction::StagedChanges | FileAction::UnstagedChanges => {
+                        let purpose = if matches!(action, FileAction::StagedChanges) {
+                            ComparisonPurpose::Staged
+                        } else {
+                            ComparisonPurpose::Unstaged
+                        };
+                        let baseline = self
+                            .repositories
+                            .iter()
+                            .find(|repository| repository.key == target.repository)
+                            .and_then(|repository| {
+                                repository
+                                    .descriptor
+                                    .baselines
+                                    .iter()
+                                    .find(|baseline| baseline.purpose == Some(purpose))
+                            });
+                        let Some(baseline) = baseline else {
+                            self.error =
+                                Some("This comparison is unavailable from the provider.".into());
+                            cx.notify();
+                            return;
+                        };
+                        baseline.id.clone()
+                    }
+                    _ => target.baseline,
+                };
+                self.workspace
+                    .update(cx, |workspace, cx| {
+                        crate::vcs_project_diff::deploy_baseline(
+                            workspace,
+                            target.repository,
+                            baseline,
+                            Some(target.change.path),
+                            true,
+                            window,
+                            cx,
+                        )
+                    })
+                    .log_err();
+            }
+        }
+        cx.notify();
+    }
+
+    fn selected_action(&mut self, action: FileAction, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) {
+            return;
+        }
+        if let Some(target) = self
+            .selected_file()
+            .and_then(|row| self.target_for_row(row))
+        {
+            self.dispatch_file_action(target, action, window, cx);
+        }
+    }
+
     fn view_file(&mut self, _: &git::ViewFile, window: &mut Window, cx: &mut Context<Self>) {
         let Some(row) = self.selected_file().cloned() else {
             return;
         };
+        self.open_working_file(row.repository, row.path, window, cx);
+    }
+
+    fn open_working_file(
+        &mut self,
+        repository: VcsRepositoryId,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.error = None;
-        cx.notify();
-        if row
-            .change
-            .as_ref()
-            .is_none_or(|change| change.kind != ContentKind::File)
-        {
-            return;
-        }
-        let path = match RelPath::from_unix_str(&row.path) {
+        let path = match RelPath::from_unix_str(&path) {
             Ok(path) => ProjectPath {
-                worktree_id: row.repository.worktree_id,
+                worktree_id: repository.worktree_id,
                 path: Arc::from(path),
             },
             Err(error) => {
                 self.error = Some(format!("{error:#}").into());
+                cx.notify();
                 return;
             }
         };
@@ -830,6 +1416,7 @@ impl VcsPanel {
                     .detach_and_notify_err(self.workspace.clone(), window, cx);
             })
             .log_err();
+        cx.notify();
     }
 
     pub(crate) fn select_repository(&mut self, key: VcsRepositoryId, cx: &mut Context<Self>) {
@@ -924,51 +1511,19 @@ impl VcsPanel {
         }
     }
 
-    fn copy_path(
-        &mut self,
-        _: &zed_actions::workspace::CopyPath,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(row) = self.selected_file()
-            && let Some(repository) = self.selected_repository()
-        {
-            match vcs::local_path(&repository.descriptor.scope_uri) {
-                Ok(scope) => cx.write_to_clipboard(ClipboardItem::new_string(
-                    scope.join(&row.path).to_string_lossy().into_owned(),
-                )),
-                Err(error) => self.error = Some(format!("{error:#}").into()),
-            }
-        }
-    }
-
-    fn copy_relative_path(
-        &mut self,
-        _: &zed_actions::workspace::CopyRelativePath,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(row) = self.selected_file() {
-            cx.write_to_clipboard(ClipboardItem::new_string(row.path.clone()));
-        }
-    }
-
     fn toggle_staged(&mut self, _: &git::ToggleStaged, _: &mut Window, cx: &mut Context<Self>) {
         let Some(row) = self.selected_file() else {
             return;
         };
-        let staged = self
+        let staged_paths = self
             .selected_repository()
             .and_then(|repository| repository.repository_state)
-            .is_some_and(|state| state.staged_paths.contains(&row.path));
-        self.run_file_operation(
-            if staged {
-                FileOperation::Unstage
-            } else {
-                FileOperation::Stage
-            },
-            cx,
-        );
+            .map(|state| state.staged_paths.clone())
+            .unwrap_or_default();
+        let Some(change) = row.change.as_ref() else {
+            return;
+        };
+        self.run_file_operation(staging_operation(staging_state(change, &staged_paths)), cx);
     }
 
     pub(crate) fn unsupported_action(&mut self, cx: &mut Context<Self>) {
@@ -978,7 +1533,7 @@ impl VcsPanel {
 
     fn show_comparison(
         &mut self,
-        key: (VcsRepositoryId, String),
+        key: (VcsRepositoryId, String, String),
         opened_diff: VcsDiff,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -990,7 +1545,7 @@ impl VcsPanel {
                 workspace.activate_item(&existing, true, true, window, cx);
                 existing
             } else {
-                add_comparison(workspace, project, opened_diff, &key.1, window, cx)
+                add_comparison(workspace, project, opened_diff, &key.1, &key.2, window, cx)
             }
         })?;
         self.opened.insert(key, item.downgrade());
@@ -1030,12 +1585,69 @@ impl VcsPanel {
                     .then(|| FileIcons::get_icon(path, cx))
                     .flatten();
                 let panel = cx.entity().downgrade();
-                let repository = row.repository.clone();
-                let file_path = row.path.clone();
+                let Some(target) = self.target_for_row(&row) else {
+                    return gpui::Empty.into_any_element();
+                };
+                let staged_paths = self
+                    .selected_repository()
+                    .and_then(|repository| repository.repository_state)
+                    .map(|state| state.staged_paths.clone())
+                    .unwrap_or_default();
+                let state = staging_state(change, &staged_paths);
+                let operation = staging_operation(state);
+                let disabled = self.preparing_operation
+                    || self.store.as_ref().is_none_or(|store| {
+                        store.read(cx).file_operation_running()
+                            || !store
+                                .read(cx)
+                                .file_operations_for_baseline(
+                                    &row.repository,
+                                    &row.path,
+                                    &target.baseline,
+                                )
+                                .contains(&operation)
+                    });
+                let checkbox_panel = panel.clone();
+                let checkbox_target = target.clone();
+                let checkbox = Checkbox::new(("vcs-stage", index), state)
+                    .disabled(disabled)
+                    .tooltip(Tooltip::text(if disabled {
+                        change.unavailable_reason.clone().unwrap_or_else(|| {
+                            "Staging is unavailable for this file or checkout.".into()
+                        })
+                    } else if operation == FileOperation::Unstage {
+                        "Unstage File".into()
+                    } else {
+                        "Stage File".into()
+                    }))
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        checkbox_panel
+                            .update(cx, |panel, cx| {
+                                panel.dispatch_file_action(
+                                    checkbox_target.clone(),
+                                    if operation == FileOperation::Unstage {
+                                        FileAction::Unstage
+                                    } else {
+                                        FileAction::Stage
+                                    },
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .log_err();
+                    });
                 let item = ListItem::new(index)
                     .inset(true)
                     .spacing(ListItemSpacing::Sparse)
                     .toggle_state(self.selected == Some(index))
+                    .start_slot(
+                        h_flex()
+                            .child(checkbox)
+                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation()
+                            }),
+                    )
                     .child(
                         h_flex()
                             .gap_1()
@@ -1065,45 +1677,42 @@ impl VcsPanel {
                 right_click_menu(("vcs-file-menu", index))
                     .trigger(move |_, _, _| item)
                     .menu(move |window, cx| {
-                        let reason = panel
+                        panel
                             .update(cx, |panel, cx| {
                                 panel.selected = panel.rows.iter().position(|row| {
-                                    row.repository == repository && row.path == file_path
+                                    row.repository == target.repository
+                                        && row.path == target.change.path
                                 });
                                 cx.notify();
-                                if panel.preparing_operation {
-                                    Some(
-                                        "Another source-control operation is being prepared."
-                                            .into(),
-                                    )
-                                } else {
-                                    discard_unavailable_reason(
-                                        panel.store.as_ref(),
-                                        &repository,
-                                        &file_path,
-                                        cx,
-                                    )
-                                }
                             })
-                            .unwrap_or_else(|_| {
-                                Some("Source-control panel is no longer available.".into())
-                            });
+                            .log_err();
+                        let target = target.clone();
                         let panel = panel.clone();
-                        let repository = repository.clone();
-                        let file_path = file_path.clone();
-                        ContextMenu::build(window, cx, move |menu, _, _| {
-                            discard_context_menu(menu, reason, move |window, cx| {
-                                panel
-                                    .update(cx, |panel, cx| {
-                                        panel.discard_path(
-                                            repository.clone(),
-                                            file_path.clone(),
-                                            window,
-                                            cx,
-                                        );
-                                    })
-                                    .log_err();
-                            })
+                        ContextMenu::build(window, cx, move |menu, _, cx| {
+                            let Some(entity) = panel.upgrade() else {
+                                return menu;
+                            };
+                            let view = entity.read(cx);
+                            let target_for_handler = target.clone();
+                            file_context_menu(
+                                menu,
+                                &target,
+                                view.store.as_ref(),
+                                view.preparing_operation,
+                                cx,
+                                move |action, window, cx| {
+                                    panel
+                                        .update(cx, |panel, cx| {
+                                            panel.dispatch_file_action(
+                                                target_for_handler.clone(),
+                                                action,
+                                                window,
+                                                cx,
+                                            )
+                                        })
+                                        .log_err();
+                                },
+                            )
                         })
                     })
                     .into_any_element()
@@ -1117,13 +1726,19 @@ fn add_comparison(
     project: Entity<Project>,
     opened_diff: VcsDiff,
     path: &str,
+    comparison: &str,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Entity<SplittableEditor> {
     let multibuffer = cx.new(|cx| {
         // A comparison must not deduplicate against the file's ordinary singleton editor.
-        let mut multibuffer =
-            MultiBuffer::without_headers(opened_diff.buffer.read(cx).capability());
+        let mut multibuffer = MultiBuffer::without_headers(
+            if opened_diff.current_content == ContentSource::Snapshot {
+                Capability::ReadOnly
+            } else {
+                opened_diff.buffer.read(cx).capability()
+            },
+        );
         let end = opened_diff.buffer.read(cx).max_point();
         multibuffer.set_excerpts_for_path(
             PathKey::sorted(0),
@@ -1134,7 +1749,17 @@ fn add_comparison(
         );
         multibuffer.add_diff(opened_diff.diff, cx);
         multibuffer.set_all_diff_hunks_expanded(cx);
-        multibuffer.set_title(format!("{path} — Changes"), cx);
+        multibuffer.set_title(
+            format!(
+                "{path} — {}",
+                if comparison.is_empty() {
+                    "Changes"
+                } else {
+                    comparison
+                }
+            ),
+            cx,
+        );
         multibuffer
     });
     let workspace_entity = cx.entity();
@@ -1157,23 +1782,38 @@ fn add_comparison(
 }
 
 fn rows_for_repositories(repositories: &[(&VcsRepositorySnapshot, Vec<Change>)]) -> Vec<Row> {
-    let mut rows = repositories
-        .iter()
-        .flat_map(|(repository, changes)| {
-            changes.iter().map(|change| Row {
+    let mut rows = Vec::new();
+    for (repository, changes) in repositories {
+        for (label, untracked) in [("Tracked", false), ("Untracked", true)] {
+            let mut changes = changes
+                .iter()
+                .filter(|change| (change.status == ChangeStatus::Untracked) == untracked)
+                .collect::<Vec<_>>();
+            if changes.is_empty() {
+                continue;
+            }
+            changes.sort_by(|left, right| left.path.cmp(&right.path));
+            rows.push(Row {
                 repository: repository.key.clone(),
-                path: change.path.clone(),
-                label: change
-                    .path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(&change.path)
-                    .to_owned(),
-                change: Some(change.clone()),
-            })
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by(|left, right| left.path.cmp(&right.path));
+                path: String::new(),
+                label: format!("{label} ({})", changes.len()),
+                change: None,
+            });
+            rows.extend(changes.into_iter().map(|change| {
+                Row {
+                    repository: repository.key.clone(),
+                    path: change.path.clone(),
+                    label: change
+                        .path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&change.path)
+                        .to_owned(),
+                    change: Some(change.clone()),
+                }
+            }));
+        }
+    }
     rows
 }
 
@@ -1215,7 +1855,7 @@ impl Render for VcsPanel {
             })
             .unwrap_or_default();
         let discard_reason = self.selected_file().and_then(|row| {
-            discard_unavailable_reason(self.store.as_ref(), &row.repository, &row.path, cx)
+            discard_unavailable_reason(self.store.as_ref(), &row.repository, &row.path, None, cx)
         });
         let unresolved = repository.as_ref().is_some_and(|repository| {
             self.store.as_ref().is_some_and(|store| {
@@ -1265,10 +1905,43 @@ impl Render for VcsPanel {
             .on_action(cx.listener(Self::last_entry))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::secondary_confirm))
-            .on_action(cx.listener(Self::view_file))
-            .on_action(cx.listener(Self::copy_path))
-            .on_action(cx.listener(Self::copy_relative_path))
-            .on_action(cx.listener(Self::toggle_staged))
+            .on_action(cx.listener(|this, _: &git::ViewFile, window, cx| {
+                this.selected_action(FileAction::ViewFile, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &zed_actions::workspace::CopyPath, window, cx| {
+                    this.selected_action(FileAction::CopyPath, window, cx)
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &zed_actions::workspace::CopyRelativePath, window, cx| {
+                    this.selected_action(FileAction::CopyRelativePath, window, cx)
+                },
+            ))
+            .on_action(cx.listener(|this, action: &git::ToggleStaged, window, cx| {
+                if this.focus.is_focused(window) {
+                    this.toggle_staged(action, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &git::FileHistory, window, cx| {
+                this.selected_action(FileAction::History, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &git::AddToGitignore, window, cx| {
+                this.selected_action(FileAction::Ignore, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &git_panel::ViewStagedChanges, window, cx| {
+                    this.selected_action(FileAction::StagedChanges, window, cx)
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &git_panel::ViewUnstagedChanges, window, cx| {
+                    this.selected_action(FileAction::UnstagedChanges, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &git::OpenFileDiff, window, cx| {
+                this.selected_action(FileAction::OpenFileDiff, window, cx)
+            }))
             .on_action(cx.listener(Self::stage_file))
             .on_action(cx.listener(Self::unstage_file))
             .on_action(cx.listener(|this, action: &DiscardFile, window, cx| {
@@ -1278,11 +1951,11 @@ impl Render for VcsPanel {
             }))
             .on_action(cx.listener(Self::commit_staged))
             .on_action(cx.listener(Self::switch_branch))
-            .on_action(cx.listener(|this, _: &git::StageFile, _, cx| {
-                this.run_file_operation(FileOperation::Stage, cx)
+            .on_action(cx.listener(|this, _: &git::StageFile, window, cx| {
+                this.selected_action(FileAction::Stage, window, cx)
             }))
-            .on_action(cx.listener(|this, _: &git::UnstageFile, _, cx| {
-                this.run_file_operation(FileOperation::Unstage, cx)
+            .on_action(cx.listener(|this, _: &git::UnstageFile, window, cx| {
+                this.selected_action(FileAction::Unstage, window, cx)
             }))
             .on_action(cx.listener(|this, _: &git::RestoreFile, window, cx| {
                 if this.focus.is_focused(window) {
@@ -1634,6 +2307,44 @@ mod tests {
     use std::sync::Arc;
     use workspace::MultiWorkspace;
 
+    #[test]
+    fn staging_checkbox_tracks_partial_and_complete_changes() {
+        let mut change = Change {
+            path: "file.txt".into(),
+            old_path: None,
+            status: ChangeStatus::Modified,
+            kind: ContentKind::File,
+            old_mode: None,
+            new_mode: None,
+            file_operations: None,
+            unavailable_reason: None,
+            staged_status: None,
+            unstaged_status: Some(ChangeStatus::Modified),
+        };
+        assert_eq!(staging_state(&change, &[]), ToggleState::Unselected);
+        assert_eq!(
+            staging_operation(staging_state(&change, &[])),
+            FileOperation::Stage
+        );
+        change.staged_status = Some(ChangeStatus::Modified);
+        assert_eq!(staging_state(&change, &[]), ToggleState::Indeterminate);
+        assert_eq!(
+            staging_operation(staging_state(&change, &[])),
+            FileOperation::Stage
+        );
+        change.unstaged_status = None;
+        assert_eq!(staging_state(&change, &[]), ToggleState::Selected);
+        assert_eq!(
+            staging_operation(staging_state(&change, &[])),
+            FileOperation::Unstage
+        );
+        change.staged_status = None;
+        assert_eq!(
+            staging_state(&change, &["file.txt".into()]),
+            ToggleState::Selected
+        );
+    }
+
     #[gpui::test]
     async fn diagnostics_is_read_only_searchable_and_not_persisted(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1749,7 +2460,7 @@ mod tests {
             provider_id: "fixture".into(),
             repository_id: "repository".into(),
         };
-        let key = (repository.clone(), "file.txt".to_owned());
+        let key = (repository.clone(), "file.txt".to_owned(), String::new());
         let comparison = panel
             .update_in(cx, |panel, window, cx| {
                 panel.show_comparison(
@@ -1757,6 +2468,7 @@ mod tests {
                     VcsDiff {
                         buffer: buffer.clone(),
                         diff: diff.clone(),
+                        current_content: ContentSource::Working,
                     },
                     window,
                     cx,
@@ -1798,6 +2510,8 @@ mod tests {
                     new_mode: None,
                     file_operations: None,
                     unavailable_reason: None,
+                    staged_status: None,
+                    unstaged_status: None,
                 }),
             }];
         });
@@ -1811,6 +2525,7 @@ mod tests {
                     VcsDiff {
                         buffer: buffer.clone(),
                         diff,
+                        current_content: ContentSource::Working,
                     },
                     window,
                     cx,
@@ -1954,12 +2669,15 @@ mod tests {
                     new_mode: None,
                     file_operations: None,
                     unavailable_reason: None,
+                    staged_status: None,
+                    unstaged_status: None,
                 }),
             })
             .collect();
-            panel
-                .opened
-                .insert((repository, "working.txt".into()), editor.downgrade());
+            panel.opened.insert(
+                (repository, "working.txt".into(), String::new()),
+                editor.downgrade(),
+            );
             panel.open_file_diff(0, window, cx);
             assert!(
                 panel.error.is_none(),
@@ -1982,6 +2700,35 @@ mod tests {
             panel.open_file_diff(0, window, cx);
             panel.select_next(&menu::SelectNext, window, cx);
             assert!(panel.metadata_notice().is_none());
+        });
+        let target = panel.read_with(cx, |panel, _| panel.target_for_row(&panel.rows[0]).unwrap());
+        let weak_panel = panel.downgrade();
+        let menu = cx.new_window_entity(|window, cx| {
+            ContextMenu::new(window, cx, |menu, _, cx| {
+                file_context_menu(menu, &target, None, false, cx, {
+                    let target = target.clone();
+                    move |action, window, cx| {
+                        weak_panel
+                            .update(cx, |panel, cx| {
+                                panel.dispatch_file_action(target.clone(), action, window, cx)
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+        });
+        panel.update(cx, |panel, _| panel.selected = Some(1));
+        menu.update_in(cx, |menu, window, cx| {
+            menu.select_first(&menu::SelectFirst, window, cx);
+            menu.select_next(&menu::SelectNext, window, cx);
+            menu.confirm(&menu::Confirm, window, cx);
+        });
+        cx.read(|cx| {
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("binary.bin".into()),
+                "menu actions retain their path after selection changes"
+            )
         });
     }
 }

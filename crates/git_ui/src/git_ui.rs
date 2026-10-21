@@ -60,6 +60,7 @@ pub mod stash_picker;
 pub mod text_diff_view;
 pub mod unstaged_diff;
 pub mod vcs_panel;
+pub mod vcs_file_history;
 mod vcs_project_diff;
 mod vcs_repository_ui;
 
