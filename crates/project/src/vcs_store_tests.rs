@@ -170,6 +170,110 @@ async fn file_operation_keeps_its_comparison_after_panel_baseline_changes(cx: &m
 }
 
 #[gpui::test]
+async fn concurrent_comparison_readers_and_buffer_events_keep_the_latest_diff(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new(
+        "concurrent-comparisons",
+        fixture.directory.path(),
+        "file-workflow",
+    )
+    .register(cx);
+    let repository = ready(&fixture, cx).await;
+    let buffer = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let (first, second) = fixture.store.update(cx, |store, cx| {
+        (
+            store.open_buffer_diff(buffer.clone(), cx),
+            store.open_buffer_diff(buffer.clone(), cx),
+        )
+    });
+    let (first, second) = futures::join!(first, second);
+    let working = first.unwrap();
+    assert_eq!(working, second.unwrap());
+    let unstaged = fixture
+        .store
+        .update(cx, |store, cx| {
+            store.open_diff_for_baseline(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                "unstaged".into(),
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    std::fs::write(
+        fixture
+            .directory
+            .path()
+            .join("concurrent-comparisons.jsonl.index"),
+        "new index\n",
+    )
+    .unwrap();
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.load_comparison(repository.key.clone(), "unstaged".into(), cx)
+        })
+        .await
+        .unwrap();
+    let (first, second) = fixture.store.update(cx, |store, cx| {
+        (
+            store.open_diff_for_baseline(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                "unstaged".into(),
+                cx,
+            ),
+            store.open_diff_for_baseline(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                "unstaged".into(),
+                cx,
+            ),
+        )
+    });
+    for index in 0..8 {
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..buffer.len(), format!("unsaved {index}\n"))], None, cx);
+            cx.emit(BufferEvent::Reloaded);
+        });
+        cx.background_executor.timer(Duration::from_millis(1)).await;
+    }
+    let (first, second) = futures::join!(first, second);
+    assert_eq!(first.unwrap().diff, unstaged.diff);
+    assert_eq!(second.unwrap().diff, unstaged.diff);
+    for (diff, base) in [(&working, "A\n"), (&unstaged.diff, "new index\n")] {
+        cx.condition(diff, |diff, cx| {
+            diff.base_text(cx).text() == base
+                && diff.snapshot(cx).buffer_snapshot().text() == "unsaved 7\n"
+        })
+        .await;
+    }
+    buffer.read_with(cx, |buffer, _| {
+        assert_eq!(buffer.text(), "unsaved 7\n");
+        assert!(buffer.is_dirty());
+    });
+    assert_eq!(
+        fixture
+            .fs
+            .load(&fixture.directory.path().join("src/example.txt"))
+            .await
+            .unwrap(),
+        "working text\n"
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
 async fn comparison_sides_preserve_index_and_dirty_working_buffer(cx: &mut TestAppContext) {
     let fixture = fixture(cx, true).await;
     trust(&fixture, cx);
@@ -1622,6 +1726,18 @@ async fn prepared_branch_switch_is_rejected_after_git_takes_scope_ownership(
         .project
         .update(cx, |project, cx| project.git_scans_complete(cx))
         .await;
+    let git = fixture.store.read_with(cx, |store, _| store.git.clone());
+    cx.condition(&git, |git, cx| {
+        git.repository_and_path_for_project_path(
+            &ProjectPath {
+                worktree_id: fixture.worktree_id,
+                path: Arc::from(RelPath::empty()),
+            },
+            cx,
+        )
+        .is_some()
+    })
+    .await;
     fixture.store.read_with(cx, |store, cx| {
         assert!(store.repositories.contains_key(&repository.key));
         assert!(

@@ -145,6 +145,10 @@ pub struct VcsDiff {
 struct ComparisonDiff {
     buffer: WeakEntity<Buffer>,
     diff: WeakEntity<BufferDiff>,
+    base: Option<Arc<str>>,
+    generation: u64,
+    update_task: Option<Task<()>>,
+    waiters: Vec<futures::channel::oneshot::Sender<()>>,
     _subscription: Subscription,
 }
 
@@ -2656,7 +2660,7 @@ impl VcsStore {
                     }
                 }
             };
-            let (diff, update) = this.update(cx, |this, cx| {
+            let (diff, updated) = this.update(cx, |this, cx| {
                 this.check_comparison(&key, &path, &connection, &snapshot, cx)?;
                 let repository = this
                     .repositories
@@ -2690,40 +2694,97 @@ impl VcsStore {
                         diff.set_operations(Arc::new(ReadOnlyDiffOperations));
                         diff
                     });
+                    let repository_key = key.clone();
+                    let comparison_key = cache_key.clone();
+                    let subscription = cx.subscribe(&buffer, move |this, _, event, cx| {
+                        if matches!(event, BufferEvent::Edited { .. } | BufferEvent::Reloaded) {
+                            this.update_comparison_diff(&repository_key, &comparison_key, cx);
+                        }
+                    });
+                    repository.comparison_diffs.insert(
+                        cache_key.clone(),
+                        ComparisonDiff {
+                            buffer: buffer.downgrade(),
+                            diff: diff.downgrade(),
+                            base: None,
+                            generation: 0,
+                            update_task: None,
+                            waiters: Vec::new(),
+                            _subscription: subscription,
+                        },
+                    );
                     diff
                 };
-                let weak_diff = diff.downgrade();
-                let current_base = base.clone();
-                let subscription = cx.subscribe(&buffer, move |_, buffer, event, cx| {
-                    if matches!(event, BufferEvent::Edited { .. } | BufferEvent::Reloaded) {
-                        if let Some(diff) = weak_diff.upgrade() {
-                            let text = buffer.read(cx).text_snapshot();
-                            diff.update(cx, |diff, cx| {
-                                diff.set_base_text(current_base.clone(), text, cx)
-                            })
-                            .detach();
-                        }
-                    }
-                });
-                repository.comparison_diffs.insert(
-                    cache_key,
-                    ComparisonDiff {
-                        buffer: buffer.downgrade(),
-                        diff: diff.downgrade(),
-                        _subscription: subscription,
-                    },
-                );
-                let text = buffer.read(cx).text_snapshot();
-                let update = diff.update(cx, |diff, cx| diff.set_base_text(base, text, cx));
-                Ok((diff, update))
+                let state = repository
+                    .comparison_diffs
+                    .get_mut(&cache_key)
+                    .context("VCS comparison closed")?;
+                state.base = base;
+                let (sender, receiver) = futures::channel::oneshot::channel();
+                state.waiters.retain(|waiter| !waiter.is_canceled());
+                state.waiters.push(sender);
+                this.update_comparison_diff(&key, &cache_key, cx);
+                Ok((diff, receiver))
             })??;
-            update.await;
+            updated
+                .await
+                .context("VCS comparison update was interrupted")?;
             Ok(VcsDiff {
                 buffer,
                 diff,
                 current_content: vcs::ContentSource::Working,
             })
         })
+    }
+
+    fn update_comparison_diff(
+        &mut self,
+        repository_key: &VcsRepositoryId,
+        comparison_key: &(String, String),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self
+            .repositories
+            .get_mut(repository_key)
+            .and_then(|repository| repository.comparison_diffs.get_mut(comparison_key))
+        else {
+            return;
+        };
+        state.update_task = None;
+        let Some((buffer, diff)) = state.buffer.upgrade().zip(state.diff.upgrade()) else {
+            state.waiters.clear();
+            return;
+        };
+        state.generation += 1;
+        let generation = state.generation;
+        let snapshot = buffer.read(cx).text_snapshot();
+        let update = diff.update(cx, |diff, cx| {
+            diff.set_base_text(state.base.clone(), snapshot, cx)
+        });
+        let repository_key = repository_key.clone();
+        let comparison_key = comparison_key.clone();
+        state.update_task = Some(cx.spawn(async move |this, cx| {
+            update.await;
+            this.update(cx, |this, _| {
+                let Some(state) = this
+                    .repositories
+                    .get_mut(&repository_key)
+                    .and_then(|repository| repository.comparison_diffs.get_mut(&comparison_key))
+                else {
+                    return;
+                };
+                if state.generation != generation {
+                    return;
+                }
+                state.update_task = None;
+                for waiter in state.waiters.drain(..) {
+                    if waiter.send(()).is_err() {
+                        log::debug!("VCS comparison consumer closed");
+                    }
+                }
+            })
+            .log_err();
+        }));
     }
 
     fn check_comparison(
