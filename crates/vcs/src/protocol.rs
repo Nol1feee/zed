@@ -27,6 +27,8 @@ pub struct InitializeParams {
 pub struct ProviderCapabilities {
     pub read_only: bool,
     #[serde(default)]
+    pub blame: bool,
+    #[serde(default)]
     pub file_operations: Vec<FileOperation>,
     #[serde(default)]
     pub repository_operations: Vec<RepositoryOperationKind>,
@@ -647,6 +649,9 @@ pub struct Snapshot {
     /// Immutable identity of the selected baseline contents, not necessarily the current revision.
     /// Reusing this identity allows the host to retain already loaded baseline contents.
     pub revision_id: String,
+    /// Current committed revision, independent of the selected comparison baseline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_revision_id: Option<String>,
     pub changes: Vec<Change>,
 }
 
@@ -660,6 +665,9 @@ impl Snapshot {
             self.repository_id == repository_id && self.baseline_id == baseline_id,
             "VCS snapshot belongs to another repository or baseline"
         );
+        if let Some(head) = &self.head_revision_id {
+            validate_revision_id(head)?;
+        }
         let mut paths = std::collections::HashSet::new();
         for change in &self.changes {
             validate_path(&change.path)?;
@@ -685,6 +693,147 @@ pub enum Content {
     Symlink { target: String },
 }
 
+pub const MAX_BLAME_CONTENT_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_BLAME_LINES: usize = 100_000;
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Blame {
+    pub revision_id: String,
+    pub content: String,
+    pub entries: Vec<BlameEntry>,
+    pub commits: Vec<BlameCommit>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BlameEntry {
+    /// Zero-based, half-open rows in the committed content, excluding a trailing empty row.
+    pub start_line: u32,
+    pub end_line: u32,
+    pub commit_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BlameCommit {
+    pub revision_id: String,
+    pub author: Option<String>,
+    pub author_time: Option<i64>,
+    pub summary: Option<String>,
+    pub message: Option<String>,
+    pub commit_url: Option<String>,
+}
+
+fn validate_revision_id(revision: &str) -> Result<()> {
+    ensure!(
+        !revision.is_empty() && revision.len() <= 4096 && !revision.chars().any(char::is_control),
+        "invalid VCS revision identity"
+    );
+    Ok(())
+}
+
+impl Blame {
+    pub fn validate(&self) -> Result<()> {
+        validate_revision_id(&self.revision_id)?;
+        ensure!(
+            self.content.len() <= MAX_BLAME_CONTENT_BYTES && !self.content.contains('\0'),
+            "VCS blame content is too large or binary"
+        );
+        let line_count = self.content.lines().count();
+        ensure!(
+            line_count <= MAX_BLAME_LINES
+                && self.entries.len() <= line_count
+                && self.commits.len() <= self.entries.len(),
+            "VCS blame exceeds its line or record limit"
+        );
+        let mut commits = std::collections::HashSet::new();
+        for commit in &self.commits {
+            validate_revision_id(&commit.revision_id)?;
+            ensure!(
+                commits.insert(commit.revision_id.as_str()),
+                "duplicate VCS blame commit"
+            );
+            for (value, limit) in [
+                (commit.author.as_deref(), 4096),
+                (commit.summary.as_deref(), 16 * 1024),
+                (commit.message.as_deref(), 64 * 1024),
+            ] {
+                ensure!(
+                    value.is_none_or(|value| value.len() <= limit && !value.contains('\0')),
+                    "invalid VCS blame metadata"
+                );
+            }
+            if let Some(timestamp) = commit.author_time {
+                ensure!(
+                    (-62_135_596_800..=253_402_300_799).contains(&timestamp),
+                    "invalid VCS blame author timestamp"
+                );
+            }
+            if let Some(commit_url) = &commit.commit_url {
+                ensure!(commit_url.len() <= 8192, "VCS blame commit URL is too long");
+                let url = url::Url::parse(commit_url).context("invalid VCS blame commit URL")?;
+                ensure!(
+                    url.scheme() == "https"
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none(),
+                    "VCS blame commit URL must use HTTPS without credentials"
+                );
+            }
+        }
+        let mut next_line = 0;
+        let mut referenced = std::collections::HashSet::new();
+        for entry in &self.entries {
+            ensure!(
+                entry.start_line == next_line
+                    && entry.end_line > entry.start_line
+                    && entry.end_line as usize <= line_count,
+                "invalid or incomplete VCS blame line ranges"
+            );
+            ensure!(
+                commits.contains(entry.commit_id.as_str()),
+                "unknown VCS blame commit"
+            );
+            referenced.insert(entry.commit_id.as_str());
+            next_line = entry.end_line;
+        }
+        ensure!(
+            next_line as usize == line_count && referenced.len() == commits.len(),
+            "incomplete VCS blame attribution"
+        );
+        Ok(())
+    }
+
+    pub fn estimated_size(&self) -> usize {
+        self.content.len()
+            + self.revision_id.len()
+            + self
+                .entries
+                .iter()
+                .map(|entry| std::mem::size_of::<BlameEntry>() + entry.commit_id.len())
+                .sum::<usize>()
+            + self
+                .commits
+                .iter()
+                .map(|commit| {
+                    std::mem::size_of::<BlameCommit>()
+                        + commit.revision_id.len()
+                        + [
+                            &commit.author,
+                            &commit.summary,
+                            &commit.message,
+                            &commit.commit_url,
+                        ]
+                        .iter()
+                        .filter_map(|value| value.as_ref())
+                        .map(|value| value.len())
+                        .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, thiserror::Error)]
 #[error("{message} (VCS error {code})")]
 pub struct ProviderError {
@@ -697,6 +846,100 @@ pub struct ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blame_is_optional_and_independent_of_writes() {
+        let mut result: InitializeResult = serde_json::from_value(serde_json::json!({
+            "protocolVersion": 1, "serverInfo": {"name": "fixture", "version": "1"},
+            "capabilities": {"readOnly": true}
+        }))
+        .expect("legacy initialization");
+        assert!(!result.capabilities.blame);
+        result.capabilities.blame = true;
+        result
+            .validate()
+            .expect("read-only protocol 1 can support blame");
+        result.protocol_version = 2;
+        result
+            .validate()
+            .expect("read-only protocol 2 can support blame");
+        assert!(
+            !result
+                .capabilities
+                .supports_file_operation(FileOperation::Stage)
+        );
+    }
+
+    fn sample_blame() -> Blame {
+        serde_json::from_value(serde_json::json!({
+            "revisionId": "revision:42", "content": "one\ntwo\n",
+            "entries": [{"startLine": 0, "endLine": 2, "commitId": "change:original"}],
+            "commits": [{"revisionId": "change:original", "author": "Author", "authorTime": 1700000000,
+                "message": "Commit message", "commitUrl": "https://example.test/revision/original"}]
+        })).expect("blame fixture")
+    }
+
+    #[test]
+    fn blame_validates_bounded_complete_attribution_and_opaque_revisions() {
+        let blame = sample_blame();
+        blame.validate().expect("opaque revision IDs");
+        for invalid in [
+            {
+                let mut value = blame.clone();
+                value.entries[0].start_line = 1;
+                value
+            },
+            {
+                let mut value = blame.clone();
+                value.entries[0].end_line = 3;
+                value
+            },
+            {
+                let mut value = blame.clone();
+                value.entries[0].commit_id = "missing".into();
+                value
+            },
+            {
+                let mut value = blame.clone();
+                value.commits.push(value.commits[0].clone());
+                value
+            },
+            {
+                let mut value = blame.clone();
+                value.content = "x".repeat(MAX_BLAME_CONTENT_BYTES + 1);
+                value
+            },
+            {
+                let mut value = blame.clone();
+                value.commits[0].commit_url = Some("javascript:alert(1)".into());
+                value
+            },
+            {
+                let mut value = blame.clone();
+                value.commits[0].commit_url = Some("https://user:password@example.test".into());
+                value
+            },
+            {
+                let mut value = blame.clone();
+                value.commits[0].author_time = Some(i64::MAX);
+                value
+            },
+            {
+                let mut value = blame;
+                value.revision_id = "bad\nrevision".into();
+                value
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+        let empty = Blame {
+            content: String::new(),
+            entries: Vec::new(),
+            commits: Vec::new(),
+            revision_id: "empty:revision".into(),
+        };
+        empty.validate().expect("empty committed file");
+    }
 
     #[test]
     fn neutral_snapshot_uses_opaque_ids_and_requires_no_index() {

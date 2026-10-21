@@ -40684,7 +40684,7 @@ async fn test_hide_pending_blame_popover_when_modal_opens(cx: &mut TestAppContex
         );
         editor.show_blame_popover(
             buffer_id,
-            &::git::blame::BlameEntry {
+            &crate::DisplayBlameEntry::Git(::git::blame::BlameEntry {
                 sha: "1b1b1b".parse().unwrap(),
                 range: 0..1,
                 original_line_number: 0,
@@ -40700,7 +40700,7 @@ async fn test_hide_pending_blame_popover_when_modal_opens(cx: &mut TestAppContex
                 previous: None,
                 filename: String::new(),
                 boundary: false,
-            },
+            }),
             gpui::point(gpui::px(0.), gpui::px(0.)),
             false,
             cx,

@@ -133,6 +133,7 @@ enum RefreshReason {
 pub enum VcsStoreEvent {
     Updated,
     DiffChanged { worktree_id: WorktreeId },
+    BlameChanged { worktree_id: WorktreeId },
 }
 
 pub struct VcsDiff {
@@ -145,6 +146,9 @@ struct Repository {
     connection: Arc<ProviderConnection>,
     generation: u64,
     refresh_task: Option<Task<()>>,
+    blame_head: Option<String>,
+    blame_generation: u64,
+    blames: HashMap<String, Arc<vcs::Blame>>,
     checkout_generation: u64,
     checkout_task: Option<Task<()>>,
 }
@@ -792,6 +796,7 @@ impl VcsStore {
                                 .cloned()
                                 .collect();
                             for key in keys {
+                                this.set_blame_head(&key, None, cx);
                                 this.refresh_with_reason(&key, RefreshReason::Background, cx);
                             }
                         }
@@ -888,6 +893,9 @@ impl VcsStore {
                     connection: connection.clone(),
                     generation: 0,
                     refresh_task: None,
+                    blame_head: None,
+                    blame_generation: 0,
+                    blames: HashMap::default(),
                     checkout_generation: 0,
                     checkout_task: None,
                 },
@@ -912,6 +920,7 @@ impl VcsStore {
                         "Multiple VCS providers claim this folder; disable one provider".into(),
                     );
                 }
+                self.set_blame_head(&owner, None, cx);
                 self.invalidate_diffs(&owner, Some("VCS ownership is ambiguous"), cx);
             }
         }
@@ -963,6 +972,7 @@ impl VcsStore {
                 state.view.checkout_loading = false;
                 state.view.checkout_error = Some(message.clone().into());
             }
+            self.set_blame_head(&repository, None, cx);
             self.invalidate_diffs(&repository, Some(&message), cx);
         }
         self.notify(cx);
@@ -989,6 +999,7 @@ impl VcsStore {
             .cloned()
             .collect();
         for repository in repositories {
+            self.set_blame_head(&repository, None, cx);
             self.invalidate_diffs(&repository, Some("VCS repository closed"), cx);
             self.repositories.remove(&repository);
         }
@@ -1183,8 +1194,10 @@ impl VcsStore {
                                     || previous.revision_id != snapshot.revision_id
                                     || previous.changes != snapshot.changes
                             });
+                        let head = snapshot.head_revision_id.clone();
                         repository.view.snapshot = Some(Arc::new(snapshot));
                         repository.view.error = None;
+                        this.set_blame_head(&key, head, cx);
                         if changed {
                             let closed_buffers: Vec<_> = this
                                 .diffs
@@ -1214,6 +1227,7 @@ impl VcsStore {
                     Err(error) => {
                         let message = format!("{error:#}");
                         repository.view.error = Some(message.clone().into());
+                        this.set_blame_head(&key, None, cx);
                         this.invalidate_diffs(&key, Some(&message), cx);
                         true
                     }
@@ -1278,6 +1292,163 @@ impl VcsStore {
 
     pub fn owns_project_path(&self, path: &ProjectPath, cx: &App) -> bool {
         self.repository_for_path(path, cx).is_some()
+    }
+
+    fn set_blame_head(
+        &mut self,
+        key: &VcsRepositoryId,
+        head: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repository) = self.repositories.get_mut(key) else {
+            return;
+        };
+        if repository.blame_head != head {
+            repository.blame_head = head;
+            repository.blame_generation += 1;
+            repository.blames.clear();
+            cx.emit(VcsStoreEvent::BlameChanged {
+                worktree_id: key.worktree_id,
+            });
+        }
+    }
+
+    pub fn has_provider_blame(&self, buffer: &Entity<Buffer>, cx: &App) -> bool {
+        buffer
+            .read(cx)
+            .project_path(cx)
+            .and_then(|path| self.repository_for_path(&path, cx))
+            .and_then(|key| self.repositories.get(&key))
+            .is_some_and(|repository| {
+                repository.connection.is_alive()
+                    && repository.view.error.is_none()
+                    && repository.blame_head.is_some()
+                    && repository
+                        .connection
+                        .capabilities()
+                        .is_some_and(|capabilities| capabilities.blame)
+            })
+    }
+
+    pub fn blame_buffer(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<Arc<vcs::Blame>>>> {
+        if !self.has_provider_blame(buffer, cx) {
+            return Task::ready(Ok(None));
+        }
+        let request = (|| {
+            let project_path = buffer
+                .read(cx)
+                .project_path(cx)
+                .context("buffer has no VCS path")?;
+            let key = self
+                .repository_for_path(&project_path, cx)
+                .context("buffer has no unambiguous VCS provider")?;
+            ensure!(
+                self.trusted(key.worktree_id, cx),
+                "VCS worktree is not trusted"
+            );
+            let repository = self
+                .repositories
+                .get(&key)
+                .context("VCS repository closed")?;
+            let head = repository
+                .blame_head
+                .clone()
+                .context("VCS HEAD is unavailable")?;
+            let path = project_path.path.as_unix_str().to_owned();
+            vcs::validate_path(&path)?;
+            let root = vcs::local_path(&repository.view.descriptor.scope_uri)?;
+            let cached = repository.blames.get(&path).cloned();
+            Ok((
+                key,
+                project_path,
+                path,
+                root,
+                head,
+                repository.blame_generation,
+                repository.connection.clone(),
+                cached,
+            ))
+        })();
+        let (key, project_path, path, root, head, generation, connection, cached) = match request {
+            Ok(request) => request,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let fs = self.fs.clone();
+        let buffer = buffer.downgrade();
+        cx.spawn(async move |this, cx| {
+            let metadata = scoped_metadata(&root, &path, &fs).await?;
+            ensure!(
+                metadata.is_none_or(|metadata| !metadata.is_dir && !metadata.is_symlink),
+                "VCS blame requires a regular file"
+            );
+            let blame = match cached {
+                Some(blame) => blame,
+                None => Arc::new(
+                    connection
+                        .blame(key.repository_id.clone(), path.clone())
+                        .await?,
+                ),
+            };
+            ensure!(
+                blame.revision_id == head,
+                "VCS blame HEAD changed during the request"
+            );
+            this.update(cx, |this, cx| {
+                ensure!(
+                    this.trusted(key.worktree_id, cx),
+                    "VCS worktree is no longer trusted"
+                );
+                ensure!(
+                    this.repository_for_path(&project_path, cx).as_ref() == Some(&key),
+                    "VCS blame owner changed"
+                );
+                ensure!(
+                    buffer.upgrade().is_some_and(|buffer| buffer
+                        .read(cx)
+                        .project_path(cx)
+                        .as_ref()
+                        == Some(&project_path)),
+                    "VCS blame buffer path changed"
+                );
+                let repository = this
+                    .repositories
+                    .get(&key)
+                    .context("VCS repository closed")?;
+                ensure!(
+                    repository.connection.is_alive()
+                        && Arc::ptr_eq(&repository.connection, &connection)
+                        && repository.blame_generation == generation
+                        && repository.blame_head.as_ref() == Some(&head)
+                        && repository.view.error.is_none(),
+                    "VCS blame response is stale"
+                );
+                if let Some(cached) = repository.blames.get(&path) {
+                    return Ok(Some(cached.clone()));
+                }
+                let (count, size) = this
+                    .repositories
+                    .values()
+                    .flat_map(|repository| repository.blames.values())
+                    .fold((0, 0), |(count, size), blame| {
+                        (count + 1, size + blame.estimated_size())
+                    });
+                if count >= 16 || size + blame.estimated_size() > 32 * 1024 * 1024 {
+                    for repository in this.repositories.values_mut() {
+                        repository.blames.clear();
+                    }
+                }
+                this.repositories
+                    .get_mut(&key)
+                    .context("VCS repository closed")?
+                    .blames
+                    .insert(path, blame.clone());
+                Ok(Some(blame))
+            })?
+        })
     }
 
     pub fn file_operations(&self, key: &VcsRepositoryId) -> Vec<FileOperation> {

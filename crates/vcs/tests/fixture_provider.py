@@ -67,6 +67,8 @@ FILE_KIND_SCENARIOS = {"file-kinds", "file-kinds-missing-summary", "file-kinds-b
                        "file-kinds-old-parent", "file-kinds-old-directory"}
 SCENARIOS += tuple(sorted(FILE_KIND_SCENARIOS))
 WRITABLE_SCENARIOS.update(FILE_KIND_SCENARIOS)
+BLAME_SCENARIOS = {"blame", "blame-malformed", "blame-stale", "blame-pending", "blame-missing-head"}
+SCENARIOS += tuple(sorted(BLAME_SCENARIOS))
 SEND_LOCK = threading.Lock()
 
 
@@ -303,6 +305,8 @@ def main():
                     capabilities = {"readOnly": True, "checkoutCatalog": True}
                 else:
                     capabilities.update(checkoutCatalog=True, checkoutOperations=["create", "open", "prepare", "suspend", "remove"])
+            if args.scenario in BLAME_SCENARIOS:
+                capabilities["blame"] = True
             reply(identifier, {"protocolVersion": version, "serverInfo": {"name": "fixture", "version": "1"}, "capabilities": capabilities})
         elif method == "vcs/discover":
             reply(identifier, [{"id": "fixture-repository", "rootUri": params["scopeUri"], "scopeUri": params["scopeUri"],
@@ -335,6 +339,11 @@ def main():
             previous = params["baselineId"] == "previous"
             snapshot = {"id": "snapshot:previous" if previous else "snapshot:7", "repositoryId": params["repositoryId"], "baselineId": params["baselineId"],
                         "revisionId": "r41" if previous else "r42", "changes": [{"path": "src/example.txt", "status": "modified", "kind": "file", "oldMode": 33188, "newMode": 33188}]}
+            if args.scenario in BLAME_SCENARIOS:
+                marker = Path(str(args.events) + ".revision") if args.events else None
+                head = marker.read_text().strip() if marker and marker.is_file() else "revision:42"
+                if args.scenario != "blame-missing-head":
+                    snapshot["headRevisionId"] = head
             if args.scenario in REPOSITORY_SCENARIOS:
                 snapshot["id"] = f"snapshot:repository:{snapshots}"
                 snapshot["revisionId"] = f"{repository_branch}:{repository_commits}:{repository_head}"
@@ -360,6 +369,22 @@ def main():
             if args.scenario == "reordered" and held_snapshot is not None:
                 reply(*held_snapshot)
                 held_snapshot = None
+        elif method == "vcs/blame":
+            marker = Path(str(args.events) + ".revision") if args.events else None
+            head = marker.read_text().strip() if marker and marker.is_file() else "revision:42"
+            result = {"revisionId": "stale-head" if args.scenario == "blame-stale" else head,
+                      "content": "first committed line\nsecond committed line\n",
+                      "entries": [{"startLine": 0, "endLine": 2, "commitId": "revision:original"}],
+                      "commits": [{"revisionId": "revision:original", "author": "Fixture author",
+                                   "authorTime": 1700000000, "summary": "Fixture commit",
+                                   "message": "Fixture commit\n\nMore details", "commitUrl": "https://example.test/commit/original"}]}
+            if args.scenario == "blame-malformed":
+                result["entries"][0]["endLine"] = 99
+            if args.scenario == "blame-pending":
+                record("blame-held", id=identifier)
+                threading.Thread(target=release_reply, args=(identifier, result, "blame-released"), daemon=True).start()
+            else:
+                reply(identifier, result)
         elif method == "vcs/readContent":
             if args.scenario == "changing-slow-content":
                 record("content-held", id=identifier, snapshot_id=params["snapshotId"])

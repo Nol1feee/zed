@@ -532,6 +532,9 @@ fn observe(
     let workspaces = workspaces.into_iter().map(|(handle, workspace)| {
         let current = handle == window && Some(workspace.entity_id()) == active;
         cx.update_window(handle, |_, window, cx| {
+            let active_editor = workspace.read(cx).active_item(cx)
+                .and_then(|item| item.act_as::<editor::Editor>(cx));
+            let blame_state = active_editor.as_ref().map(|editor| observe_blame(editor, cx));
             let workspace = workspace.read(cx);
             let vcs_panel_registered = workspace.all_docks().into_iter().any(|dock| {
                 dock.read(cx).panel_index_for_persistent_name("VcsPanel", cx).is_some()
@@ -590,6 +593,7 @@ fn observe(
                 "active_item_kind": active_item_kind,
                 "active_item_title": active_item.as_ref().map(|item| item.tab_content_text(0, cx)),
                 "active_item_buffers": buffers,
+                "blame": blame_state,
                 "active_diff_split": split_editor.as_ref().map(|editor| editor.read(cx).is_split()),
                 "panels": {
                     "git": {
@@ -617,4 +621,51 @@ fn observe(
             .unwrap_or(false)
     );
     Ok(state)
+}
+
+fn observe_blame(editor: &Entity<editor::Editor>, cx: &mut gpui::App) -> Value {
+    let (inline, gutter, blame, rows) = {
+        let editor = editor.read(cx);
+        let rows = editor
+            .buffer()
+            .read(cx)
+            .all_buffers_iter()
+            .flat_map(|buffer| {
+                let buffer = buffer.read(cx);
+                let buffer_id = buffer.remote_id();
+                (0..=buffer.snapshot().max_point().row.min(11)).map(move |row| editor::RowInfo {
+                    buffer_id: Some(buffer_id),
+                    buffer_row: Some(row),
+                    ..Default::default()
+                })
+            })
+            .collect::<Vec<_>>();
+        (
+            editor.git_blame_inline_enabled(),
+            editor.show_git_blame_gutter(),
+            editor.blame().cloned(),
+            rows,
+        )
+    };
+    let Some(blame) = blame else {
+        return json!({"inline": inline, "gutter": gutter, "generated": false, "rows": []});
+    };
+    blame.update(cx, |blame, cx| {
+        let generated = blame.has_generated_entries();
+        let entries = blame
+            .blame_for_rows(&rows, cx)
+            .enumerate()
+            .map(|(index, entry)| {
+                json!({
+                    "row": rows.get(index).and_then(|row| row.buffer_row),
+                    "entry": entry.map(|(_, entry)| json!({
+                        "revisionId": entry.revision_id(),
+                        "author": entry.author(),
+                        "provider": matches!(entry, editor::DisplayBlameEntry::Provider(_)),
+                    }))
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({"inline": inline, "gutter": gutter, "generated": generated, "rows": entries})
+    })
 }

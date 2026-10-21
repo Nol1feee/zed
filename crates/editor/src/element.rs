@@ -26,7 +26,7 @@ use crate::{
         CurrentLineHighlight, DocumentColorsRenderMode, GitGutterWidth, Minimap, MinimapThumb,
         MinimapThumbBorder, ScrollBeyondLastLine, ScrollbarAxes, ScrollbarDiagnostics, ShowMinimap,
     },
-    git::blame::{BlameRenderer, GitBlame, GlobalBlameRenderer},
+    git::blame::{BlameRenderer, DisplayBlameEntry, GitBlame, GlobalBlameRenderer},
     hover_popover::{
         self, HOVER_POPOVER_GAP, MIN_POPOVER_CHARACTER_WIDTH, MIN_POPOVER_LINE_HEIGHT,
         POPOVER_RIGHT_OFFSET,
@@ -40,7 +40,9 @@ use crate::{
 use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
 use collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
-use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage};
+#[cfg(test)]
+use git::blame::BlameEntry;
+use git::commit::ParsedCommitMessage;
 use gpui::{
     Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, BorderStyle,
     Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase, Edges,
@@ -155,7 +157,7 @@ struct InlineBlameLayout {
     element: AnyElement,
     bounds: Bounds<Pixels>,
     buffer_id: BufferId,
-    entry: BlameEntry,
+    entry: DisplayBlameEntry,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2346,7 +2348,7 @@ impl EditorElement {
         };
         let start_x = em_width;
 
-        let mut last_used_color: Option<(Hsla, Oid)> = None;
+        let mut last_used_color: Option<(Hsla, String)> = None;
         let blame_renderer = cx.global::<GlobalBlameRenderer>().0.clone();
 
         let shaped_lines = blamed_rows
@@ -7265,16 +7267,21 @@ fn apply_dirty_filename_style(
 }
 
 fn render_inline_blame_entry(
-    blame_entry: BlameEntry,
+    blame_entry: DisplayBlameEntry,
     style: &EditorStyle,
     cx: &mut App,
 ) -> Option<AnyElement> {
     let renderer = cx.global::<GlobalBlameRenderer>().0.clone();
-    renderer.render_inline_blame_entry(&style.text, blame_entry, cx)
+    match blame_entry {
+        DisplayBlameEntry::Git(entry) => renderer.render_inline_blame_entry(&style.text, entry, cx),
+        DisplayBlameEntry::Provider(commit) => {
+            renderer.render_provider_inline_blame_entry(&style.text, commit, cx)
+        }
+    }
 }
 
 fn render_blame_entry_popover(
-    blame_entry: BlameEntry,
+    blame_entry: DisplayBlameEntry,
     scroll_handle: ScrollHandle,
     commit_message: Option<ParsedCommitMessage>,
     markdown: Entity<Markdown>,
@@ -7289,9 +7296,21 @@ fn render_blame_entry_popover(
     }
 
     let renderer = cx.global::<GlobalBlameRenderer>().0.clone();
+    if let DisplayBlameEntry::Provider(commit) = &blame_entry {
+        return renderer.render_provider_blame_entry_popover(
+            commit.clone(),
+            scroll_handle,
+            markdown,
+            window,
+            cx,
+        );
+    }
     let blame = blame.read(cx);
     let repository = blame.repository(cx, buffer)?;
     let tag_names = blame.tag_names_for_entry(buffer, &blame_entry);
+    let DisplayBlameEntry::Git(blame_entry) = blame_entry else {
+        return None;
+    };
     renderer.render_blame_entry_popover(
         blame_entry,
         scroll_handle,
@@ -7308,9 +7327,9 @@ fn render_blame_entry_popover(
 fn render_blame_entry(
     ix: usize,
     blame: &Entity<GitBlame>,
-    blame_entry: BlameEntry,
+    blame_entry: DisplayBlameEntry,
     style: &EditorStyle,
-    last_used_color: &mut Option<(Hsla, Oid)>,
+    last_used_color: &mut Option<(Hsla, String)>,
     editor: Entity<Editor>,
     workspace: Entity<Workspace>,
     buffer: BufferId,
@@ -7318,23 +7337,51 @@ fn render_blame_entry(
     window: &mut Window,
     cx: &mut App,
 ) -> Option<AnyElement> {
-    let index: u32 = blame_entry.sha.into();
+    let revision_id = blame_entry.revision_id();
+    let index: u32 = match &blame_entry {
+        DisplayBlameEntry::Git(entry) => entry.sha.into(),
+        DisplayBlameEntry::Provider(_) => {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            revision_id.hash(&mut hasher);
+            hasher.finish() as u32
+        }
+    };
     let mut sha_color = cx.theme().players().color_for_participant(index).cursor;
 
     // If the last color we used is the same as the one we get for this line, but
     // the commit SHAs are different, then we try again to get a different color.
-    if let Some((color, sha)) = *last_used_color
-        && sha != blame_entry.sha
-        && color == sha_color
+    if let Some((color, sha)) = last_used_color.as_ref()
+        && *sha != revision_id
+        && *color == sha_color
     {
-        sha_color = cx.theme().players().color_for_participant(index + 1).cursor;
+        sha_color = cx
+            .theme()
+            .players()
+            .color_for_participant(index.wrapping_add(1))
+            .cursor;
     }
-    last_used_color.replace((sha_color, blame_entry.sha));
+    last_used_color.replace((sha_color, revision_id));
+
+    if let DisplayBlameEntry::Provider(commit) = &blame_entry {
+        return renderer.render_provider_blame_entry(
+            &style.text,
+            commit.clone(),
+            editor,
+            ix,
+            sha_color,
+            window,
+            cx,
+        );
+    }
 
     let blame = blame.read(cx);
     let details = blame.details_for_entry(buffer, &blame_entry);
     let tag_names = blame.tag_names_for_entry(buffer, &blame_entry);
     let repository = blame.repository(cx, buffer)?;
+    let DisplayBlameEntry::Git(blame_entry) = blame_entry else {
+        return None;
+    };
     renderer.render_blame_entry(
         &style.text,
         blame_entry,
@@ -10718,7 +10765,7 @@ pub(crate) struct PositionMap {
     pub content_origin: gpui::Point<Pixels>,
     pub text_hitbox: Hitbox,
     pub gutter_hitbox: Hitbox,
-    pub inline_blame_bounds: Option<(Bounds<Pixels>, BufferId, BlameEntry)>,
+    pub inline_blame_bounds: Option<(Bounds<Pixels>, BufferId, DisplayBlameEntry)>,
     pub display_hunks: Vec<(DisplayDiffHunk, Option<Hitbox>)>,
     pub diff_hunk_control_bounds: Vec<(DisplayRow, Bounds<Pixels>)>,
 }

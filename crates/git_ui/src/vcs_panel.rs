@@ -8,7 +8,7 @@ use editor::{Editor, EditorSettings, SplittableEditor};
 use file_icons::FileIcons;
 use gpui::{
     Action, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel,
-    ScrollStrategy, Subscription, UniformListScrollHandle, WeakEntity, Window, actions,
+    ScrollStrategy, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions,
     uniform_list,
 };
 use language::{Buffer, Capability};
@@ -20,8 +20,8 @@ use project::{
 };
 use settings::{GitPanelClickBehavior, Settings};
 use ui::{
-    Button, ButtonLike, Color, IconButton, IconName, Label, ListItem, ListItemSpacing, Tab,
-    Tooltip, prelude::*,
+    Button, ButtonLike, Color, ContextMenu, ContextMenuEntry, IconButton, IconName, Label,
+    ListItem, ListItemSpacing, Tab, Tooltip, prelude::*, right_click_menu,
 };
 use util::{ResultExt as _, rel_path::RelPath};
 use vcs::{
@@ -67,6 +67,106 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+pub(crate) fn discard_unavailable_reason(
+    store: Option<&Entity<VcsStore>>,
+    repository: &VcsRepositoryId,
+    path: &str,
+    cx: &App,
+) -> Option<SharedString> {
+    let Some(store) = store else {
+        return Some("Source-control provider is unavailable.".into());
+    };
+    let store = store.read(cx);
+    if store.file_operation_running() {
+        return Some("Another source-control operation is running.".into());
+    }
+    if store.file_operation_unresolved(repository)
+        || store.repository_operation_unresolved(repository)
+    {
+        return Some("Refresh source control to reconcile the previous operation.".into());
+    }
+    if store
+        .file_operations_for_path(repository, path)
+        .contains(&FileOperation::Discard)
+    {
+        return None;
+    }
+    Some(
+        store
+            .changes(repository, cx)
+            .into_iter()
+            .find(|change| change.path == path)
+            .and_then(|change| change.unavailable_reason)
+            .unwrap_or_else(|| {
+                "The provider does not allow discarding changes to this file in this checkout."
+                    .into()
+            })
+            .into(),
+    )
+}
+
+pub(crate) fn discard_context_menu(
+    mut menu: ContextMenu,
+    unavailable_reason: Option<SharedString>,
+    handler: impl Fn(&mut Window, &mut App) + 'static,
+) -> ContextMenu {
+    menu.push_item(
+        ContextMenuEntry::new("Discard Changes")
+            .disabled(unavailable_reason.is_some())
+            .handler(handler),
+    );
+    if let Some(reason) = unavailable_reason {
+        menu = menu.label(reason);
+    }
+    menu
+}
+
+pub(crate) fn discard_file_changes(
+    store: Entity<VcsStore>,
+    repository: VcsRepositoryId,
+    path: String,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<Result<()>> {
+    if let Some(reason) = discard_unavailable_reason(Some(&store), &repository, &path, cx) {
+        return Task::ready(Err(anyhow::anyhow!(reason.to_string())));
+    }
+    let Some(snapshot) = store
+        .read(cx)
+        .repositories()
+        .into_iter()
+        .find(|snapshot| snapshot.key == repository)
+    else {
+        return Task::ready(Err(anyhow::anyhow!(
+            "Source-control repository is no longer available."
+        )));
+    };
+    let preparation = store.update(cx, |store, cx| {
+        store.prepare_file_operation(repository, path.clone(), FileOperation::Discard, cx)
+    });
+    window.spawn(cx, async move |cx| {
+        let prepared = preparation.await?;
+        let detail = format!(
+            "Project: {}\nScope: {}\n\n{}\n\nAffected paths:\n{}",
+            snapshot.descriptor.display_name,
+            snapshot.descriptor.scope_uri,
+            prepared.summary().unwrap_or("The working file will be restored to its staged version. Staged changes will be preserved."),
+            prepared.affected_paths().join("\n"),
+        );
+        let answer = cx.update(|window, cx| window.prompt(
+            PromptLevel::Warning,
+            &format!("Discard unstaged changes to {path}?"),
+            Some(&detail),
+            &["Discard Unstaged Changes", "Cancel"],
+            cx,
+        ))?.await?;
+        if answer == 0 {
+            store.update(cx, |store, cx| store.apply_prepared_file_operation(prepared, cx)).await?;
+        }
+        Ok(())
+    })
 }
 
 fn show_diagnostics(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -320,66 +420,30 @@ impl VcsPanel {
     }
 
     fn discard_file(&mut self, _: &DiscardFile, window: &mut Window, cx: &mut Context<Self>) {
-        if self.preparing_operation {
-            return;
-        }
         let Some(row) = self.selected_file().cloned() else {
             return;
         };
+        self.discard_path(row.repository, row.path, window, cx);
+    }
+
+    fn discard_path(
+        &mut self,
+        repository: VcsRepositoryId,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preparing_operation {
+            return;
+        }
         let Some(store) = self.store.clone() else {
             return;
         };
-        let Some(repository) = self
-            .repositories
-            .iter()
-            .find(|repository| repository.key == row.repository)
-        else {
-            return;
-        };
-        let detail = format!(
-            "Project: {}\nScope: {}",
-            repository.descriptor.display_name, repository.descriptor.scope_uri,
-        );
         self.error = None;
         self.preparing_operation = true;
-        let preparation = store.update(cx, |store, cx| {
-            store.prepare_file_operation(
-                row.repository,
-                row.path.clone(),
-                FileOperation::Discard,
-                cx,
-            )
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let result: Result<()> = async {
-                let prepared = preparation.await?;
-                let detail = format!(
-                    "{}\n\n{}\n\nAffected paths:\n{}",
-                    detail,
-                    prepared.summary().unwrap_or("The working file will be restored to its staged version. Staged changes will be preserved."),
-                    prepared.affected_paths().join("\n"),
-                );
-                let answer = this
-                    .update_in(cx, |_, window, cx| {
-                        window.prompt(
-                            PromptLevel::Warning,
-                            &format!("Discard unstaged changes to {}?", row.path),
-                            Some(&detail),
-                            &["Discard Unstaged Changes", "Cancel"],
-                            cx,
-                        )
-                    })?
-                    .await?;
-                if answer == 0 {
-                    store
-                        .update(cx, |store, cx| {
-                            store.apply_prepared_file_operation(prepared, cx)
-                        })
-                        .await?;
-                }
-                Ok(())
-            }
-            .await;
+        let operation = discard_file_changes(store, repository, path, window, cx);
+        cx.spawn(async move |this, cx| {
+            let result = operation.await;
             this.update(cx, |this, cx| {
                 this.preparing_operation = false;
                 if let Err(error) = result {
@@ -965,7 +1029,10 @@ impl VcsPanel {
                     .file_icons
                     .then(|| FileIcons::get_icon(path, cx))
                     .flatten();
-                ListItem::new(index)
+                let panel = cx.entity().downgrade();
+                let repository = row.repository.clone();
+                let file_path = row.path.clone();
+                let item = ListItem::new(index)
                     .inset(true)
                     .spacing(ListItemSpacing::Sparse)
                     .toggle_state(self.selected == Some(index))
@@ -994,7 +1061,51 @@ impl VcsPanel {
                         cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                             this.open_entry_on_click(index, event.click_count() > 1, window, cx)
                         }),
-                    )
+                    );
+                right_click_menu(("vcs-file-menu", index))
+                    .trigger(move |_, _, _| item)
+                    .menu(move |window, cx| {
+                        let reason = panel
+                            .update(cx, |panel, cx| {
+                                panel.selected = panel.rows.iter().position(|row| {
+                                    row.repository == repository && row.path == file_path
+                                });
+                                cx.notify();
+                                if panel.preparing_operation {
+                                    Some(
+                                        "Another source-control operation is being prepared."
+                                            .into(),
+                                    )
+                                } else {
+                                    discard_unavailable_reason(
+                                        panel.store.as_ref(),
+                                        &repository,
+                                        &file_path,
+                                        cx,
+                                    )
+                                }
+                            })
+                            .unwrap_or_else(|_| {
+                                Some("Source-control panel is no longer available.".into())
+                            });
+                        let panel = panel.clone();
+                        let repository = repository.clone();
+                        let file_path = file_path.clone();
+                        ContextMenu::build(window, cx, move |menu, _, _| {
+                            discard_context_menu(menu, reason, move |window, cx| {
+                                panel
+                                    .update(cx, |panel, cx| {
+                                        panel.discard_path(
+                                            repository.clone(),
+                                            file_path.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    })
+                                    .log_err();
+                            })
+                        })
+                    })
                     .into_any_element()
             })
             .collect()
@@ -1103,6 +1214,9 @@ impl Render for VcsPanel {
                 })
             })
             .unwrap_or_default();
+        let discard_reason = self.selected_file().and_then(|row| {
+            discard_unavailable_reason(self.store.as_ref(), &row.repository, &row.path, cx)
+        });
         let unresolved = repository.as_ref().is_some_and(|repository| {
             self.store.as_ref().is_some_and(|store| {
                 let store = store.read(cx);
@@ -1157,7 +1271,11 @@ impl Render for VcsPanel {
             .on_action(cx.listener(Self::toggle_staged))
             .on_action(cx.listener(Self::stage_file))
             .on_action(cx.listener(Self::unstage_file))
-            .on_action(cx.listener(Self::discard_file))
+            .on_action(cx.listener(|this, action: &DiscardFile, window, cx| {
+                if this.focus.is_focused(window) {
+                    this.discard_file(action, window, cx);
+                }
+            }))
             .on_action(cx.listener(Self::commit_staged))
             .on_action(cx.listener(Self::switch_branch))
             .on_action(cx.listener(|this, _: &git::StageFile, _, cx| {
@@ -1167,7 +1285,9 @@ impl Render for VcsPanel {
                 this.run_file_operation(FileOperation::Unstage, cx)
             }))
             .on_action(cx.listener(|this, _: &git::RestoreFile, window, cx| {
-                this.discard_file(&DiscardFile, window, cx)
+                if this.focus.is_focused(window) {
+                    this.discard_file(&DiscardFile, window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &git::Commit, window, cx| {
                 this.commit_staged(&CommitStaged, window, cx)
@@ -1317,15 +1437,18 @@ impl Render for VcsPanel {
                 .track_scroll(&self.scroll_handle)
                 .flex_1(),
             )
-            .when_some(read_only_reason, |this, reason| {
-                this.child(
-                    div().px_2().py_1().child(
-                        Label::new(reason)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-                )
-            })
+            .when_some(
+                read_only_reason.filter(|_| discard_reason.is_none()),
+                |this, reason| {
+                    this.child(
+                        div().px_2().py_1().child(
+                            Label::new(reason)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                    )
+                },
+            )
             .when(unresolved, |this| {
                 this.child(
                     div().px_2().py_1().child(
@@ -1344,7 +1467,7 @@ impl Render for VcsPanel {
                     ),
                 )
             })
-            .when(!file_operations.is_empty(), |this| {
+            .when(self.selected_file().is_some(), |this| {
                 this.child(
                     h_flex()
                         .px_2()
@@ -1371,15 +1494,25 @@ impl Render for VcsPanel {
                                 })),
                         )
                         .child(
-                            Button::new("vcs-discard-file", "Discard")
+                            Button::new("vcs-discard-file", "Discard Changes")
                                 .label_size(LabelSize::Small)
-                                .disabled(
-                                    blocked || !file_operations.contains(&FileOperation::Discard),
-                                )
+                                .disabled(blocked || discard_reason.is_some())
+                                .tooltip(Tooltip::text(discard_reason.clone().unwrap_or_else(
+                                    || "Discard unstaged changes to this file".into(),
+                                )))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.discard_file(&DiscardFile, window, cx)
                                 })),
                         ),
+                )
+            })
+            .when_some(discard_reason, |this, reason| {
+                this.child(
+                    div().px_2().py_1().child(
+                        Label::new(reason)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
                 )
             })
             .when(

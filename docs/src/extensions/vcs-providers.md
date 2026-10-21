@@ -36,6 +36,15 @@ With the changes list focused, {#action git::StageFile},
 provider capabilities. {#action git::Commit} and {#action git::Switch} open the
 provider's scoped commit and existing-branch switch controls when supported.
 
+Use **Discard Changes** from a file's context menu or diff header to discard
+that file's unstaged changes. The operation requires confirmation and the
+provider's discard capability. Disabled actions explain why they are unavailable.
+
+Providers that support blame use the existing {#action git::Blame},
+{#action editor::ToggleGitBlameInline}, and {#action editor::BlameHover} commands.
+The hover shows the author and commit details, with an external commit link when
+the provider supplies one. Previous-revision blame remains Git-only.
+
 External repositories do not expose Git's History, separate staged or unstaged
 index views, or hunk and batch mutations. Stash, amend, and remote Git operations
 are also unavailable. Unsupported commands report that limitation instead of
@@ -99,13 +108,14 @@ components, `.`/`..`, NUL, backslashes and colon-containing components are rejec
 by the initial portable-path contract. Report an unsupported path rather than
 silently omitting it. File URIs identify local paths only.
 
-| Method            | Parameters                                                                    | Result                                          |
-| ----------------- | ----------------------------------------------------------------------------- | ----------------------------------------------- |
-| `initialize`      | `protocolVersion`, `supportedProtocolVersions`, `clientInfo: {name, version}` | `protocolVersion`, `serverInfo`, `capabilities` |
-| `vcs/discover`    | `scopeUri`                                                                    | Array of repository descriptors                 |
-| `vcs/snapshot`    | `repositoryId`, `baselineId`                                                  | A snapshot of changes for that comparison       |
-| `vcs/readContent` | `repositoryId`, `snapshotId`, `baselineId`, `path`                            | Baseline-side content                           |
-| `shutdown`        | Empty object                                                                  | `null`, after provider cleanup                  |
+| Method            | Parameters                                                                    | Result                                                |
+| ----------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `initialize`      | `protocolVersion`, `supportedProtocolVersions`, `clientInfo: {name, version}` | `protocolVersion`, `serverInfo`, `capabilities`       |
+| `vcs/discover`    | `scopeUri`                                                                    | Array of repository descriptors                       |
+| `vcs/snapshot`    | `repositoryId`, `baselineId`                                                  | A snapshot of changes for that comparison             |
+| `vcs/readContent` | `repositoryId`, `snapshotId`, `baselineId`, `path`                            | Baseline-side content                                 |
+| `vcs/blame`       | `repositoryId`, `path`                                                        | Committed content and line attribution when supported |
+| `shutdown`        | Empty object                                                                  | `null`, after provider cleanup                        |
 
 After shutdown, the client sends an `exit` notification. Dropping a request sends
 `$/cancelRequest` with its `id`. Shutdown and process exit have bounded deadlines;
@@ -118,6 +128,46 @@ invalidates the visible snapshot; Zed also refreshes after relevant file changes
 and supports explicit refresh. Request failure, timeout, malformed data and process
 EOF are errors, not empty successful snapshots. Error `code`, `message`, and
 optional `data` retain provider details. Responses received before EOF remain valid.
+
+### Line attribution {#provider-blame}
+
+Set `capabilities.blame` to `true` to support `vcs/blame`. This optional read-only
+capability is independent of mutation permissions and works with protocol 1 or 2.
+A supporting provider must include `headRevisionId` in each snapshot: it identifies
+the current committed revision even when `revisionId` identifies a different
+comparison baseline.
+
+Return attribution for the exact committed content at one pinned revision:
+
+```json
+{
+  "revisionId": "revision:42",
+  "content": "first line\n",
+  "entries": [{ "startLine": 0, "endLine": 1, "commitId": "change:7" }],
+  "commits": [
+    {
+      "revisionId": "change:7",
+      "author": "Example Author",
+      "authorTime": 1700000000,
+      "summary": "Add first line",
+      "message": "Add first line",
+      "commitUrl": "https://example.test/changes/7"
+    }
+  ]
+}
+```
+
+Line ranges are zero-based, half-open, contiguous, and cover all committed lines,
+excluding the empty row after a final newline. Each `commitId` references exactly
+one commit record. Revision IDs remain opaque strings. Commit fields other than
+`revisionId` are optional; `authorTime` is Unix time in seconds and `commitUrl`
+must use HTTPS without embedded credentials. The host accepts at most 4 MiB of
+text and 100,000 lines; binary content is unsupported.
+
+Zed maps committed attribution to the live editor buffer, leaving edited lines
+unattributed. Results are cached by file and HEAD, and discarded when ownership,
+HEAD, or the provider connection changes. Cursor movement uses the existing
+in-memory attribution.
 
 ### Version negotiation
 

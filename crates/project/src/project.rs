@@ -5568,6 +5568,23 @@ impl Project {
         })
     }
 
+    pub fn has_provider_blame(&self, buffer: &Entity<Buffer>, cx: &App) -> bool {
+        self.vcs_store
+            .as_ref()
+            .is_some_and(|store| store.read(cx).has_provider_blame(buffer, cx))
+    }
+
+    pub fn blame_provider_buffer(
+        &self,
+        buffer: &Entity<Buffer>,
+        cx: &mut App,
+    ) -> Task<Result<Option<Arc<vcs::Blame>>>> {
+        let Some(store) = &self.vcs_store else {
+            return Task::ready(Ok(None));
+        };
+        store.update(cx, |store, cx| store.blame_buffer(buffer, cx))
+    }
+
     pub fn get_permalink_to_line(
         &self,
         buffer: &Entity<Buffer>,

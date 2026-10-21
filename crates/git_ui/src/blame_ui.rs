@@ -3,7 +3,9 @@ use crate::{
     commit_view::{CommitView, GitBlob, build_buffer, worktree_id_for_repo_path},
 };
 use anyhow::Context as _;
-use editor::{BlameRenderer, Editor, GitBlame, MultiBuffer, hover_markdown_style};
+use editor::{
+    BlameRenderer, DisplayBlameEntry, Editor, GitBlame, MultiBuffer, hover_markdown_style,
+};
 use git::{
     Oid,
     blame::BlameEntry,
@@ -64,7 +66,14 @@ impl GitBlameStatus {
             if inline_blame.enabled && inline_blame.location == InlineBlameLocation::StatusBar {
                 editor
                     .update(cx, |editor, cx| editor.active_git_blame_entry(cx))
-                    .map(|blame_entry| SharedString::from(format_blame_text(&blame_entry, cx)))
+                    .map(|blame_entry| {
+                        SharedString::from(match blame_entry {
+                            DisplayBlameEntry::Git(entry) => format_blame_text(&entry, cx),
+                            DisplayBlameEntry::Provider(commit) => {
+                                format_provider_blame_text(&commit, cx)
+                            }
+                        })
+                    })
             } else {
                 None
             };
@@ -148,6 +157,99 @@ impl BlameRenderer for GitBlameRenderer {
         } else {
             width
         }
+    }
+
+    fn render_provider_blame_entry(
+        &self,
+        style: &TextStyle,
+        commit: Arc<vcs::BlameCommit>,
+        editor: Entity<Editor>,
+        index: usize,
+        revision_color: Hsla,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        let author = util::truncate_and_trailoff(
+            commit.author.as_deref().unwrap_or("<no name>"),
+            GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED,
+        );
+        let revision: String = commit
+            .revision_id
+            .chars()
+            .take(git::SHORT_SHA_LENGTH)
+            .collect();
+        let timestamp = provider_blame_timestamp(&commit, time_format::TimestampFormat::Relative);
+        Some(
+            div()
+                .mr_2()
+                .child(
+                    h_flex()
+                        .id(("blame", index))
+                        .w_full()
+                        .gap_2()
+                        .justify_between()
+                        .font(style.font())
+                        .line_height(style.line_height)
+                        .text_color(cx.theme().status().hint)
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .child(div().text_color(revision_color).child(revision))
+                                .child(author),
+                        )
+                        .child(timestamp)
+                        .hover(|style| style.bg(cx.theme().colors().element_hover))
+                        .when_some(commit.commit_url.clone(), |element, url| {
+                            element
+                                .cursor_pointer()
+                                .on_click(move |_, _, cx| cx.open_url(&url))
+                        })
+                        .when(!editor.read(cx).has_mouse_context_menu(), |element| {
+                            element.hoverable_tooltip(move |_, cx| {
+                                cx.new(|cx| ProviderBlameTooltip::new(commit.clone(), cx))
+                                    .into()
+                            })
+                        }),
+                )
+                .into_any(),
+        )
+    }
+
+    fn render_provider_inline_blame_entry(
+        &self,
+        style: &TextStyle,
+        commit: Arc<vcs::BlameCommit>,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        Some(
+            h_flex()
+                .id("inline-blame")
+                .w_full()
+                .font(style.font())
+                .text_color(cx.theme().status().hint)
+                .line_height(style.line_height)
+                .child(Icon::new(IconName::FileGit).color(Color::Hint))
+                .child(format_provider_blame_text(&commit, cx))
+                .gap_2()
+                .into_any(),
+        )
+    }
+
+    fn render_provider_blame_entry_popover(
+        &self,
+        commit: Arc<vcs::BlameCommit>,
+        scroll_handle: ScrollHandle,
+        markdown: Entity<Markdown>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        Some(render_provider_blame_popover(
+            &commit,
+            scroll_handle,
+            markdown,
+            window,
+            cx,
+        ))
     }
 
     fn render_blame_entry(
@@ -757,6 +859,156 @@ fn existing_blame_editor(
             let blob = (file.as_ref() as &dyn std::any::Any).downcast_ref::<GitBlob>()?;
             (blob.path == *path).then_some(editor)
         })
+}
+
+fn format_provider_blame_text(commit: &vcs::BlameCommit, cx: &App) -> String {
+    let author = commit.author.as_deref().unwrap_or("<no name>");
+    let timestamp = provider_blame_timestamp(commit, time_format::TimestampFormat::Relative);
+    let mut text = format!("{author}, {timestamp}");
+    if ProjectSettings::get_global(cx)
+        .git
+        .inline_blame
+        .show_commit_summary
+        && let Some(summary) = &commit.summary
+    {
+        text.push_str(" - ");
+        text.push_str(summary);
+    }
+    text
+}
+
+fn provider_blame_timestamp(
+    commit: &vcs::BlameCommit,
+    format: time_format::TimestampFormat,
+) -> String {
+    let Some(timestamp) = commit
+        .author_time
+        .and_then(|time| OffsetDateTime::from_unix_timestamp(time).ok())
+    else {
+        return "Unknown date".into();
+    };
+    time_format::format_localized_timestamp(
+        timestamp,
+        OffsetDateTime::now_utc(),
+        time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC),
+        format,
+    )
+}
+
+struct ProviderBlameTooltip {
+    commit: Arc<vcs::BlameCommit>,
+    markdown: Entity<Markdown>,
+    scroll_handle: ScrollHandle,
+}
+
+impl ProviderBlameTooltip {
+    fn new(commit: Arc<vcs::BlameCommit>, cx: &mut Context<Self>) -> Self {
+        let message = commit
+            .message
+            .clone()
+            .or_else(|| commit.summary.clone())
+            .unwrap_or_default();
+        Self {
+            commit,
+            markdown: cx.new(|cx| Markdown::new(message.into(), None, None, cx)),
+            scroll_handle: ScrollHandle::new(),
+        }
+    }
+}
+
+impl Render for ProviderBlameTooltip {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        render_provider_blame_popover(
+            &self.commit,
+            self.scroll_handle.clone(),
+            self.markdown.clone(),
+            window,
+            cx,
+        )
+    }
+}
+
+fn render_provider_blame_popover(
+    commit: &vcs::BlameCommit,
+    scroll_handle: ScrollHandle,
+    markdown: Entity<Markdown>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let revision: String = commit
+        .revision_id
+        .chars()
+        .take(git::SHORT_SHA_LENGTH)
+        .collect();
+    let timestamp = provider_blame_timestamp(commit, time_format::TimestampFormat::MediumAbsolute);
+    let message = MarkdownElement::new(markdown, hover_markdown_style(window, cx))
+        .scroll_handle(scroll_handle.clone());
+    let message_max_height =
+        window.line_height() * 12 + (ThemeSettings::get_global(cx).ui_font_size(cx) / 0.4);
+    tooltip_container(cx, |this, cx| {
+        this.occlude()
+            .on_mouse_move(|_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                v_flex()
+                    .w(rems(30.))
+                    .child(
+                        h_flex()
+                            .pb_1()
+                            .gap_2()
+                            .flex_wrap()
+                            .border_b_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(commit.author.clone().unwrap_or_else(|| "<no name>".into())),
+                    )
+                    .child(
+                        div()
+                            .id("inline-blame-commit-message")
+                            .track_scroll(&scroll_handle)
+                            .py_1p5()
+                            .max_h(message_max_height)
+                            .overflow_y_scroll()
+                            .child(message),
+                    )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .justify_between()
+                            .pt_1()
+                            .gap_1()
+                            .flex_wrap()
+                            .text_color(cx.theme().colors().text_muted)
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(timestamp)
+                            .child(
+                                h_flex()
+                                    .gap_1()
+                                    .child(
+                                        Button::new("blame-revision", revision)
+                                            .color(Color::Muted)
+                                            .disabled(commit.commit_url.is_none())
+                                            .when_some(commit.commit_url.clone(), |button, url| {
+                                                button
+                                                    .tooltip(ui::Tooltip::text("Open Commit"))
+                                                    .on_click(move |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                        cx.open_url(&url);
+                                                    })
+                                            }),
+                                    )
+                                    .child(
+                                        CopyButton::new(
+                                            "copy-blame-revision",
+                                            commit.revision_id.clone(),
+                                        )
+                                        .tooltip_label("Copy Commit ID"),
+                                    ),
+                            ),
+                    ),
+            )
+    })
+    .into_any_element()
 }
 
 fn blame_entry_relative_timestamp(blame_entry: &BlameEntry) -> String {

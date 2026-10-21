@@ -22,6 +22,84 @@ struct Fixture {
 }
 
 #[gpui::test]
+async fn blame_requires_capability_and_rejects_malformed_results(cx: &mut TestAppContext) {
+    let unsupported = fixture("normal", cx);
+    bounded(unsupported.connection.initialize(), cx)
+        .await
+        .unwrap();
+    assert!(
+        unsupported
+            .connection
+            .blame("fixture-repository".into(), "src/example.txt".into())
+            .await
+            .is_err()
+    );
+    assert!(
+        !events(&unsupported)
+            .iter()
+            .any(|event| event["method"] == "vcs/blame")
+    );
+    bounded(unsupported.connection.shutdown(), cx)
+        .await
+        .unwrap();
+
+    let supported = fixture("blame", cx);
+    let initialized = bounded(supported.connection.initialize(), cx)
+        .await
+        .unwrap();
+    assert!(initialized.capabilities.read_only && initialized.capabilities.blame);
+    let blame = bounded(
+        supported
+            .connection
+            .blame("fixture-repository".into(), "src/example.txt".into()),
+        cx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(blame.revision_id, "revision:42");
+    assert_eq!(blame.entries[0].commit_id, "revision:original");
+    assert_eq!(
+        blame.content,
+        "first committed line\nsecond committed line\n"
+    );
+    bounded(supported.connection.shutdown(), cx).await.unwrap();
+
+    let malformed = fixture("blame-malformed", cx);
+    bounded(malformed.connection.initialize(), cx)
+        .await
+        .unwrap();
+    assert!(
+        bounded(
+            malformed
+                .connection
+                .blame("fixture-repository".into(), "src/example.txt".into()),
+            cx
+        )
+        .await
+        .is_err()
+    );
+    bounded(malformed.connection.shutdown(), cx).await.unwrap();
+
+    let missing_head = fixture("blame-missing-head", cx);
+    bounded(missing_head.connection.initialize(), cx)
+        .await
+        .unwrap();
+    assert!(
+        bounded(
+            missing_head
+                .connection
+                .snapshot("fixture-repository".into(), "submitted".into()),
+            cx
+        )
+        .await
+        .is_err()
+    );
+    bounded(missing_head.connection.shutdown(), cx)
+        .await
+        .unwrap();
+}
+
+#[gpui::test]
 async fn repository_operations_require_capability_and_bind_the_prepared_request(
     cx: &mut TestAppContext,
 ) {

@@ -1,5 +1,5 @@
 use crate::{
-    CheckoutCatalog, CheckoutOperation, CheckoutOperationResult, Content, FileOperation,
+    Blame, CheckoutCatalog, CheckoutOperation, CheckoutOperationResult, Content, FileOperation,
     FileOperationResult, InitializeParams, InitializeResult, MAX_MESSAGE_BYTES, OperationProgress,
     PROTOCOL_VERSION, PreparedCheckoutOperation, PreparedFileOperation,
     PreparedRepositoryOperation, ProviderCapabilities, ProviderError, ProviderInfo,
@@ -335,7 +335,33 @@ impl ProviderConnection {
             )
             .await?;
         snapshot.validate(&repository_id, &baseline_id)?;
+        ensure!(
+            !self
+                .capabilities()
+                .is_some_and(|capabilities| capabilities.blame)
+                || snapshot.head_revision_id.is_some(),
+            "VCS blame provider omitted the current HEAD revision"
+        );
         Ok(snapshot)
+    }
+
+    pub async fn blame(&self, repository_id: String, path: String) -> Result<Blame> {
+        self.ensure_initialized()?;
+        ensure!(
+            self.capabilities()
+                .is_some_and(|capabilities| capabilities.blame),
+            "VCS provider does not support blame"
+        );
+        validate_path(&path)?;
+        let blame: Blame = self
+            .request(
+                "vcs/blame",
+                json!({"repositoryId": repository_id, "path": path}),
+                REQUEST_TIMEOUT,
+            )
+            .await?;
+        blame.validate()?;
+        Ok(blame)
     }
 
     pub async fn read_content(

@@ -12,8 +12,10 @@ use editor::{
 };
 use futures::{StreamExt as _, stream};
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task, Window,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task, WeakEntity,
+    Window,
 };
+use language::BufferId;
 use language::{Anchor, Capability, OffsetRangeExt as _, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::{
@@ -21,7 +23,7 @@ use project::{
     vcs_store::{VcsDiff, VcsRepositoryId, VcsStore},
 };
 use settings::Settings as _;
-use ui::{Label, prelude::*};
+use ui::{Button, ContextMenu, Label, Tooltip, prelude::*};
 use util::{ResultExt as _, rel_path::RelPath};
 use vcs::{Change, ChangeStatus, ContentKind};
 use workspace::{
@@ -30,7 +32,12 @@ use workspace::{
     searchable::SearchableItemHandle,
 };
 
-use crate::git_panel::GitPanel;
+use crate::{
+    git_panel::GitPanel,
+    vcs_panel::{
+        DiscardFile, discard_context_menu, discard_file_changes, discard_unavailable_reason,
+    },
+};
 
 const MAX_CONCURRENT_BUFFER_LOADS: usize = 4;
 
@@ -153,6 +160,7 @@ pub(crate) struct VcsProjectDiff {
     pending_path: Option<String>,
     generation: u64,
     loading: bool,
+    preparing_discard: bool,
     metadata_count: usize,
     error: Option<SharedString>,
     repository_error: Option<SharedString>,
@@ -179,6 +187,7 @@ impl VcsProjectDiff {
             buffer.set_title("Uncommitted Changes".into(), cx);
             buffer
         });
+        let diff_view = cx.entity().downgrade();
         let editor = cx.new(|cx| {
             let editor = SplittableEditor::new(
                 EditorSettings::get_global(cx).diff_view_style,
@@ -190,6 +199,7 @@ impl VcsProjectDiff {
             );
             editor.rhs_editor().update(cx, |editor, cx| {
                 editor.set_should_serialize(false, cx);
+                editor.register_addon(VcsDiffAddon { view: diff_view });
             });
             editor
         });
@@ -219,6 +229,7 @@ impl VcsProjectDiff {
             pending_path: None,
             generation: 0,
             loading: false,
+            preparing_discard: false,
             metadata_count: 0,
             error: None,
             repository_error: None,
@@ -227,6 +238,79 @@ impl VcsProjectDiff {
         };
         this.refresh(window, cx);
         this
+    }
+
+    fn path_for_buffer(&self, buffer_id: BufferId, cx: &App) -> Option<String> {
+        self.loaded.iter().find_map(|(path, loaded)| {
+            (loaded.opened.buffer.read(cx).remote_id() == buffer_id
+                || loaded
+                    .opened
+                    .diff
+                    .read(cx)
+                    .snapshot(cx)
+                    .base_text()
+                    .remote_id()
+                    == buffer_id)
+                .then(|| path.clone())
+        })
+    }
+
+    fn selected_path(&self, cx: &App) -> Option<String> {
+        let editor = self.editor.read(cx).focused_editor().read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let selection = editor.selections.newest_anchor();
+        let (buffer, _) = snapshot.point_to_buffer_offset(selection.head())?;
+        self.path_for_buffer(buffer.remote_id(), cx)
+    }
+
+    fn discard_reason(&self, path: &str, cx: &App) -> Option<SharedString> {
+        if self.preparing_discard {
+            return Some("Another discard operation is being prepared.".into());
+        }
+        discard_unavailable_reason(self.store.as_ref(), &self.repository, path, cx)
+    }
+
+    fn discard_selected_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Header menus have their own target; a shortcut must not fall back to the editor cursor.
+        if !self
+            .editor
+            .read(cx)
+            .focused_editor()
+            .focus_handle(cx)
+            .is_focused(window)
+        {
+            return;
+        }
+        if let Some(path) = self.selected_path(cx) {
+            self.discard_path(path, window, cx);
+        }
+    }
+
+    fn discard_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reason) = self.discard_reason(&path, cx) {
+            self.error = Some(reason);
+            cx.notify();
+            return;
+        }
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        self.error = None;
+        self.preparing_discard = true;
+        let operation = discard_file_changes(store, self.repository.clone(), path, window, cx);
+        cx.spawn(async move |this, cx| {
+            let result = operation.await;
+            this.update(cx, |this, cx| {
+                this.preparing_discard = false;
+                if let Err(error) = result {
+                    this.error = Some(format!("{error:#}").into());
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
     }
 
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -498,6 +582,66 @@ impl VcsProjectDiff {
     }
 }
 
+struct VcsDiffAddon {
+    view: WeakEntity<VcsProjectDiff>,
+}
+
+impl editor::Addon for VcsDiffAddon {
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn render_buffer_header_controls(
+        &self,
+        _: &multi_buffer::ExcerptBoundaryInfo,
+        buffer: &language::BufferSnapshot,
+        _: &Window,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let view = self.view.upgrade()?;
+        let path = view.read(cx).path_for_buffer(buffer.remote_id(), cx)?;
+        let reason = view.read(cx).discard_reason(&path, cx);
+        let weak_view = self.view.clone();
+        Some(
+            Button::new("vcs-discard-file", "Discard Changes")
+                .label_size(LabelSize::Small)
+                .disabled(reason.is_some())
+                .tooltip(Tooltip::text(reason.unwrap_or_else(|| {
+                    "Discard unstaged changes to this file".into()
+                })))
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    weak_view
+                        .update(cx, |view, cx| view.discard_path(path.clone(), window, cx))
+                        .log_err();
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn extend_buffer_header_context_menu(
+        &self,
+        menu: ContextMenu,
+        buffer: &language::BufferSnapshot,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> ContextMenu {
+        let Some(view) = self.view.upgrade() else {
+            return menu;
+        };
+        let Some(path) = view.read(cx).path_for_buffer(buffer.remote_id(), cx) else {
+            return menu;
+        };
+        let reason = view.read(cx).discard_reason(&path, cx);
+        let weak_view = self.view.clone();
+        discard_context_menu(menu.separator(), reason, move |window, cx| {
+            weak_view
+                .update(cx, |view, cx| view.discard_path(path.clone(), window, cx))
+                .log_err();
+        })
+    }
+}
+
 fn path_key(path: &str) -> Result<PathKey> {
     Ok(PathKey::with_sort_prefix(
         0,
@@ -519,6 +663,14 @@ impl Render for VcsProjectDiff {
         v_flex()
             .size_full()
             .key_context("GitDiff")
+            .capture_action(cx.listener(|this, _: &git::RestoreFile, window, cx| {
+                cx.stop_propagation();
+                this.discard_selected_file(window, cx);
+            }))
+            .capture_action(cx.listener(|this, _: &DiscardFile, window, cx| {
+                cx.stop_propagation();
+                this.discard_selected_file(window, cx);
+            }))
             .when_some(self.repository_error.clone(), |element, error| {
                 element.child(Label::new(error).color(Color::Error))
             })
@@ -829,6 +981,41 @@ mod tests {
                 normal_editor.focus_handle(cx).contains_focused(window, cx),
                 "deferred navigation must keep panel/previous focus"
             );
+            assert_eq!(item.selected_path(cx).as_deref(), Some("b.txt"));
+            assert_eq!(
+                item.path_for_buffer(buffer_a.read(cx).remote_id(), cx)
+                    .as_deref(),
+                Some("a.txt"),
+                "a header targets its own file independently of the selected excerpt"
+            );
+            let before = buffer_a.read(cx).text();
+            let menu = ContextMenu::build(window, cx, |menu, _, _| {
+                discard_context_menu(menu, None, |_, _| {})
+            });
+            menu.focus_handle(cx).focus(window, cx);
+            item.discard_selected_file(window, cx);
+            assert!(
+                item.error.is_none(),
+                "menu shortcuts must not target the editor cursor"
+            );
+            assert!(!item.preparing_discard);
+            item.editor
+                .read(cx)
+                .focused_editor()
+                .focus_handle(cx)
+                .focus(window, cx);
+            item.discard_selected_file(window, cx);
+            assert!(
+                !item.preparing_discard,
+                "unavailable operations must not prepare or dispatch"
+            );
+            assert_eq!(
+                item.error.as_deref(),
+                Some("Source-control provider is unavailable.")
+            );
+            assert_eq!(buffer_a.read(cx).text(), before);
+            item.error = None;
+            normal_editor.focus_handle(cx).focus(window, cx);
             assert!(item.is_dirty(cx));
             let snapshot = item.multibuffer.read(cx).snapshot(cx);
             let paths = snapshot

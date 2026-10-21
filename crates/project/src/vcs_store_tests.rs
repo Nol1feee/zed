@@ -3745,3 +3745,184 @@ async fn explicit_symlink_directory_leaf_is_allowed_without_following_parents(
         "untouched"
     );
 }
+
+#[gpui::test]
+async fn provider_blame_cache_tracks_head_independently_of_baseline_and_preserves_git(
+    cx: &mut TestAppContext,
+) {
+    let fixture = fixture(cx, true).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("blame-cache", fixture.directory.path(), "blame").register(cx);
+    let repository = ready(&fixture, cx).await;
+    fixture
+        .project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    let buffer = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let nested = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("nested/file.txt"), cx)
+        })
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .project
+            .read_with(cx, |project, cx| project.has_provider_blame(&buffer, cx))
+    );
+    assert!(
+        !fixture
+            .project
+            .read_with(cx, |project, cx| project.has_provider_blame(&nested, cx))
+    );
+    assert!(
+        fixture
+            .project
+            .update(cx, |project, cx| project.blame_provider_buffer(&nested, cx))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let first = fixture
+        .project
+        .update(cx, |project, cx| project.blame_provider_buffer(&buffer, cx))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.revision_id, "revision:42");
+    fixture.store.update(cx, |store, _| {
+        let cached = &mut store.repositories.get_mut(&repository.key).unwrap().blames;
+        for index in 0..15 {
+            cached.insert(format!("other-{index}.txt"), first.clone());
+        }
+    });
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.set_baseline(&repository.key, "previous".into(), cx)
+        })
+        .unwrap();
+    let current = ready(&fixture, cx).await;
+    assert_eq!(current.snapshot.unwrap().revision_id, "r41");
+    let cached = fixture
+        .project
+        .update(cx, |project, cx| project.blame_provider_buffer(&buffer, cx))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(Arc::ptr_eq(&first, &cached));
+    fixture.store.read_with(cx, |store, _| {
+        assert_eq!(
+            store
+                .repositories
+                .get(&repository.key)
+                .unwrap()
+                .blames
+                .len(),
+            16
+        );
+    });
+    let events = fixture.directory.path().join("blame-cache.jsonl");
+    let calls = || {
+        std::fs::read_to_string(&events)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["method"] == "vcs/blame")
+            .count()
+    };
+    assert_eq!(calls(), 1);
+    std::fs::write(events.with_extension("jsonl.revision"), "revision:43").unwrap();
+    fixture
+        .store
+        .update(cx, |store, cx| store.refresh(&repository.key, cx));
+    ready(&fixture, cx).await;
+    let refreshed = fixture
+        .project
+        .update(cx, |project, cx| project.blame_provider_buffer(&buffer, cx))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(refreshed.revision_id, "revision:43");
+    assert!(!Arc::ptr_eq(&first, &refreshed));
+    assert_eq!(calls(), 2);
+    stop(&fixture, cx).await;
+    assert!(
+        !fixture
+            .project
+            .read_with(cx, |project, cx| project.has_provider_blame(&buffer, cx))
+    );
+}
+
+#[gpui::test]
+async fn provider_blame_rejects_response_from_another_head(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("blame-stale", fixture.directory.path(), "blame-stale").register(cx);
+    ready(&fixture, cx).await;
+    let buffer = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let error = fixture
+        .project
+        .update(cx, |project, cx| project.blame_provider_buffer(&buffer, cx))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("HEAD changed"));
+    fixture.store.read_with(cx, |store, _| {
+        assert!(
+            store
+                .repositories
+                .values()
+                .all(|repository| repository.blames.is_empty())
+        )
+    });
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn provider_blame_fences_in_flight_results_after_head_invalidation(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("blame-pending", fixture.directory.path(), "blame-pending").register(cx);
+    let repository = ready(&fixture, cx).await;
+    let buffer = fixture
+        .project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(fixture.directory.path().join("src/example.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let pending = fixture
+        .project
+        .update(cx, |project, cx| project.blame_provider_buffer(&buffer, cx));
+    let events = fixture.directory.path().join("blame-pending.jsonl");
+    provider_event(events.clone(), "blame-held").await;
+    fixture.store.update(cx, |store, cx| {
+        store.set_blame_head(&repository.key, None, cx);
+        store.set_blame_head(&repository.key, Some("revision:42".into()), cx);
+    });
+    std::fs::write(events.with_extension("jsonl.release"), "ready").unwrap();
+    let error = pending.await.unwrap_err();
+    assert!(error.to_string().contains("stale"));
+    fixture.store.read_with(cx, |store, _| {
+        assert!(
+            store
+                .repositories
+                .values()
+                .all(|repository| repository.blames.is_empty())
+        )
+    });
+    stop(&fixture, cx).await;
+}
