@@ -26,24 +26,57 @@ pub(super) struct Scenario {
     provider_id: String,
     output_directory: PathBuf,
     user_settings: Option<Value>,
+    viewport: Option<[f32; 2]>,
     steps: Vec<Step>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum Step {
-    Action { name: String, data: Option<Value> },
-    Keys { keys: String },
-    Input { text: String },
-    Click { x: f32, y: f32 },
-    RightClick { x: f32, y: f32 },
-    OpenFile { path: PathBuf },
-    SelectWorkspace { path: PathBuf },
+    Action {
+        name: String,
+        data: Option<Value>,
+    },
+    Keys {
+        keys: String,
+    },
+    Input {
+        text: String,
+    },
+    Click {
+        x: f32,
+        y: f32,
+    },
+    RightClick {
+        x: f32,
+        y: f32,
+    },
+    OpenFile {
+        path: PathBuf,
+        root: Option<PathBuf>,
+    },
+    AddRoot {
+        path: PathBuf,
+    },
+    SelectWorkspace {
+        path: PathBuf,
+    },
     CloseWindow,
-    Wait { pointer: String, equals: Value },
-    WaitFile { path: PathBuf, content: String },
-    WaitEditor { suffix: String, dirty: bool },
-    Screenshot { name: String },
+    Wait {
+        pointer: String,
+        equals: Value,
+    },
+    WaitFile {
+        path: PathBuf,
+        content: String,
+    },
+    WaitEditor {
+        suffix: String,
+        dirty: bool,
+    },
+    Screenshot {
+        name: String,
+    },
 }
 
 impl Step {
@@ -54,7 +87,8 @@ impl Step {
             Self::Input { text } => format!("Input ({} characters)", text.chars().count()),
             Self::Click { x, y } => format!("Click {x}, {y}"),
             Self::RightClick { x, y } => format!("Right click {x}, {y}"),
-            Self::OpenFile { path } => format!("Open file {}", path.display()),
+            Self::OpenFile { path, .. } => format!("Open file {}", path.display()),
+            Self::AddRoot { path } => format!("Add root {}", path.display()),
             Self::SelectWorkspace { path } => format!("Select workspace {}", path.display()),
             Self::CloseWindow => "Close window".into(),
             Self::Wait { pointer, equals } => format!("Wait {pointer} = {equals}"),
@@ -72,6 +106,12 @@ impl Scenario {
         };
         let mut scenario: Self = serde_json::from_slice(&std::fs::read(path)?)?;
         scenario.project_path = scenario.project_path.canonicalize()?;
+        if let Some([width, height]) = scenario.viewport {
+            ensure!(
+                (640.0..=3840.0).contains(&width) && (480.0..=2160.0).contains(&height),
+                "invalid visual scenario viewport"
+            );
+        }
         scenario.extension_directory = scenario.extension_directory.canonicalize()?;
         ensure!(
             scenario
@@ -195,7 +235,10 @@ impl Scenario {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
                         origin: point(px(0.), px(0.)),
-                        size: size(px(1280.), px(800.)),
+                        size: {
+                            let [width, height] = self.viewport.unwrap_or([1280.0, 800.0]);
+                            size(px(width), px(height))
+                        },
                     })),
                     focus: false,
                     show: false,
@@ -326,7 +369,7 @@ impl Scenario {
                     Modifiers::default(),
                 );
             }
-            Step::OpenFile { path } => {
+            Step::OpenFile { path, root } => {
                 ensure!(
                     !path.is_absolute()
                         && !path
@@ -337,11 +380,21 @@ impl Scenario {
                 let workspace = current_workspace(*window, cx)?;
                 let task = cx.update_window(*window, |_, window, cx| {
                     workspace.update(cx, |workspace, cx| {
-                        let root = workspace
-                            .root_paths(cx)
-                            .into_iter()
-                            .next()
-                            .context("workspace has no root")?;
+                        let roots = workspace.root_paths(cx);
+                        let root = if let Some(root) = root {
+                            let root = root.canonicalize()?;
+                            ensure!(
+                                roots.iter().any(|path| path.as_ref() == root.as_path()),
+                                "file root is not in this workspace"
+                            );
+                            root
+                        } else {
+                            roots
+                                .into_iter()
+                                .next()
+                                .context("workspace has no root")?
+                                .to_path_buf()
+                        };
                         Ok::<_, anyhow::Error>(workspace.open_abs_path(
                             root.join(path),
                             workspace::OpenOptions {
@@ -357,6 +410,32 @@ impl Scenario {
                 let result = cx.foreground_executor.block_test(task);
                 cx.background_executor.forbid_parking();
                 result?;
+            }
+            Step::AddRoot { path } => {
+                let path = path.canonicalize()?;
+                ensure!(path.is_dir(), "additional root must be a directory");
+                let workspace = current_workspace(*window, cx)?;
+                let project = cx.read(|cx| workspace.read(cx).project().clone());
+                let task = cx.update(|cx| {
+                    project.update(cx, |project, cx| {
+                        project.find_or_create_worktree(&path, true, cx)
+                    })
+                });
+                cx.background_executor.allow_parking();
+                let worktree = cx.foreground_executor.block_test(task);
+                cx.background_executor.forbid_parking();
+                let (worktree, _) = worktree?;
+                cx.update(|cx| {
+                    let worktrees = project.read(cx).worktree_store();
+                    let trust_path =
+                        project::trusted_worktrees::PathTrust::Worktree(worktree.read(cx).id());
+                    project::trusted_worktrees::TrustedWorktrees::try_get_global(cx)
+                        .context("test trust store missing")?
+                        .update(cx, |trust, cx| {
+                            trust.trust(&worktrees, [trust_path].into_iter().collect(), cx)
+                        });
+                    anyhow::Ok(())
+                })?;
             }
             Step::SelectWorkspace { path } => {
                 let path = path.canonicalize()?;
@@ -621,6 +700,7 @@ fn observe(
                 "panels": {
                     "git": {
                         "loaded": git_panel.is_some(),
+                        "commit": git_panel.as_ref().map(|panel| panel.read(cx).commit_workflow_diagnostics(window, cx)),
                         "external_selected": git_panel.as_ref().is_some_and(|panel| panel.read(cx).uses_vcs_panel(cx)),
                         "enabled": git_panel.as_ref().is_some_and(|panel| panel.read(cx).enabled(cx)),
                         "focused": git_panel.as_ref().is_some_and(|panel| panel.read(cx).focus_handle(cx).contains_focused(window, cx)),

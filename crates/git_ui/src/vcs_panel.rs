@@ -1,13 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::{any::TypeId, ops::Range, path::Path, rc::Rc, sync::Arc};
 
-use crate::git_panel::{self, GitPanel};
+use crate::git_panel::{self, GitPanel, GitTreeDirEntry, Section, StatusTreeRow, TreeKey};
 use crate::git_panel_settings::GitPanelSettings;
 use anyhow::Result;
 use editor::{Editor, EditorSettings, SplittableEditor};
-use file_icons::FileIcons;
+use git::status::{FileStatus, StatusCode};
 use gpui::{
-    Action, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel,
+    Anchor, App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, PromptLevel,
     ScrollStrategy, Subscription, Task, UniformListScrollHandle, WeakEntity, Window, actions,
     uniform_list,
 };
@@ -18,10 +18,11 @@ use project::{
     Project, ProjectPath,
     vcs_store::{VcsRepositoryId, VcsRepositorySnapshot, VcsStore, VcsStoreEvent},
 };
-use settings::{GitPanelClickBehavior, Settings};
+use settings::{GitPanelClickBehavior, GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
 use ui::{
-    Button, ButtonLike, Checkbox, Color, ContextMenu, ContextMenuEntry, IconButton, IconName,
-    Label, ListItem, ListItemSpacing, Tab, ToggleState, Tooltip, prelude::*, right_click_menu,
+    ButtonLike, Checkbox, Color, ContextMenu, ContextMenuEntry, ElevationIndex, IconButton,
+    IconName, Label, PopoverMenu, SplitButton, Tab, ToggleState, Tooltip, prelude::*,
+    right_click_menu,
 };
 use util::{ResultExt as _, rel_path::RelPath};
 use vcs::{
@@ -53,7 +54,6 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
-    crate::vcs_repository_ui::init(cx);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<GitPanel>(window, cx);
@@ -346,6 +346,50 @@ struct Row {
     path: String,
     label: String,
     change: Option<Change>,
+    presentation: RowPresentation,
+}
+
+#[derive(Clone, Default)]
+struct RowPresentation {
+    section: Option<Section>,
+    comparison: Option<ComparisonPurpose>,
+    directory: Option<GitTreeDirEntry>,
+    depth: usize,
+    hidden: bool,
+    empty_section: bool,
+}
+
+impl Row {
+    fn baseline(&self, repository: &VcsRepositorySnapshot) -> String {
+        self.presentation
+            .comparison
+            .and_then(|purpose| {
+                repository
+                    .descriptor
+                    .baselines
+                    .iter()
+                    .find(|baseline| baseline.purpose == Some(purpose))
+            })
+            .map(|baseline| baseline.id.clone())
+            .unwrap_or_else(|| repository.selected_baseline.clone())
+    }
+
+    fn is_selectable(&self) -> bool {
+        self.change.is_some() || self.presentation.directory.is_some()
+    }
+
+    fn staging_state(&self, staged_paths: &[String]) -> ToggleState {
+        match self.presentation.section {
+            Some(Section::Staged) => ToggleState::Selected,
+            Some(Section::Unstaged) => ToggleState::Unselected,
+            _ => self
+                .change
+                .as_ref()
+                .map_or(ToggleState::Unselected, |change| {
+                    staging_state(change, staged_paths)
+                }),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -371,6 +415,16 @@ pub(crate) enum FileAction {
     History,
 }
 
+fn presentation_status(change: &Change) -> FileStatus {
+    match change.status {
+        ChangeStatus::Untracked => FileStatus::Untracked,
+        ChangeStatus::Added => FileStatus::worktree(StatusCode::Added),
+        ChangeStatus::Modified => FileStatus::worktree(StatusCode::Modified),
+        ChangeStatus::Deleted => FileStatus::worktree(StatusCode::Deleted),
+        ChangeStatus::Renamed => FileStatus::worktree(StatusCode::Renamed),
+    }
+}
+
 pub(crate) fn staging_state(change: &Change, staged_paths: &[String]) -> ToggleState {
     let staged = change.staged_status.is_some() || staged_paths.contains(&change.path);
     match (staged, change.unstaged_status.is_some()) {
@@ -385,6 +439,118 @@ fn staging_operation(state: ToggleState) -> FileOperation {
         FileOperation::Unstage
     } else {
         FileOperation::Stage
+    }
+}
+
+pub(crate) fn staging_baseline_for_target(
+    target: &FileTarget,
+    repository: Option<&VcsRepositorySnapshot>,
+) -> String {
+    let working = repository.and_then(|repository| {
+        let comparison = repository
+            .descriptor
+            .baselines
+            .iter()
+            .find(|baseline| baseline.id == target.baseline)?;
+        if !matches!(
+            comparison.purpose,
+            Some(ComparisonPurpose::Staged | ComparisonPurpose::Unstaged)
+        ) {
+            return None;
+        }
+        repository
+            .descriptor
+            .baselines
+            .iter()
+            .find(|baseline| baseline.purpose == Some(ComparisonPurpose::Working))
+    });
+    working.map_or_else(|| target.baseline.clone(), |baseline| baseline.id.clone())
+}
+
+pub(crate) fn staging_unavailable_reason(
+    target: &FileTarget,
+    store: Option<&Entity<VcsStore>>,
+    busy: bool,
+    operation: FileOperation,
+    cx: &App,
+) -> Option<SharedString> {
+    let Some(store) = store else {
+        return Some("Source-control provider is unavailable.".into());
+    };
+    let store = store.read(cx);
+    if busy || store.file_operation_running() {
+        return Some("Another source-control operation is running.".into());
+    }
+    let repository = store
+        .repositories()
+        .into_iter()
+        .find(|repository| repository.key == target.repository);
+    let baseline = staging_baseline_for_target(target, repository.as_ref());
+    let loaded = repository.as_ref().is_some_and(|repository| {
+        if repository.selected_baseline == baseline {
+            repository.snapshot.is_some()
+        } else {
+            store
+                .comparison_snapshot(&target.repository, &baseline)
+                .is_some()
+        }
+    });
+    if !loaded {
+        return Some("Refresh working changes before staging or unstaging this file.".into());
+    }
+    if store
+        .file_operations_for_baseline(&target.repository, &target.change.path, &baseline)
+        .contains(&operation)
+    {
+        None
+    } else {
+        Some(
+            target
+                .change
+                .unavailable_reason
+                .clone()
+                .unwrap_or_else(|| {
+                    "The provider does not support this action for this file.".into()
+                })
+                .into(),
+        )
+    }
+}
+
+pub(crate) fn staging_state_for_target(
+    target: &FileTarget,
+    repository: Option<&VcsRepositorySnapshot>,
+) -> ToggleState {
+    let purpose = repository
+        .and_then(|repository| {
+            repository
+                .descriptor
+                .baselines
+                .iter()
+                .find(|baseline| baseline.id == target.baseline)
+        })
+        .and_then(|baseline| baseline.purpose);
+    match purpose {
+        Some(ComparisonPurpose::Staged) => ToggleState::Selected,
+        Some(ComparisonPurpose::Unstaged) => ToggleState::Unselected,
+        _ => staging_state(
+            &target.change,
+            repository
+                .and_then(|repository| repository.repository_state.as_ref())
+                .map_or(&[][..], |state| state.staged_paths.as_slice()),
+        ),
+    }
+}
+
+fn aggregate_staging_state(states: impl IntoIterator<Item = ToggleState>) -> ToggleState {
+    let mut states = states.into_iter();
+    let Some(first) = states.next() else {
+        return ToggleState::Unselected;
+    };
+    if states.all(|state| state == first) {
+        first
+    } else {
+        ToggleState::Indeterminate
     }
 }
 
@@ -413,12 +579,7 @@ pub(crate) fn file_context_menu(
             )
         })
         .unwrap_or_default();
-    let staged_paths = repository
-        .as_ref()
-        .and_then(|repository| repository.repository_state.as_ref())
-        .map(|state| state.staged_paths.as_slice())
-        .unwrap_or_default();
-    let state = staging_state(&target.change, staged_paths);
+    let state = staging_state_for_target(target, repository.as_ref());
     let operation = staging_operation(state);
     let entry = |label: SharedString, action, reason: Option<SharedString>| {
         let handler = handler.clone();
@@ -437,6 +598,9 @@ pub(crate) fn file_context_menu(
         entry
     };
     let unavailable = |operation: FileOperation| -> Option<SharedString> {
+        if matches!(operation, FileOperation::Stage | FileOperation::Unstage) {
+            return staging_unavailable_reason(target, store, busy, operation, cx);
+        }
         if busy || store.is_some_and(|store| store.read(cx).file_operation_running()) {
             Some("Another source-control operation is running.".into())
         } else if !operations.contains(&operation) {
@@ -579,6 +743,8 @@ pub struct VcsPanel {
     repositories: Vec<VcsRepositorySnapshot>,
     selected_repository_id: Option<VcsRepositoryId>,
     rows: Vec<Row>,
+    collapsed_sections: HashSet<String>,
+    expanded_directories: collections::HashMap<TreeKey, bool>,
     selected: Option<usize>,
     scroll_handle: UniformListScrollHandle,
     error: Option<SharedString>,
@@ -592,6 +758,7 @@ pub struct VcsPanel {
 impl VcsPanel {
     #[cfg(test)]
     pub(crate) fn set_test_repository(&mut self, snapshot: VcsRepositorySnapshot) {
+        self.selected_repository_id = Some(snapshot.key.clone());
         self.repositories = vec![snapshot];
     }
 
@@ -609,6 +776,21 @@ impl VcsPanel {
                 }
             })
         });
+        let view_options = |cx: &App| {
+            let settings = GitPanelSettings::get_global(cx);
+            (settings.group_by, settings.sort_by, settings.tree_view)
+        };
+        let mut previous_view_options = view_options(cx);
+        cx.observe_global::<SettingsStore>(move |panel, cx| {
+            let current = view_options(cx);
+            if current != previous_view_options {
+                previous_view_options = current;
+                panel.update_entries(cx);
+            } else {
+                cx.notify();
+            }
+        })
+        .detach();
         let mut panel = Self {
             workspace,
             project,
@@ -617,6 +799,8 @@ impl VcsPanel {
             repositories: Vec::new(),
             selected_repository_id: None,
             rows: Vec::new(),
+            collapsed_sections: HashSet::new(),
+            expanded_directories: collections::HashMap::default(),
             selected: None,
             scroll_handle: UniformListScrollHandle::new(),
             error: None,
@@ -634,7 +818,13 @@ impl VcsPanel {
         let selected = self
             .selected
             .and_then(|index| self.rows.get(index))
-            .map(|row| (row.repository.clone(), row.path.clone()));
+            .map(|row| {
+                (
+                    row.repository.clone(),
+                    row.path.clone(),
+                    row.presentation.section,
+                )
+            });
         self.repositories = self
             .store
             .as_ref()
@@ -663,14 +853,31 @@ impl VcsPanel {
                 (repository, changes)
             })
             .collect::<Vec<_>>();
-        self.rows = rows_for_repositories(&changes);
+        let settings = GitPanelSettings::get_global(cx);
+        self.rows = rows_for_repositories(
+            &changes,
+            settings.group_by,
+            settings.sort_by,
+            settings.tree_view,
+            &mut self.expanded_directories,
+        );
         self.selected = selected
             .and_then(|selected| {
                 self.rows.iter().position(|row| {
-                    row.change.is_some() && (row.repository.clone(), row.path.clone()) == selected
+                    row.is_selectable()
+                        && (
+                            row.repository.clone(),
+                            row.path.clone(),
+                            row.presentation.section,
+                        ) == selected
                 })
             })
-            .or_else(|| self.rows.iter().position(|row| row.change.is_some()));
+            .filter(|index| self.visible_row_indices().contains(index))
+            .or_else(|| {
+                self.visible_row_indices()
+                    .into_iter()
+                    .find(|index| self.rows[*index].is_selectable())
+            });
         cx.notify();
     }
 
@@ -753,12 +960,13 @@ impl VcsPanel {
 
     fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         let start = self.selected.map_or(0, |index| index + 1);
-        self.selected = (start..self.rows.len())
-            .find(|index| self.rows[*index].change.is_some())
+        self.selected = self
+            .visible_row_indices()
+            .into_iter()
+            .find(|index| *index >= start && self.rows[*index].is_selectable())
             .or(self.selected);
         if let Some(index) = self.selected {
-            self.scroll_handle
-                .scroll_to_item(index, ScrollStrategy::Center);
+            self.scroll_to_row(index);
         }
         cx.notify();
     }
@@ -770,20 +978,99 @@ impl VcsPanel {
         cx: &mut Context<Self>,
     ) {
         let start = self.selected.unwrap_or(self.rows.len());
-        self.selected = (0..start)
+        self.selected = self
+            .visible_row_indices()
+            .into_iter()
             .rev()
-            .find(|index| self.rows[*index].change.is_some())
+            .find(|index| *index < start && self.rows[*index].is_selectable())
             .or(self.selected);
         if let Some(index) = self.selected {
-            self.scroll_handle
-                .scroll_to_item(index, ScrollStrategy::Center);
+            self.scroll_to_row(index);
         }
         cx.notify();
     }
 
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(index) = self.selected {
-            self.open_diff(index, window, cx);
+            if let Some(directory) = self
+                .rows
+                .get(index)
+                .and_then(|row| row.presentation.directory.clone())
+            {
+                self.expanded_directories
+                    .insert(directory.key, !directory.expanded);
+                self.update_entries(cx);
+            } else {
+                self.open_diff(index, window, cx);
+            }
+        }
+    }
+
+    fn expand_selected_entry(
+        &mut self,
+        _: &git_panel::ExpandSelectedEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(directory) = self
+            .selected
+            .and_then(|index| self.rows.get(index))
+            .and_then(|row| row.presentation.directory.clone())
+        {
+            if !directory.expanded {
+                self.expanded_directories.insert(directory.key, true);
+                self.update_entries(cx);
+                return;
+            }
+        }
+        self.select_next(&menu::SelectNext, window, cx);
+    }
+
+    fn collapse_selected_entry(
+        &mut self,
+        _: &git_panel::CollapseSelectedEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !GitPanelSettings::get_global(cx).tree_view {
+            self.select_previous(&menu::SelectPrevious, window, cx);
+            return;
+        }
+        let Some(row) = self
+            .selected
+            .and_then(|index| self.rows.get(index))
+            .cloned()
+        else {
+            return;
+        };
+        let target = row
+            .presentation
+            .directory
+            .as_ref()
+            .filter(|directory| directory.expanded)
+            .map(|directory| (self.selected, directory.key.clone()))
+            .or_else(|| {
+                self.rows
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(index, parent)| {
+                        let directory = parent.presentation.directory.as_ref()?;
+                        (directory.expanded
+                            && parent.presentation.section == row.presentation.section
+                            && row.path.starts_with(&format!("{}/", parent.path)))
+                        .then(|| (Some(index), directory.key.clone()))
+                    })
+            });
+        let Some((selected, key)) = target else {
+            self.select_previous(&menu::SelectPrevious, window, cx);
+            return;
+        };
+        self.selected = selected;
+        self.expanded_directories.insert(key, false);
+        self.update_entries(cx);
+        if let Some(index) = self.selected {
+            self.scroll_to_row(index);
         }
     }
 
@@ -874,7 +1161,7 @@ impl VcsPanel {
             .filter(|row| row.change.is_some())
     }
 
-    fn selected_repository(&self) -> Option<VcsRepositorySnapshot> {
+    pub(crate) fn selected_repository(&self) -> Option<VcsRepositorySnapshot> {
         self.repositories
             .iter()
             .find(|repository| Some(&repository.key) == self.selected_repository_id.as_ref())
@@ -887,46 +1174,130 @@ impl VcsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(repository) = self.selected_repository() {
-            self.commit_repository(repository.key, window, cx);
-        }
+        let workspace = self.workspace.clone();
+        window.defer(cx, move |window, cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    if let Some(panel) = workspace.panel::<GitPanel>(cx) {
+                        panel.update(cx, |panel, cx| {
+                            panel.ensure_vcs_commit_editor(window, cx);
+                            panel
+                                .active_commit_editor(cx)
+                                .focus_handle(cx)
+                                .focus(window, cx);
+                        });
+                    }
+                })
+                .log_err();
+        });
     }
 
-    fn commit_repository(
+    pub(crate) fn commit_unavailable_reason(&self, cx: &App) -> Option<&'static str> {
+        let Some(repository) = self.selected_repository() else {
+            return Some("No repository available");
+        };
+        let Some(store) = self.store.as_ref().map(|store| store.read(cx)) else {
+            return Some("Source-control provider is unavailable");
+        };
+        if self.preparing_operation || store.file_operation_running() {
+            return Some("Source-control operation in progress");
+        }
+        if store.file_operation_unresolved(&repository.key)
+            || store.repository_operation_unresolved(&repository.key)
+        {
+            return Some("Refresh source control to reconcile the previous operation");
+        }
+        if !store
+            .repository_operations(&repository.key)
+            .contains(&RepositoryOperationKind::Commit)
+        {
+            return Some("The provider does not allow commits in this checkout");
+        }
+        if repository
+            .repository_state
+            .as_ref()
+            .is_none_or(|state| state.staged_paths.is_empty())
+        {
+            return Some("No staged changes to commit");
+        }
+        if self.project.read(cx).is_read_only(cx) {
+            return Some("You do not have write access to this project");
+        }
+        None
+    }
+
+    pub(crate) fn commit_message(
         &mut self,
-        key: VcsRepositoryId,
+        message: String,
+        editor: Entity<Editor>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.preparing_operation {
+        if message.trim().is_empty() {
             return;
         }
-        let Some(repository) = self
-            .repositories
-            .iter()
-            .find(|repository| repository.key == key)
-            .cloned()
-        else {
+        if let Some(reason) = self.commit_unavailable_reason(cx) {
+            self.error = Some(reason.into());
+            cx.notify();
+            return;
+        }
+        let Some(repository) = self.selected_repository() else {
             return;
         };
         let Some(store) = self.store.clone() else {
             return;
         };
-        if !store
-            .read(cx)
-            .repository_operations(&key)
-            .contains(&RepositoryOperationKind::Commit)
-        {
-            self.unsupported_action(cx);
-            return;
-        }
-        crate::vcs_repository_ui::show_commit(
-            self.workspace.clone(),
-            store,
-            repository,
-            window,
-            cx,
-        );
+        self.preparing_operation = true;
+        self.error = None;
+        let preparation = store.update(cx, |store, cx| {
+            store.prepare_repository_operation(
+                repository.key,
+                RepositoryOperation::Commit {
+                    message: message.clone(),
+                },
+                cx,
+            )
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result: Result<()> = async {
+                let prepared = preparation.await?;
+                store
+                    .update(cx, |store, cx| {
+                        store.apply_prepared_repository_operation(prepared, cx)
+                    })
+                    .await?;
+                Ok(())
+            }
+            .await;
+            this.update_in(cx, |this, window, cx| {
+                this.preparing_operation = false;
+                match result {
+                    Ok(()) => editor.update(cx, |editor, cx| {
+                        if editor.text(cx) == message {
+                            editor.set_text("", window, cx);
+                        }
+                    }),
+                    Err(error) => this.error = Some(format!("{error:#}").into()),
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(crate) fn can_switch_branch(&self, cx: &App) -> bool {
+        !self.preparing_operation
+            && self.selected_repository().is_some_and(|repository| {
+                self.store.as_ref().is_some_and(|store| {
+                    !store.read(cx).file_operation_running()
+                        && store
+                            .read(cx)
+                            .repository_operations(&repository.key)
+                            .contains(&RepositoryOperationKind::SwitchBranch)
+                })
+            })
     }
 
     pub(crate) fn switch_branch(
@@ -1054,7 +1425,26 @@ impl VcsPanel {
         let Some(row) = self.selected_file().cloned() else {
             return;
         };
-        self.run_path_operation(row.repository, row.path, operation, None, cx);
+        let Some(target) = self.target_for_row(&row) else {
+            return;
+        };
+        let baseline = if matches!(operation, FileOperation::Stage | FileOperation::Unstage) {
+            staging_baseline_for_target(
+                &target,
+                self.repositories
+                    .iter()
+                    .find(|repository| repository.key == target.repository),
+            )
+        } else {
+            target.baseline.clone()
+        };
+        self.run_path_operation(
+            target.repository,
+            target.change.path,
+            operation,
+            Some(baseline),
+            cx,
+        );
     }
 
     fn run_path_operation(
@@ -1128,12 +1518,16 @@ impl VcsPanel {
         if change.kind != ContentKind::File {
             return;
         }
+        let Some(target) = self.target_for_row(&row) else {
+            return;
+        };
         self.workspace
             .update(cx, |workspace, cx| {
-                crate::vcs_project_diff::deploy_at_with_focus(
+                crate::vcs_project_diff::deploy_baseline(
                     workspace,
-                    row.repository,
-                    Some(row.path),
+                    target.repository,
+                    target.baseline,
+                    Some(target.change.path),
                     focus,
                     window,
                     cx,
@@ -1173,14 +1567,15 @@ impl VcsPanel {
     }
 
     fn target_for_row(&self, row: &Row) -> Option<FileTarget> {
+        let baseline = self
+            .repositories
+            .iter()
+            .find(|repository| repository.key == row.repository)
+            .map(|repository| row.baseline(repository))
+            .unwrap_or_default();
         Some(FileTarget {
             repository: row.repository.clone(),
-            baseline: self
-                .repositories
-                .iter()
-                .find(|repository| repository.key == row.repository)
-                .map(|repository| repository.selected_baseline.clone())
-                .unwrap_or_default(),
+            baseline,
             change: row.change.clone()?,
         })
     }
@@ -1254,19 +1649,25 @@ impl VcsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let staging_baseline = staging_baseline_for_target(
+            &target,
+            self.repositories
+                .iter()
+                .find(|repository| repository.key == target.repository),
+        );
         match action {
             FileAction::Stage => self.run_path_operation(
                 target.repository,
                 target.change.path,
                 FileOperation::Stage,
-                Some(target.baseline),
+                Some(staging_baseline),
                 cx,
             ),
             FileAction::Unstage => self.run_path_operation(
                 target.repository,
                 target.change.path,
                 FileOperation::Unstage,
-                Some(target.baseline),
+                Some(staging_baseline),
                 cx,
             ),
             FileAction::Ignore => self.confirm_path_operation(
@@ -1441,7 +1842,12 @@ impl VcsPanel {
     }
 
     pub(crate) fn change_count(&self) -> usize {
-        self.rows.iter().filter(|row| row.change.is_some()).count()
+        self.rows
+            .iter()
+            .filter(|row| row.change.is_some())
+            .map(|row| (&row.repository, &row.path))
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     fn show_project_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1463,8 +1869,7 @@ impl VcsPanel {
     ) {
         self.select_next(&menu::SelectNext, window, cx);
         if let Some(index) = self.selected {
-            self.scroll_handle
-                .scroll_to_item(index, ScrollStrategy::Center);
+            self.scroll_to_row(index);
             self.open_diff_with_focus(index, false, window, cx);
         }
     }
@@ -1477,8 +1882,7 @@ impl VcsPanel {
     ) {
         self.select_previous(&menu::SelectPrevious, window, cx);
         if let Some(index) = self.selected {
-            self.scroll_handle
-                .scroll_to_item(index, ScrollStrategy::Center);
+            self.scroll_to_row(index);
             self.open_diff_with_focus(index, false, window, cx);
         }
     }
@@ -1489,10 +1893,12 @@ impl VcsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.selected = self.rows.iter().position(|row| row.change.is_some());
+        self.selected = self
+            .visible_row_indices()
+            .into_iter()
+            .find(|index| self.rows[*index].is_selectable());
         if let Some(index) = self.selected {
-            self.scroll_handle
-                .scroll_to_item(index, ScrollStrategy::Center);
+            self.scroll_to_row(index);
             self.open_diff_with_focus(index, false, window, cx);
         }
     }
@@ -1503,10 +1909,13 @@ impl VcsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.selected = self.rows.iter().rposition(|row| row.change.is_some());
+        self.selected = self
+            .visible_row_indices()
+            .into_iter()
+            .rev()
+            .find(|index| self.rows[*index].is_selectable());
         if let Some(index) = self.selected {
-            self.scroll_handle
-                .scroll_to_item(index, ScrollStrategy::Center);
+            self.scroll_to_row(index);
             self.open_diff_with_focus(index, false, window, cx);
         }
     }
@@ -1520,10 +1929,7 @@ impl VcsPanel {
             .and_then(|repository| repository.repository_state)
             .map(|state| state.staged_paths.clone())
             .unwrap_or_default();
-        let Some(change) = row.change.as_ref() else {
-            return;
-        };
-        self.run_file_operation(staging_operation(staging_state(change, &staged_paths)), cx);
+        self.run_file_operation(staging_operation(row.staging_state(&staged_paths)), cx);
     }
 
     pub(crate) fn unsupported_action(&mut self, cx: &mut Context<Self>) {
@@ -1552,38 +1958,323 @@ impl VcsPanel {
         Ok(item)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn visible_row_count(&self) -> usize {
+        self.visible_row_indices().len()
+    }
+
+    fn visible_row_indices(&self) -> Vec<usize> {
+        let mut collapsed = false;
+        self.rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                if row.change.is_none()
+                    && row.presentation.directory.is_none()
+                    && !row.presentation.empty_section
+                {
+                    let title = row
+                        .label
+                        .rsplit_once(" (")
+                        .map_or(row.label.as_str(), |(title, _)| title);
+                    collapsed = self.collapsed_sections.contains(title);
+                    Some(index)
+                } else {
+                    (!collapsed && !row.presentation.hidden).then_some(index)
+                }
+            })
+            .collect()
+    }
+
+    fn compute_visible_depths(&self, range: Range<usize>) -> smallvec::SmallVec<[usize; 64]> {
+        let visible = self.visible_row_indices();
+        range
+            .map(|index| {
+                visible
+                    .get(index)
+                    .and_then(|index| self.rows.get(*index))
+                    .map_or(0, |row| row.presentation.depth)
+            })
+            .collect()
+    }
+
+    fn scroll_to_row(&self, index: usize) {
+        if let Some(index) = self
+            .visible_row_indices()
+            .iter()
+            .position(|row| *row == index)
+        {
+            self.scroll_handle
+                .scroll_to_item(index, ScrollStrategy::Center);
+        }
+    }
+
+    fn render_options_menu(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let focus = self.focus.clone();
+        PopoverMenu::new("view_options_menu")
+            .trigger_with_tooltip(
+                IconButton::new("view-options-menu-trigger", IconName::Filter)
+                    .icon_size(IconSize::Small),
+                Tooltip::text("View Options"),
+            )
+            .menu(move |window, cx| {
+                Some(git_panel::git_panel_view_options_menu(
+                    focus.clone(),
+                    window,
+                    cx,
+                ))
+            })
+            .anchor(Anchor::TopRight)
+    }
+
+    fn render_actions_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let panel = cx.entity();
+        let staged_paths = self
+            .selected_repository()
+            .and_then(|repository| repository.repository_state)
+            .map(|state| state.staged_paths.clone())
+            .unwrap_or_default();
+        let unstage = self.change_count() > 0
+            && self
+                .rows
+                .iter()
+                .filter_map(|row| row.change.as_ref())
+                .all(|change| staging_state(change, &staged_paths) == ToggleState::Selected);
+        let title = if unstage { "Unstage All" } else { "Stage All" };
+        SplitButton::new(
+            ButtonLike::new_rounded_left("git-changes-actions-split-button-left")
+                .layer(ElevationIndex::ModalSurface)
+                .size(ButtonSize::Compact)
+                .child(Label::new(title).size(LabelSize::Small).mr_0p5())
+                .disabled(true)
+                .tooltip(Tooltip::text(
+                    "The provider supports staging individual files",
+                )),
+            PopoverMenu::new("git-changes-actions-split-button-menu")
+                .trigger(crate::render_split_button_chevron_trigger(
+                    "changes-actions-split-button-right",
+                    false,
+                ))
+                .menu(move |window, cx| {
+                    let panel = panel.clone();
+                    Some(ContextMenu::build(window, cx, |menu, _, cx| {
+                        let refresh_panel = panel.clone();
+                        let diagnostics_panel = panel.clone();
+                        let repository = panel.read(cx).selected_repository();
+                        let has_checkouts = repository.as_ref().is_some_and(|repository| {
+                            panel.read(cx).store.as_ref().is_some_and(|store| {
+                                store.read(cx).checkout_catalog_available(&repository.key)
+                            })
+                        });
+                        let mut menu = menu;
+                        if let Some(repository) = &repository {
+                            menu = menu.header("Comparison");
+                            for baseline in repository.descriptor.baselines.clone() {
+                                let key = repository.key.clone();
+                                let panel = panel.clone();
+                                let selected = repository.selected_baseline == baseline.id;
+                                menu = menu.item(
+                                    ContextMenuEntry::new(baseline.label)
+                                        .toggle(IconPosition::End, selected)
+                                        .handler(move |_, cx| {
+                                            panel.update(cx, |panel, cx| {
+                                                panel.error = None;
+                                                if let Some(store) = &panel.store {
+                                                    if let Err(error) =
+                                                        store.update(cx, |store, cx| {
+                                                            store.set_baseline(
+                                                                &key,
+                                                                baseline.id.clone(),
+                                                                cx,
+                                                            )
+                                                        })
+                                                    {
+                                                        panel.error =
+                                                            Some(format!("{error:#}").into());
+                                                    }
+                                                }
+                                                cx.notify();
+                                            });
+                                        }),
+                                );
+                            }
+                            menu = menu.separator();
+                        }
+                        menu.entry("Refresh", None, move |_, cx| {
+                            refresh_panel.update(cx, |panel, cx| {
+                                panel.error = None;
+                                if let Some(store) = &panel.store {
+                                    store.update(cx, |store, cx| store.refresh_all(cx));
+                                }
+                            });
+                        })
+                        .entry("Provider Diagnostics", None, move |window, cx| {
+                            let workspace = diagnostics_panel.read(cx).workspace.clone();
+                            workspace
+                                .update(cx, |workspace, cx| show_diagnostics(workspace, window, cx))
+                                .log_err();
+                        })
+                        .when(has_checkouts, |menu| {
+                            menu.entry("Checkouts", None, move |window, cx| {
+                                let workspace = panel.read(cx).workspace.clone();
+                                let key =
+                                    repository.as_ref().map(|repository| repository.key.clone());
+                                workspace
+                                    .update(cx, |workspace, cx| {
+                                        git_ui_core::vcs_checkout_picker::show(
+                                            workspace, key, window, cx,
+                                        )
+                                    })
+                                    .log_err();
+                            })
+                        })
+                    }))
+                })
+                .anchor(Anchor::TopRight)
+                .offset(gpui::Point {
+                    x: px(0.),
+                    y: px(2.),
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_rows(
         &mut self,
         range: Range<usize>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
+        let visible = self.visible_row_indices();
         range
+            .filter_map(|visible_index| visible.get(visible_index).copied())
             .filter_map(|index| self.rows.get(index).cloned().map(|row| (index, row)))
             .map(|(index, row)| {
+                if row.presentation.empty_section {
+                    return git_panel::status_empty_section(
+                        row.presentation.section.unwrap_or(Section::Tracked),
+                    );
+                }
+                if let Some(directory) = row.presentation.directory.clone() {
+                    let key = directory.key.clone();
+                    let staged_paths = self
+                        .selected_repository()
+                        .and_then(|repository| repository.repository_state)
+                        .map(|state| state.staged_paths.clone())
+                        .unwrap_or_default();
+                    let prefix = format!("{}/", row.path);
+                    let directory_state = aggregate_staging_state(
+                        self.rows
+                            .iter()
+                            .filter(|child| {
+                                child.change.is_some()
+                                    && child.presentation.section == row.presentation.section
+                                    && child.path.starts_with(&prefix)
+                            })
+                            .map(|child| child.staging_state(&staged_paths)),
+                    );
+                    return git_panel::status_row(
+                        ("vcs-directory", index).into(),
+                        self.selected == Some(index),
+                        false,
+                        self.focus.is_focused(window),
+                        cx,
+                    )
+                    .min_w_0()
+                    .justify_between()
+                    .child(git_panel::status_directory_name(&directory, cx))
+                    .child(
+                        Checkbox::new(("vcs-directory-stage", index), directory_state)
+                            .fill()
+                            .elevation(ElevationIndex::Surface)
+                            .disabled(true)
+                            .tooltip(Tooltip::text(
+                                "The provider supports staging individual files",
+                            )),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.selected = Some(index);
+                        this.expanded_directories
+                            .insert(key.clone(), !directory.expanded);
+                        this.update_entries(cx);
+                    }))
+                    .into_any_element();
+                }
                 let Some(change) = row.change.as_ref() else {
-                    return ListItem::new(index)
-                        .inset(true)
-                        .disabled(true)
-                        .child(Label::new(row.label).color(Color::Muted))
-                        .into_any_element();
-                };
-                let (status, color) = match change.status {
-                    ChangeStatus::Added => ("A", Color::VersionControlAdded),
-                    ChangeStatus::Untracked => ("?", Color::VersionControlAdded),
-                    ChangeStatus::Modified => ("M", Color::VersionControlModified),
-                    ChangeStatus::Deleted => ("D", Color::Disabled),
-                    ChangeStatus::Renamed => ("R", Color::VersionControlModified),
+                    let (title, count) = row
+                        .label
+                        .rsplit_once(" (")
+                        .map(|(title, count)| {
+                            (
+                                title.to_owned(),
+                                count.trim_end_matches(')').parse().unwrap_or(0),
+                            )
+                        })
+                        .unwrap_or_else(|| (row.label.clone(), 0));
+                    let collapsed = self.collapsed_sections.contains(&title);
+                    let staged_paths = self
+                        .selected_repository()
+                        .and_then(|repository| repository.repository_state)
+                        .map(|state| state.staged_paths.clone())
+                        .unwrap_or_default();
+                    let states = self
+                        .rows
+                        .iter()
+                        .skip(index + 1)
+                        .take_while(|row| {
+                            row.change.is_some() || row.presentation.directory.is_some()
+                        })
+                        .filter_map(|row| row.change.as_ref())
+                        .map(|change| staging_state(change, &staged_paths))
+                        .collect::<Vec<_>>();
+                    let section_state = if row.presentation.section == Some(Section::Staged) {
+                        ToggleState::Selected
+                    } else if row.presentation.section == Some(Section::Unstaged) {
+                        ToggleState::Unselected
+                    } else if states.iter().all(|state| *state == ToggleState::Selected) {
+                        ToggleState::Selected
+                    } else if states.iter().all(|state| *state == ToggleState::Unselected) {
+                        ToggleState::Unselected
+                    } else {
+                        ToggleState::Indeterminate
+                    };
+                    return git_panel::status_list_header(
+                        ("vcs-header", index).into(),
+                        title.clone().into(),
+                        count,
+                        collapsed,
+                        cx,
+                    )
+                    .when(count > 0, |this| {
+                        this.child(
+                            Checkbox::new(("vcs-stage-section", index), section_state)
+                                .fill()
+                                .elevation(ElevationIndex::Surface)
+                                .disabled(true)
+                                .tooltip(Tooltip::text(
+                                    "The provider supports staging individual files",
+                                )),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.collapsed_sections.remove(&title) {
+                            this.collapsed_sections.insert(title.clone());
+                        }
+                        let visible = this.visible_row_indices();
+                        if this.selected.is_some_and(|index| !visible.contains(&index)) {
+                            this.selected = visible
+                                .into_iter()
+                                .find(|index| this.rows[*index].change.is_some());
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element();
                 };
                 let path = Path::new(&row.path);
                 let parent = path
                     .parent()
                     .filter(|path| !path.as_os_str().is_empty())
                     .map(|path| path.to_string_lossy().into_owned());
-                let icon = GitPanelSettings::get_global(cx)
-                    .file_icons
-                    .then(|| FileIcons::get_icon(path, cx))
-                    .flatten();
                 let panel = cx.entity().downgrade();
                 let Some(target) = self.target_for_row(&row) else {
                     return gpui::Empty.into_any_element();
@@ -1593,33 +2284,29 @@ impl VcsPanel {
                     .and_then(|repository| repository.repository_state)
                     .map(|state| state.staged_paths.clone())
                     .unwrap_or_default();
-                let state = staging_state(change, &staged_paths);
+                let state = row.staging_state(&staged_paths);
                 let operation = staging_operation(state);
-                let disabled = self.preparing_operation
-                    || self.store.as_ref().is_none_or(|store| {
-                        store.read(cx).file_operation_running()
-                            || !store
-                                .read(cx)
-                                .file_operations_for_baseline(
-                                    &row.repository,
-                                    &row.path,
-                                    &target.baseline,
-                                )
-                                .contains(&operation)
-                    });
+                let unavailable = staging_unavailable_reason(
+                    &target,
+                    self.store.as_ref(),
+                    self.preparing_operation,
+                    operation,
+                    cx,
+                );
+                let disabled = unavailable.is_some();
                 let checkbox_panel = panel.clone();
                 let checkbox_target = target.clone();
                 let checkbox = Checkbox::new(("vcs-stage", index), state)
+                    .fill()
+                    .elevation(ElevationIndex::Surface)
                     .disabled(disabled)
-                    .tooltip(Tooltip::text(if disabled {
-                        change.unavailable_reason.clone().unwrap_or_else(|| {
-                            "Staging is unavailable for this file or checkout.".into()
-                        })
-                    } else if operation == FileOperation::Unstage {
-                        "Unstage File".into()
-                    } else {
-                        "Stage File".into()
-                    }))
+                    .tooltip(Tooltip::text(unavailable.unwrap_or_else(|| {
+                        if operation == FileOperation::Unstage {
+                            "Unstage File".into()
+                        } else {
+                            "Stage File".into()
+                        }
+                    })))
                     .on_click(move |_, window, cx| {
                         cx.stop_propagation();
                         checkbox_panel
@@ -1637,43 +2324,41 @@ impl VcsPanel {
                             })
                             .log_err();
                     });
-                let item = ListItem::new(index)
-                    .inset(true)
-                    .spacing(ListItemSpacing::Sparse)
-                    .toggle_state(self.selected == Some(index))
-                    .start_slot(
-                        h_flex()
-                            .child(checkbox)
-                            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| {
-                                cx.stop_propagation()
-                            }),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .overflow_hidden()
-                            .when_some(icon, |this, icon| {
-                                this.child(Icon::from_path(icon).size(IconSize::Small))
-                            })
-                            .child(Label::new(row.label).color(color))
-                            .when_some(parent, |this, parent| {
-                                this.child(
-                                    Label::new(parent)
-                                        .color(Color::Muted)
-                                        .size(LabelSize::Small),
-                                )
-                            }),
-                    )
-                    .end_slot(Label::new(status).color(color).size(LabelSize::Small))
-                    .tooltip(Tooltip::text(match &change.old_path {
-                        Some(old) => format!("{old} → {}", row.path),
-                        None => row.path.clone(),
-                    }))
-                    .on_click(
-                        cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                            this.open_entry_on_click(index, event.click_count() > 1, window, cx)
-                        }),
-                    );
+                let item = git_panel::status_row(
+                    ("vcs-entry", index).into(),
+                    self.selected == Some(index),
+                    false,
+                    self.focus.is_focused(window),
+                    cx,
+                )
+                .child(git_panel::status_name_row(
+                    path,
+                    row.label.clone(),
+                    parent,
+                    presentation_status(change),
+                    row.presentation.depth,
+                    GitPanelSettings::get_global(cx).tree_view,
+                    self.project.read(cx).path_style(cx),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .id(("vcs-stage-wrapper", index))
+                        .flex_none()
+                        .occlude()
+                        .cursor_pointer()
+                        .child(checkbox)
+                        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                )
+                .tooltip(Tooltip::text(match &change.old_path {
+                    Some(old) => format!("{old} → {}", row.path),
+                    None => row.path.clone(),
+                }))
+                .on_click(cx.listener(
+                    move |this, event: &gpui::ClickEvent, window, cx| {
+                        this.open_entry_on_click(index, event.click_count() > 1, window, cx)
+                    },
+                ));
                 right_click_menu(("vcs-file-menu", index))
                     .trigger(move |_, _, _| item)
                     .menu(move |window, cx| {
@@ -1682,6 +2367,9 @@ impl VcsPanel {
                                 panel.selected = panel.rows.iter().position(|row| {
                                     row.repository == target.repository
                                         && row.path == target.change.path
+                                        && panel.target_for_row(row).is_some_and(|row_target| {
+                                            row_target.baseline == target.baseline
+                                        })
                                 });
                                 cx.notify();
                             })
@@ -1781,37 +2469,188 @@ fn add_comparison(
     editor
 }
 
-fn rows_for_repositories(repositories: &[(&VcsRepositorySnapshot, Vec<Change>)]) -> Vec<Row> {
+fn rows_for_repositories(
+    repositories: &[(&VcsRepositorySnapshot, Vec<Change>)],
+    group_by: GitPanelGroupBy,
+    sort_by: GitPanelSortBy,
+    tree_view: bool,
+    expanded_directories: &mut collections::HashMap<TreeKey, bool>,
+) -> Vec<Row> {
     let mut rows = Vec::new();
     for (repository, changes) in repositories {
-        for (label, untracked) in [("Tracked", false), ("Untracked", true)] {
+        let staged_paths = repository
+            .repository_state
+            .as_ref()
+            .map_or(&[][..], |state| state.staged_paths.as_slice());
+        let project_staging = repository
+            .descriptor
+            .baselines
+            .iter()
+            .find(|baseline| baseline.id == repository.selected_baseline)
+            .is_some_and(|baseline| {
+                matches!(
+                    baseline.purpose,
+                    Some(
+                        ComparisonPurpose::Working
+                            | ComparisonPurpose::Staged
+                            | ComparisonPurpose::Unstaged
+                    )
+                )
+            });
+        let sections = match group_by {
+            GitPanelGroupBy::None => vec![(Section::Tracked, "")],
+            GitPanelGroupBy::Status => {
+                vec![(Section::Tracked, "Tracked"), (Section::New, "Untracked")]
+            }
+            GitPanelGroupBy::Staging => {
+                vec![(Section::Staged, "Staged"), (Section::Unstaged, "Unstaged")]
+            }
+        };
+        for (section, label) in sections {
             let mut changes = changes
                 .iter()
-                .filter(|change| (change.status == ChangeStatus::Untracked) == untracked)
+                .filter(|change| {
+                    if group_by == GitPanelGroupBy::None {
+                        return true;
+                    }
+                    match section {
+                        Section::Tracked => !presentation_status(change).is_created(),
+                        Section::New => presentation_status(change).is_created(),
+                        Section::Staged => {
+                            staging_state(change, staged_paths) != ToggleState::Unselected
+                        }
+                        Section::Unstaged => {
+                            staging_state(change, staged_paths) != ToggleState::Selected
+                        }
+                        Section::Conflict => false,
+                    }
+                })
+                .cloned()
                 .collect::<Vec<_>>();
-            if changes.is_empty() {
+            let show_empty = group_by == GitPanelGroupBy::Staging
+                && repositories.iter().any(|(_, changes)| !changes.is_empty());
+            if changes.is_empty() && !show_empty {
                 continue;
             }
-            changes.sort_by(|left, right| left.path.cmp(&right.path));
-            rows.push(Row {
-                repository: repository.key.clone(),
-                path: String::new(),
-                label: format!("{label} ({})", changes.len()),
-                change: None,
+            changes.sort_by(|left, right| {
+                git_panel::compare_change_paths(&left.path, &right.path, sort_by)
             });
-            rows.extend(changes.into_iter().map(|change| {
-                Row {
-                    repository: repository.key.clone(),
-                    path: change.path.clone(),
-                    label: change
-                        .path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(&change.path)
-                        .to_owned(),
-                    change: Some(change.clone()),
+            let comparison = if project_staging {
+                match section {
+                    Section::Staged => Some(ComparisonPurpose::Staged),
+                    Section::Unstaged => Some(ComparisonPurpose::Unstaged),
+                    _ => None,
                 }
-            }));
+            } else {
+                None
+            };
+            if !label.is_empty() {
+                rows.push(Row {
+                    repository: repository.key.clone(),
+                    path: String::new(),
+                    label: format!("{label} ({})", changes.len()),
+                    change: None,
+                    presentation: RowPresentation {
+                        section: Some(section),
+                        comparison,
+                        ..Default::default()
+                    },
+                });
+            }
+            if changes.is_empty() {
+                rows.push(Row {
+                    repository: repository.key.clone(),
+                    path: String::new(),
+                    label: String::new(),
+                    change: None,
+                    presentation: RowPresentation {
+                        section: Some(section),
+                        empty_section: true,
+                        ..Default::default()
+                    },
+                });
+                continue;
+            }
+            let files = changes
+                .into_iter()
+                .map(|mut change| {
+                    if comparison == Some(ComparisonPurpose::Staged) {
+                        change.status = change.staged_status.unwrap_or(change.status);
+                    } else if comparison == Some(ComparisonPurpose::Unstaged) {
+                        change.status = change.unstaged_status.unwrap_or(change.status);
+                    }
+                    Row {
+                        repository: repository.key.clone(),
+                        path: change.path.clone(),
+                        label: change
+                            .path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&change.path)
+                            .to_owned(),
+                        change: Some(change),
+                        presentation: RowPresentation {
+                            section: Some(section),
+                            comparison,
+                            ..Default::default()
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !tree_view {
+                rows.extend(files);
+                continue;
+            }
+            let indexed_paths = files
+                .iter()
+                .enumerate()
+                .filter_map(
+                    |(index, row)| match git::repository::RepoPath::new(&row.path) {
+                        Ok(path) => Some((path, index)),
+                        Err(error) => {
+                            log::error!("Invalid provider file path: {error}");
+                            None
+                        }
+                    },
+                )
+                .collect();
+            let mut seen = collections::HashSet::default();
+            let mut descendants = collections::HashMap::default();
+            for (row, visible) in git_panel::project_status_tree(
+                section,
+                indexed_paths,
+                expanded_directories,
+                &mut seen,
+                &mut descendants,
+            ) {
+                match row {
+                    StatusTreeRow::File {
+                        source_index,
+                        depth,
+                    } => {
+                        if let Some(file) = files.get(source_index) {
+                            let mut file = file.clone();
+                            file.presentation.depth = depth;
+                            file.presentation.hidden = !visible;
+                            rows.push(file);
+                        }
+                    }
+                    StatusTreeRow::Directory(directory) => rows.push(Row {
+                        repository: repository.key.clone(),
+                        path: directory.key.path.as_unix_str().to_owned(),
+                        label: directory.name.to_string(),
+                        change: None,
+                        presentation: RowPresentation {
+                            section: Some(section),
+                            comparison,
+                            depth: directory.depth,
+                            hidden: !visible,
+                            directory: Some(directory),
+                            empty_section: false,
+                        },
+                    }),
+                }
+            }
         }
     }
     rows
@@ -1831,50 +2670,10 @@ impl Render for VcsPanel {
             .as_ref()
             .map(|store| store.read(cx).errors())
             .unwrap_or_default();
-        let operation_running = self.preparing_operation
-            || self
-                .store
-                .as_ref()
-                .is_some_and(|store| store.read(cx).file_operation_running());
-        let repository_operations = repository
-            .as_ref()
-            .and_then(|repository| {
-                self.store
-                    .as_ref()
-                    .map(|store| store.read(cx).repository_operations(&repository.key))
-            })
-            .unwrap_or_default();
-        let file_operations = self
-            .selected_file()
-            .and_then(|row| {
-                self.store.as_ref().map(|store| {
-                    store
-                        .read(cx)
-                        .file_operations_for_path(&row.repository, &row.path)
-                })
-            })
-            .unwrap_or_default();
-        let discard_reason = self.selected_file().and_then(|row| {
-            discard_unavailable_reason(self.store.as_ref(), &row.repository, &row.path, None, cx)
-        });
-        let unresolved = repository.as_ref().is_some_and(|repository| {
-            self.store.as_ref().is_some_and(|store| {
-                let store = store.read(cx);
-                store.file_operation_unresolved(&repository.key)
-                    || store.repository_operation_unresolved(&repository.key)
-            })
-        });
-        let blocked = operation_running || unresolved;
         let operation_error = repository.as_ref().and_then(|repository| {
             self.store
                 .as_ref()
                 .and_then(|store| store.read(cx).file_operation_error(&repository.key))
-        });
-        let read_only_reason = repository.as_ref().and_then(|repository| {
-            let store = self.store.as_ref()?.read(cx);
-            if !store.file_operations(&repository.key).is_empty() || !repository_operations.is_empty() { return None; }
-            Some(self.selected_file().and_then(|row| row.change.as_ref()).and_then(|change| change.unavailable_reason.clone())
-                .unwrap_or_else(|| "Read-only repository: the provider does not allow changes in this checkout.".into()))
         });
         let count = self.change_count();
         let loading = repository
@@ -1899,6 +2698,8 @@ impl Render for VcsPanel {
             .overflow_hidden()
             .on_action(cx.listener(Self::select_next))
             .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::expand_selected_entry))
+            .on_action(cx.listener(Self::collapse_selected_entry))
             .on_action(cx.listener(Self::next_entry))
             .on_action(cx.listener(Self::previous_entry))
             .on_action(cx.listener(Self::first_entry))
@@ -1971,6 +2772,8 @@ impl Render for VcsPanel {
                     .w_full()
                     .pl_1()
                     .pr_2()
+                    .flex_none()
+                    .flex_wrap()
                     .gap_1()
                     .justify_between()
                     .child(
@@ -2000,65 +2803,10 @@ impl Render for VcsPanel {
                     .child(
                         h_flex()
                             .gap_1()
-                            .child(
-                                Label::new(count.to_string())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            )
-                            .child(
-                                IconButton::new("vcs-diagnostics", IconName::Ellipsis)
-                                    .tooltip(Tooltip::text("Provider diagnostics"))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.workspace
-                                            .update(cx, |workspace, cx| {
-                                                show_diagnostics(workspace, window, cx)
-                                            })
-                                            .log_err();
-                                    })),
-                            )
-                            .child(
-                                IconButton::new("refresh-vcs", IconName::ArrowCircle)
-                                    .disabled(operation_running)
-                                    .tooltip(Tooltip::text("Refresh changes"))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.error = None;
-                                        if let Some(store) = &this.store {
-                                            store.update(cx, |store, cx| store.refresh_all(cx));
-                                        }
-                                    })),
-                            ),
+                            .child(self.render_options_menu(cx))
+                            .child(self.render_actions_menu(cx)),
                     ),
             )
-            .when_some(repository.clone(), |this, repository| {
-                this.child(
-                    h_flex().px_2().py_1().gap_1().flex_wrap().children(
-                        repository
-                            .descriptor
-                            .baselines
-                            .iter()
-                            .enumerate()
-                            .map(|(index, baseline)| {
-                                let key = repository.key.clone();
-                                let baseline_id = baseline.id.clone();
-                                Button::new(("vcs-baseline", index), baseline.label.clone())
-                                    .label_size(LabelSize::Small)
-                                    .toggle_state(repository.selected_baseline == baseline.id)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.error = None;
-                                        if let Some(store) = &this.store
-                                            && let Err(error) = store.update(cx, |store, cx| {
-                                                store.set_baseline(&key, baseline_id.clone(), cx)
-                                            })
-                                        {
-                                            this.error = Some(format!("{error:#}").into());
-                                        }
-                                        cx.notify();
-                                    }))
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-                )
-            })
             .when(loading, |this| {
                 this.child(
                     div()
@@ -2091,9 +2839,9 @@ impl Render for VcsPanel {
             })
             .when(count == 0 && !loading, |this| {
                 this.child(
-                    div().p_4().child(
+                    v_flex().flex_1().items_center().justify_center().child(
                         Label::new(if repository.is_some() {
-                            "No changes for this comparison"
+                            "No changes to commit"
                         } else {
                             "No repository available"
                         })
@@ -2101,198 +2849,24 @@ impl Render for VcsPanel {
                     ),
                 )
             })
-            .child(
-                uniform_list(
-                    "vcs-changes",
-                    self.rows.len(),
-                    cx.processor(Self::render_rows),
-                )
-                .track_scroll(&self.scroll_handle)
-                .flex_1(),
-            )
-            .when_some(
-                read_only_reason.filter(|_| discard_reason.is_none()),
-                |this, reason| {
-                    this.child(
-                        div().px_2().py_1().child(
-                            Label::new(reason)
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
-                        ),
+            .when(count > 0, |this| {
+                this.child(
+                    uniform_list(
+                        "vcs-changes",
+                        self.visible_row_indices().len(),
+                        cx.processor(Self::render_rows),
                     )
-                },
-            )
-            .when(unresolved, |this| {
-                this.child(
-                    div().px_2().py_1().child(
-                        Label::new("Refresh to reconcile the previous operation.")
-                            .size(LabelSize::Small)
-                            .color(Color::Warning),
-                    ),
-                )
-            })
-            .when(operation_running, |this| {
-                this.child(
-                    div().px_2().py_1().child(
-                        Label::new("Updating source control…")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-                )
-            })
-            .when(self.selected_file().is_some(), |this| {
-                this.child(
-                    h_flex()
-                        .px_2()
-                        .py_1()
-                        .gap_1()
-                        .child(
-                            Button::new("vcs-stage-file", "Stage File")
-                                .label_size(LabelSize::Small)
-                                .disabled(
-                                    blocked || !file_operations.contains(&FileOperation::Stage),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.run_file_operation(FileOperation::Stage, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("vcs-unstage-file", "Unstage File")
-                                .label_size(LabelSize::Small)
-                                .disabled(
-                                    blocked || !file_operations.contains(&FileOperation::Unstage),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.run_file_operation(FileOperation::Unstage, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("vcs-discard-file", "Discard Changes")
-                                .label_size(LabelSize::Small)
-                                .disabled(blocked || discard_reason.is_some())
-                                .tooltip(Tooltip::text(discard_reason.clone().unwrap_or_else(
-                                    || "Discard unstaged changes to this file".into(),
-                                )))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.discard_file(&DiscardFile, window, cx)
-                                })),
-                        ),
-                )
-            })
-            .when_some(discard_reason, |this, reason| {
-                this.child(
-                    div().px_2().py_1().child(
-                        Label::new(reason)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-                )
-            })
-            .when(
-                repository_operations.contains(&RepositoryOperationKind::Commit),
-                |this| {
-                    this.child(
-                        div().px_2().py_1().child(
-                            Button::new("vcs-commit-staged", "Commit Staged")
-                                .full_width()
-                                .disabled(
-                                    blocked
-                                        || repository
-                                            .as_ref()
-                                            .and_then(|repository| {
-                                                repository.repository_state.as_ref()
-                                            })
-                                            .is_none_or(|state| state.staged_paths.is_empty()),
-                                )
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.commit_staged(&CommitStaged, window, cx)
-                                })),
-                        ),
-                    )
-                },
-            )
-            .when_some(repository, |this, repository| {
-                let branch = repository
-                    .repository_state
-                    .as_ref()
-                    .and_then(|state| state.current_branch.as_ref())
-                    .map(|branch| branch.name.clone());
-                let has_checkouts = self.store.as_ref().is_some_and(|store| {
-                    store.read(cx).checkout_catalog_available(&repository.key)
-                });
-                let key = repository.key.clone();
-                this.child(
-                    h_flex()
-                        .w_full()
-                        .px_2()
-                        .py_1p5()
-                        .gap_1()
-                        .justify_between()
-                        .border_t_1()
-                        .border_color(cx.theme().colors().border_variant)
-                        .child(
-                            h_flex()
-                                .min_w_0()
-                                .gap_1()
-                                .child(
-                                    Icon::new(IconName::GitBranch)
-                                        .size(IconSize::Small)
-                                        .color(Color::Muted),
-                                )
-                                .child(
-                                    Button::new(
-                                        "vcs-repository-selector",
-                                        repository.descriptor.display_name,
-                                    )
-                                    .size(ButtonSize::None)
-                                    .label_size(LabelSize::Small)
-                                    .truncate(true)
-                                    .tooltip(Tooltip::text("Switch Active Repository"))
-                                    .on_click(
-                                        |_, window, cx| {
-                                            window.dispatch_action(
-                                                zed_actions::git::SelectRepo.boxed_clone(),
-                                                cx,
-                                            )
-                                        },
-                                    ),
-                                )
-                                .when_some(branch, |this, branch| {
-                                    this.child(Label::new("/").color(Color::Muted)).child(
-                                        Button::new("vcs-branch-selector", branch)
-                                            .size(ButtonSize::None)
-                                            .label_size(LabelSize::Small)
-                                            .truncate(true)
-                                            .disabled(
-                                                blocked
-                                                    || !repository_operations.contains(
-                                                        &RepositoryOperationKind::SwitchBranch,
-                                                    ),
-                                            )
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.switch_branch(&SwitchBranch, window, cx)
-                                            })),
-                                    )
+                    .when(GitPanelSettings::get_global(cx).tree_view, |list| {
+                        list.with_decoration(
+                            git_panel::status_indent_guides(cx)
+                                .with_compute_indents_fn(cx.entity(), |panel, range, _, _| {
+                                    panel.compute_visible_depths(range)
                                 }),
                         )
-                        .when(has_checkouts, |this| {
-                            this.child(
-                                Button::new("vcs-checkouts", "Checkouts")
-                                    .label_size(LabelSize::Small)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.workspace
-                                            .update(cx, |workspace, cx| {
-                                                git_ui_core::vcs_checkout_picker::show(
-                                                    workspace,
-                                                    Some(key.clone()),
-                                                    window,
-                                                    cx,
-                                                )
-                                            })
-                                            .log_err();
-                                    })),
-                            )
-                        }),
+                    })
+                    .track_scroll(&self.scroll_handle)
+                    .size_full()
+                    .flex_1(),
                 )
             })
     }
@@ -2306,6 +2880,210 @@ mod tests {
     use settings::{DiffViewStyle, SettingsStore};
     use std::sync::Arc;
     use workspace::MultiWorkspace;
+
+    #[test]
+    fn stock_projection_preserves_mixed_staging_targets_and_tree_paths() {
+        let repository = VcsRepositorySnapshot {
+            key: VcsRepositoryId {
+                worktree_id: settings::WorktreeId::from_usize(1),
+                extension_id: "fixture".into(),
+                provider_id: "native".into(),
+                repository_id: "repo".into(),
+            },
+            descriptor: vcs::RepositoryDescriptor {
+                id: "repo".into(),
+                root_uri: "file:///repo".into(),
+                scope_uri: "file:///repo".into(),
+                display_name: "repo".into(),
+                ignore_config_path: None,
+                baselines: [
+                    ("work", ComparisonPurpose::Working),
+                    ("index-view", ComparisonPurpose::Staged),
+                    ("disk-view", ComparisonPurpose::Unstaged),
+                ]
+                .into_iter()
+                .map(|(id, purpose)| vcs::Baseline {
+                    id: id.into(),
+                    label: id.into(),
+                    purpose: Some(purpose),
+                    current_content: if purpose == ComparisonPurpose::Staged {
+                        ContentSource::Snapshot
+                    } else {
+                        ContentSource::Working
+                    },
+                })
+                .collect(),
+            },
+            selected_baseline: "work".into(),
+            snapshot: None,
+            loading: false,
+            show_loading: false,
+            error: None,
+            repository_state: None,
+            repository_state_error: None,
+            checkouts: None,
+            checkout_error: None,
+            checkout_loading: false,
+        };
+        let mixed = Change {
+            path: "a/nested/z.rs".into(),
+            old_path: None,
+            status: ChangeStatus::Modified,
+            kind: ContentKind::File,
+            old_mode: None,
+            new_mode: None,
+            file_operations: None,
+            unavailable_reason: None,
+            staged_status: Some(ChangeStatus::Added),
+            unstaged_status: Some(ChangeStatus::Modified),
+        };
+        let mut unstaged = mixed.clone();
+        unstaged.path = "z/a.rs".into();
+        unstaged.staged_status = None;
+        let repositories = [(&repository, vec![mixed, unstaged])];
+        let mut expanded = collections::HashMap::default();
+        let mut created_changes = repositories[0].1.clone();
+        let mut added = created_changes[0].clone();
+        added.path = "created.rs".into();
+        added.status = ChangeStatus::Added;
+        added.staged_status = Some(ChangeStatus::Added);
+        added.unstaged_status = None;
+        let mut untracked = added.clone();
+        untracked.path = "scratch.rs".into();
+        untracked.status = ChangeStatus::Untracked;
+        untracked.staged_status = None;
+        untracked.unstaged_status = Some(ChangeStatus::Untracked);
+        created_changes.extend([added, untracked]);
+        let status_rows = rows_for_repositories(
+            &[(&repository, created_changes)],
+            GitPanelGroupBy::Status,
+            GitPanelSortBy::Path,
+            false,
+            &mut expanded,
+        );
+        for path in ["created.rs", "scratch.rs"] {
+            assert_eq!(
+                status_rows
+                    .iter()
+                    .find(|row| row.path == path)
+                    .expect("created row")
+                    .presentation
+                    .section,
+                Some(Section::New)
+            );
+        }
+        assert_eq!(
+            status_rows
+                .iter()
+                .find(|row| row.path == "a/nested/z.rs")
+                .expect("modified row")
+                .presentation
+                .section,
+            Some(Section::Tracked)
+        );
+        let rows = rows_for_repositories(
+            &repositories,
+            GitPanelGroupBy::Staging,
+            GitPanelSortBy::Path,
+            false,
+            &mut expanded,
+        );
+        let mixed_rows = rows
+            .iter()
+            .filter(|row| row.path == "a/nested/z.rs")
+            .collect::<Vec<_>>();
+        assert_eq!(mixed_rows.len(), 2);
+        assert_eq!(mixed_rows[0].baseline(&repository), "index-view");
+        assert_eq!(mixed_rows[1].baseline(&repository), "disk-view");
+        assert_eq!(mixed_rows[0].staging_state(&[]), ToggleState::Selected);
+        assert_eq!(mixed_rows[1].staging_state(&[]), ToggleState::Unselected);
+        for (row, expected) in [
+            (mixed_rows[0], FileOperation::Unstage),
+            (mixed_rows[1], FileOperation::Stage),
+        ] {
+            let target = FileTarget {
+                repository: repository.key.clone(),
+                baseline: row.baseline(&repository),
+                change: row.change.clone().expect("change"),
+            };
+            assert_eq!(
+                staging_operation(staging_state_for_target(&target, Some(&repository))),
+                expected
+            );
+            assert_eq!(
+                staging_baseline_for_target(&target, Some(&repository)),
+                "work",
+                "Grouped Stage/Unstage uses working metadata even before opening an index comparison"
+            );
+        }
+        let historical = FileTarget {
+            repository: repository.key.clone(),
+            baseline: "revision-view".into(),
+            change: repositories[0].1[0].clone(),
+        };
+        assert_eq!(
+            staging_baseline_for_target(&historical, Some(&repository)),
+            "revision-view",
+            "Historical snapshots must not borrow working mutation capabilities"
+        );
+        let rows = rows_for_repositories(
+            &repositories,
+            GitPanelGroupBy::None,
+            GitPanelSortBy::Name,
+            false,
+            &mut expanded,
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            ["z/a.rs", "a/nested/z.rs"]
+        );
+        let rows = rows_for_repositories(
+            &repositories,
+            GitPanelGroupBy::None,
+            GitPanelSortBy::Path,
+            true,
+            &mut expanded,
+        );
+        assert_eq!(rows[0].label, "a/nested");
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.path == "a/nested/z.rs")
+                .expect("file row")
+                .presentation
+                .depth,
+            1
+        );
+        let key = rows[0]
+            .presentation
+            .directory
+            .as_ref()
+            .expect("native compact directory")
+            .key
+            .clone();
+        expanded.insert(key, false);
+        let rows = rows_for_repositories(
+            &repositories,
+            GitPanelGroupBy::None,
+            GitPanelSortBy::Path,
+            true,
+            &mut expanded,
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.path == "a/nested/z.rs")
+                .expect("file row")
+                .presentation
+                .hidden
+        );
+        assert!(
+            !rows
+                .iter()
+                .find(|row| row.path == "z/a.rs")
+                .expect("unrelated file row")
+                .presentation
+                .hidden
+        );
+    }
 
     #[test]
     fn staging_checkbox_tracks_partial_and_complete_changes() {
@@ -2501,6 +3279,7 @@ mod tests {
                 repository,
                 path: "file.txt".into(),
                 label: "file.txt".into(),
+                presentation: RowPresentation::default(),
                 change: Some(Change {
                     path: "file.txt".into(),
                     old_path: None,
@@ -2660,6 +3439,7 @@ mod tests {
                 repository: repository.clone(),
                 path: path.into(),
                 label: path.into(),
+                presentation: RowPresentation::default(),
                 change: Some(Change {
                     path: path.into(),
                     old_path: None,

@@ -23,7 +23,7 @@ use project::{
     vcs_store::{VcsDiff, VcsRepositoryId, VcsStore, VcsStoreEvent},
 };
 use settings::Settings as _;
-use ui::{Button, Checkbox, ContextMenu, Label, ToggleState, Tooltip, prelude::*};
+use ui::{Checkbox, ContextMenu, Label, ToggleState, Tooltip, prelude::*};
 use util::{ResultExt as _, rel_path::RelPath};
 use vcs::{Change, ChangeStatus, ComparisonPurpose, ContentKind, ContentSource, FileOperation};
 use workspace::{
@@ -36,7 +36,7 @@ use crate::{
     git_panel::GitPanel,
     vcs_panel::{
         DiscardFile, FileAction, FileTarget, discard_file_changes, discard_unavailable_reason,
-        file_context_menu, staging_state,
+        file_context_menu, staging_state_for_target, staging_unavailable_reason,
     },
 };
 
@@ -411,6 +411,7 @@ impl VcsProjectDiff {
         )
     }
 
+    #[cfg(test)]
     fn discard_label(&self) -> &'static str {
         if self.current_content == ContentSource::Snapshot {
             "Discard Unstaged Changes"
@@ -877,25 +878,14 @@ impl editor::Addon for VcsDiffAddon {
             .repositories()
             .into_iter()
             .find(|repository| repository.key == target.repository)?;
-        let staged_paths = repository
-            .repository_state
-            .as_ref()
-            .map(|state| state.staged_paths.as_slice())
-            .unwrap_or_default();
-        let state = staging_state(&target.change, staged_paths);
+        let state = staging_state_for_target(&target, Some(&repository));
         let operation = if state == ToggleState::Selected {
             FileOperation::Unstage
         } else {
             FileOperation::Stage
         };
-        let disabled = store.read(cx).file_operation_running()
-            || !store
-                .read(cx)
-                .file_operations_for_baseline(&target.repository, &path, &target.baseline)
-                .contains(&operation);
-        let reason = view.read(cx).discard_reason(&path, cx);
-        let discard_label = view.read(cx).discard_label();
-        let weak_view = self.view.clone();
+        let unavailable = staging_unavailable_reason(&target, Some(store), false, operation, cx);
+        let disabled = unavailable.is_some();
         let checkbox_view = self.view.clone();
         Some(
             h_flex()
@@ -904,11 +894,14 @@ impl editor::Addon for VcsDiffAddon {
                     Checkbox::new("vcs-stage-file", state)
                         .disabled(disabled)
                         .fill()
-                        .tooltip(Tooltip::text(if operation == FileOperation::Unstage {
-                            "Unstage File"
-                        } else {
-                            "Stage File"
-                        }))
+                        .elevation(ui::ElevationIndex::Surface)
+                        .tooltip(Tooltip::text(unavailable.unwrap_or_else(|| {
+                            if operation == FileOperation::Unstage {
+                                "Unstage File".into()
+                            } else {
+                                "Stage File".into()
+                            }
+                        })))
                         .on_click(move |_, window, cx| {
                             cx.stop_propagation();
                             checkbox_view
@@ -924,20 +917,6 @@ impl editor::Addon for VcsDiffAddon {
                                         cx,
                                     )
                                 })
-                                .log_err();
-                        }),
-                )
-                .child(
-                    Button::new("vcs-discard-file", discard_label)
-                        .label_size(LabelSize::Small)
-                        .disabled(reason.is_some())
-                        .tooltip(Tooltip::text(reason.unwrap_or_else(|| {
-                            "Discard unstaged changes to this file".into()
-                        })))
-                        .on_click(move |_, window, cx| {
-                            cx.stop_propagation();
-                            weak_view
-                                .update(cx, |view, cx| view.discard_path(path.clone(), window, cx))
                                 .log_err();
                         }),
                 )

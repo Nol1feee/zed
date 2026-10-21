@@ -59,10 +59,9 @@ pub mod staged_diff;
 pub mod stash_picker;
 pub mod text_diff_view;
 pub mod unstaged_diff;
-pub mod vcs_panel;
 pub mod vcs_file_history;
+pub mod vcs_panel;
 mod vcs_project_diff;
-mod vcs_repository_ui;
 
 pub use blame_ui::GitBlameStatus;
 pub use conflict_view::MergeConflictIndicator;

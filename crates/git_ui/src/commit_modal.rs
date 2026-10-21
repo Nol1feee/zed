@@ -130,32 +130,18 @@ impl CommitModal {
             return;
         };
 
-        if crate::external_vcs_selected(workspace, cx) {
-            if matches!(force_mode.as_ref(), Some(ForceMode::Commit))
-                && let Some(repository) = git_panel.read(cx).selected_vcs_repository(cx)
-            {
-                let git_panel = git_panel.downgrade();
-                window.defer(cx, move |window, cx| {
-                    let Some(git_panel) = git_panel.upgrade() else {
-                        return;
-                    };
-                    let panel = git_panel.read(cx);
-                    if panel.selected_vcs_repository(cx).as_ref() != Some(&repository) {
-                        return;
-                    }
-                    let vcs_panel = panel.vcs_panel();
-                    vcs_panel.update(cx, |panel, cx| {
-                        panel.commit_staged(&crate::vcs_panel::CommitStaged, window, cx);
-                    });
-                });
-            } else {
-                crate::reject_external_vcs_action(workspace, cx);
-            }
+        let external = crate::external_vcs_selected(workspace, cx);
+        if external
+            && (git_panel.read(cx).selected_vcs_repository(cx).is_none()
+                || matches!(force_mode, Some(ForceMode::Amend)))
+        {
+            crate::reject_external_vcs_action(workspace, cx);
             return;
         }
 
         git_panel.update(cx, |git_panel, cx| {
-            if let Some(force_mode) = force_mode {
+            git_panel.ensure_vcs_commit_editor(window, cx);
+            if let Some(force_mode) = force_mode.filter(|_| !external) {
                 match force_mode {
                     ForceMode::Amend => {
                         if git_panel
@@ -177,7 +163,9 @@ impl CommitModal {
                 }
             }
             git_panel.set_modal_open(true, cx);
-            git_panel.load_local_committer(cx);
+            if !external {
+                git_panel.load_local_committer(cx);
+            }
         });
 
         let dock = workspace.dock_at_position(git_panel.position(window, cx));
@@ -208,7 +196,7 @@ impl CommitModal {
         let commit_editor = git_panel.update(cx, |git_panel, cx| {
             git_panel.set_modal_open(true, cx);
             let buffer = git_panel.commit_message_buffer(cx);
-            let panel_editor = git_panel.commit_editor.clone();
+            let panel_editor = git_panel.active_commit_editor(cx);
             let project = git_panel.project.clone();
 
             cx.new(|cx| {
@@ -382,12 +370,33 @@ impl CommitModal {
             commit_options,
             workspace,
             is_generating,
+            external,
+            external_branch,
         ) = self.git_panel.update(cx, |git_panel, cx| {
             let (can_commit, tooltip) = git_panel.configure_commit_button(cx);
             let title = git_panel.commit_button_title();
-            let co_authors = git_panel.render_co_authors(cx);
+            let external = git_panel.uses_vcs_panel(cx);
+            let co_authors = if external {
+                None
+            } else {
+                git_panel.render_co_authors(cx)
+            };
             let generate_commit_message = git_panel.render_generate_commit_message_button(cx);
-            let active_repo = git_panel.active_repository.clone();
+            let active_repo = if external {
+                None
+            } else {
+                git_panel.active_repository.clone()
+            };
+            let external_branch = external
+                .then(|| git_panel.vcs_panel().read(cx).selected_repository())
+                .flatten()
+                .and_then(|repository| repository.repository_state)
+                .and_then(|state| {
+                    state
+                        .current_branch
+                        .as_ref()
+                        .map(|branch| branch.name.clone())
+                });
             let commit_options = git_panel.commit_options();
             let is_generating = git_panel.is_generating_commit_message();
             (
@@ -400,16 +409,21 @@ impl CommitModal {
                 commit_options,
                 git_panel.workspace.clone(),
                 is_generating,
+                external,
+                external_branch,
             )
         });
 
-        let branch = active_repo
-            .as_ref()
-            .and_then(|repo| repo.read(cx).branch.as_ref())
-            .map(|b| b.name().to_owned())
+        let branch = external_branch
+            .or_else(|| {
+                active_repo
+                    .as_ref()
+                    .and_then(|repo| repo.read(cx).branch.as_ref())
+                    .map(|b| b.name().to_owned())
+            })
             .unwrap_or_else(|| "<no branch>".to_owned());
 
-        let branch_picker_button = Button::new("branch_picker_button", branch)
+        let branch_picker_button = Button::new("branch_picker_button", branch.clone())
             .label_size(LabelSize::Small)
             .start_icon(
                 Icon::new(IconName::GitBranch)
@@ -420,26 +434,46 @@ impl CommitModal {
                 window.dispatch_action(zed_actions::git::Branch.boxed_clone(), cx);
             }));
 
-        let branch_picker = PopoverMenu::new("popover-button")
-            .menu(move |window, cx| {
-                Some(branch_picker::popover(
-                    workspace.clone(),
-                    false,
-                    active_repo.clone(),
-                    window,
-                    cx,
-                ))
-            })
-            .with_handle(self.branch_list_handle.clone())
-            .trigger_with_tooltip(
-                branch_picker_button,
-                Tooltip::for_action_title("Switch Branch", &zed_actions::git::Branch),
-            )
-            .anchor(Anchor::BottomLeft)
-            .offset(gpui::Point {
-                x: px(0.0),
-                y: px(-2.0),
-            });
+        let branch_picker = if external {
+            let panel = self.git_panel.clone();
+            let can_switch = panel.read(cx).vcs_panel().read(cx).can_switch_branch(cx);
+            Button::new("branch_picker_button", branch)
+                .label_size(LabelSize::Small)
+                .start_icon(
+                    Icon::new(IconName::GitBranch)
+                        .size(IconSize::Small)
+                        .color(Color::Placeholder),
+                )
+                .disabled(!can_switch)
+                .on_click(move |_, window, cx| {
+                    panel.read(cx).vcs_panel().update(cx, |panel, cx| {
+                        panel.switch_branch(&crate::vcs_panel::SwitchBranch, window, cx);
+                    });
+                })
+                .into_any_element()
+        } else {
+            PopoverMenu::new("popover-button")
+                .menu(move |window, cx| {
+                    Some(branch_picker::popover(
+                        workspace.clone(),
+                        false,
+                        active_repo.clone(),
+                        window,
+                        cx,
+                    ))
+                })
+                .with_handle(self.branch_list_handle.clone())
+                .trigger_with_tooltip(
+                    branch_picker_button,
+                    Tooltip::for_action_title("Switch Branch", &zed_actions::git::Branch),
+                )
+                .anchor(Anchor::BottomLeft)
+                .offset(gpui::Point {
+                    x: px(0.0),
+                    y: px(-2.0),
+                })
+                .into_any_element()
+        };
 
         let focus_handle = self.focus_handle(cx);
 
@@ -490,7 +524,7 @@ impl CommitModal {
                             .tooltip({
                                 let focus_handle = focus_handle.clone();
                                 move |_window, cx| {
-                                    if can_commit {
+                                    if can_commit && !external {
                                         Tooltip::with_meta_in(
                                             tooltip,
                                             Some(&git::Commit),
@@ -519,7 +553,7 @@ impl CommitModal {
                         self.render_git_commit_menu(
                             format!("split-button-right-{}", commit_label),
                             Some(focus_handle),
-                            is_generating,
+                            external || is_generating,
                         )
                         .into_any_element(),
                     )),

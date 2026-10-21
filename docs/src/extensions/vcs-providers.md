@@ -25,8 +25,9 @@ Open the [Git Panel](../git.md#git-panel) with
 repository to see its changes and available actions. External repositories use
 the same panel and keybindings; there is no separate Source Control dock.
 
-Choose a provider's comparison baseline in the Changes tab, then click **View
-Diff** or run {#action git::Diff}. The diff combines the selected repository's
+Choose a provider's comparison from the dropdown beside **Stage All** or
+**Unstage All** in the Changes tab, then click **View Diff** or run
+{#action git::Diff}. The diff combines the selected repository's
 changed text files in one editor. Working comparisons share live buffers with ordinary file
 editors, preserving unsaved edits. Staged comparisons use a read-only snapshot of
 the index; editing or saving that snapshot cannot change a working file. Navigating the changes list moves to the
@@ -34,12 +35,18 @@ selected file in the diff.
 
 With the changes list focused, {#action git::StageFile},
 {#action git::UnstageFile}, and {#action git::RestoreFile} use the selected file's
-provider capabilities. {#action git::Commit} and {#action git::Switch} open the
-provider's scoped commit and existing-branch switch controls when supported.
+provider capabilities. The checkbox stages or unstages the whole file.
 
-Use **Discard Changes** from a file's context menu or diff header to discard
-that file's unstaged changes. The operation requires confirmation and the
-provider's discard capability. Disabled actions explain why they are unavailable.
+Type a message in the standard commit editor, then choose **Commit** or run
+{#action git::Commit} with the editor focused. {#action git::ExpandCommitEditor}
+opens the standard commit modal. Drafts are kept separately for each repository.
+The editor remains available when committing is unsupported; the disabled button
+explains why. {#action git::Switch} opens the existing-branch switch controls when
+supported.
+
+Use **Discard Changes** from a file's context menu or the diff header's context
+menu to discard that file's unstaged changes. The operation requires confirmation
+and the provider's discard capability. Disabled actions explain why they are unavailable.
 
 Providers that support blame use the existing {#action git::Blame},
 {#action editor::ToggleGitBlameInline}, and {#action editor::BlameHover} commands.
@@ -47,8 +54,12 @@ The hover shows the author and commit details, with an external commit link when
 the provider supplies one. Previous-revision blame remains Git-only.
 
 The context menu includes file navigation, path copying, and the operations the
-provider supports. Tracked and untracked files are grouped separately. A checked
-box means staged, an empty box means unstaged, and a mixed box means both.
+provider supports. **View Options** uses the same list/tree views, path/name
+sorting, and grouping options as Git. File icons and status colors follow the
+Git Panel settings. A checked box means staged, an empty box means unstaged, and
+a mixed box means both. With **Staged & Unstaged** grouping, a partially staged
+file appears in both sections. When the provider exposes index comparisons,
+each row opens its corresponding comparison.
 **Staged Changes** compares the committed version with the index; **Unstaged
 Changes** compares the index with the working buffer. These views keep their own
 comparison when the panel selection changes. Providers without index comparisons
@@ -60,8 +71,10 @@ the available history; the view indicates truncation instead of presenting it as
 complete. **Add to ignore file** uses the provider's declared configuration path
 and requires confirmation before updating that file.
 
-Repository-wide history, hunk and batch mutations, stash, amend, and remote Git
-operations are unavailable for external repositories. Unsupported commands report that limitation instead of
+Repository-wide history, hunk and batch mutations, stash, amend, signoff, hook
+options, AI commit-message generation, and remote Git operations are unavailable
+for external repositories. Shared native controls do not enable capabilities the
+provider does not expose. Unsupported commands report that limitation instead of
 operating on another Git repository in the project. Use the provider's own tools
 for operations it does not expose to Zed.
 
@@ -237,8 +250,9 @@ file operations; contradictory capabilities are rejected.
 
 ### Selected-file operations
 
-The Git Panel shows Stage File, Unstage File, and Discard for the selected
-change. The optional `fileOperations` on each change narrows provider-level capabilities;
+The Git Panel uses the file checkbox for whole-file staging and unstaging.
+The file context menu includes Stage File, Unstage File, and Discard for the
+selected change. The optional `fileOperations` on each change narrows provider-level capabilities;
 an empty list disables all writes for that row. An optional `unavailableReason` explains
 why. Without this field, only an ordinary modified file without a rename retains legacy
 file operations. Text preview support does not determine file-operation support.
@@ -326,8 +340,9 @@ The provider must refuse a commit that would silently include staged changes
 outside the opened scope or files owned by a nested VCS. It must freeze the full
 relevant staged set and content, recheck it under its shared mutation lock, commit
 the staged contents, and verify the resulting commit. Newer working-file changes
-remain on disk. The confirmation shows the exact project, scope, message, and
-prepared file list.
+remain on disk. Choosing **Commit** in the standard editor prepares and applies
+this scoped operation without a second confirmation dialog. Zed rechecks
+ownership, open buffers, and the prepared state before applying it.
 
 A branch request is `{"operation":"switchBranch","branchId":"opaque-branch-id"}`.
 Switching affects the whole checkout. Zed checks open projects and unsaved or
@@ -386,8 +401,8 @@ Zed also refuses Suspend/Remove while any live Project overlaps its root. A
 provider may decline removal when cleanliness cannot be proved. The host never
 falls back to deleting the directory after a provider refusal.
 
-The native Checkouts picker is available from the Git Panel, the title bar, and
-`vcs::OpenCheckouts`. It requires a live provider repository as its catalog anchor.
+The native Checkouts picker is available from the Git Panel's changes actions
+menu, the title bar, and `vcs::OpenCheckouts`. It requires a live provider repository as its catalog anchor.
 Opening uses the returned scope and the ordinary workspace flow. Provider-created
 workspaces inherit trust through that flow without running Git create-worktree
 hooks. Agent creation supports one local provider scope and rejects mixed Git/provider projects
