@@ -1164,6 +1164,446 @@ fn staging_events(fixture: &Fixture) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn file_batch_events(fixture: &Fixture) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(fixture.directory.path().join("staging.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["event"] == "file-batch-applied")
+        .collect()
+}
+
+#[gpui::test]
+async fn staging_queue_updates_immediately_and_preserves_later_intents(cx: &mut TestAppContext) {
+    let fixture = staging_fixture(cx, "bulk-write-delay").await;
+    let repository = ready(&fixture, cx).await;
+    let first = fixture.store.update(cx, |store, cx| {
+        let task = store.run_file_operation(
+            repository.key.clone(),
+            "b-unstaged.txt".into(),
+            FileOperation::Stage,
+            cx,
+        );
+        assert_eq!(
+            store.pending_staging_operation(&repository.key, "b-unstaged.txt"),
+            Some(FileOperation::Stage)
+        );
+        task
+    });
+    let events = fixture.directory.path().join("staging.jsonl");
+    provider_event(events.clone(), "apply-held").await;
+    let queued = fixture.store.update(cx, |store, cx| {
+        assert!(store.can_enqueue_staging(&repository.key, cx));
+        let tasks = vec![
+            store.run_file_operation(
+                repository.key.clone(),
+                "a-mixed.txt".into(),
+                FileOperation::Stage,
+                cx,
+            ),
+            store.run_file_operation(
+                repository.key.clone(),
+                "d-renamed.txt".into(),
+                FileOperation::Stage,
+                cx,
+            ),
+            store.run_file_operation(
+                repository.key.clone(),
+                "b-unstaged.txt".into(),
+                FileOperation::Unstage,
+                cx,
+            ),
+        ];
+        assert_eq!(
+            store.pending_staging_operation(&repository.key, "a-mixed.txt"),
+            Some(FileOperation::Stage)
+        );
+        assert_eq!(
+            store.pending_staging_operation(&repository.key, "b-unstaged.txt"),
+            Some(FileOperation::Unstage)
+        );
+        tasks
+    });
+    // A snapshot accepted before the first acknowledgement must not erase queued intent.
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.load_comparison(repository.key.clone(), "working".into(), cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.store.read_with(cx, |store, _| store
+            .pending_staging_operation(&repository.key, "b-unstaged.txt")),
+        Some(FileOperation::Unstage)
+    );
+    std::fs::write(events.with_extension("jsonl.release"), "release").unwrap();
+    first.await.unwrap();
+    for task in queued {
+        task.await.unwrap();
+    }
+    let repository = ready(&fixture, cx).await;
+    let applied = file_batch_events(&fixture);
+    assert_eq!(
+        applied.len(),
+        3,
+        "Adjacent waiting stage requests share one bulk write"
+    );
+    assert_eq!(applied[0]["paths"], json!(["b-unstaged.txt"]));
+    assert_eq!(applied[1]["paths"], json!(["a-mixed.txt", "d-renamed.txt"]));
+    assert_eq!(applied[2]["operation"], "unstage");
+    assert_eq!(applied[2]["paths"], json!(["b-unstaged.txt"]));
+    assert!(
+        repository
+            .snapshot
+            .unwrap()
+            .changes
+            .iter()
+            .find(|change| change.path == "b-unstaged.txt")
+            .unwrap()
+            .staged_status
+            .is_none()
+    );
+    fixture.store.read_with(cx, |store, _| {
+        assert!(store.pending_staging.is_empty());
+        assert!(!store.file_operation_running());
+    });
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn staging_all_uses_one_bulk_write_and_one_rename_target(cx: &mut TestAppContext) {
+    let fixture = staging_fixture(cx, "bulk-write").await;
+    let repository = ready(&fixture, cx).await;
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
+        })
+        .await
+        .unwrap();
+    ready(&fixture, cx).await;
+    let applied = file_batch_events(&fixture);
+    assert_eq!(applied.len(), 1);
+    assert_eq!(
+        applied[0]["paths"],
+        json!(["a-mixed.txt", "b-unstaged.txt", "d-renamed.txt"])
+    );
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        file_batch_events(&fixture).len(),
+        1,
+        "Repeated Stage All is a no-op"
+    );
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_staging_batch(repository.key.clone(), FileOperation::Unstage, cx)
+        })
+        .await
+        .unwrap();
+    ready(&fixture, cx).await;
+    let applied = file_batch_events(&fixture);
+    assert_eq!(applied.len(), 2);
+    assert_eq!(
+        applied[1]["paths"],
+        json!([
+            "a-mixed.txt",
+            "b-unstaged.txt",
+            "c-staged.txt",
+            "d-renamed.txt"
+        ])
+    );
+    assert!(
+        staging_events(&fixture).is_empty(),
+        "A bulk-capable provider must never use the per-file fallback"
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn staging_known_failure_removes_optimism_and_reports_error(cx: &mut TestAppContext) {
+    let fixture = staging_fixture(cx, "bulk-write-error").await;
+    let repository = ready(&fixture, cx).await;
+    let task = fixture.store.update(cx, |store, cx| {
+        let task = store.run_file_operation(
+            repository.key.clone(),
+            "b-unstaged.txt".into(),
+            FileOperation::Stage,
+            cx,
+        );
+        assert_eq!(
+            store.pending_staging_operation(&repository.key, "b-unstaged.txt"),
+            Some(FileOperation::Stage)
+        );
+        task
+    });
+    assert!(task.await.unwrap_err().to_string().contains("not applied"));
+    ready(&fixture, cx).await;
+    fixture.store.read_with(cx, |store, _| {
+        assert!(store.pending_staging.is_empty());
+        assert!(store.file_operation_error(&repository.key).is_some());
+        assert!(!store.file_operation_unresolved(&repository.key));
+    });
+    assert!(file_batch_events(&fixture).is_empty());
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn staging_unknown_bulk_outcome_stops_queue_and_recovers_without_reapply(
+    cx: &mut TestAppContext,
+) {
+    let fixture = staging_fixture(cx, "bulk-write-unknown").await;
+    let repository = ready(&fixture, cx).await;
+    let (first, second) = fixture.store.update(cx, |store, cx| {
+        (
+            store.run_file_operation(
+                repository.key.clone(),
+                "b-unstaged.txt".into(),
+                FileOperation::Stage,
+                cx,
+            ),
+            store.run_file_operation(
+                repository.key.clone(),
+                "c-staged.txt".into(),
+                FileOperation::Unstage,
+                cx,
+            ),
+        )
+    });
+    assert!(format!("{:#}", first.await.unwrap_err()).contains("unknown"));
+    assert!(second.await.is_err());
+    fixture.store.read_with(cx, |store, cx| {
+        assert!(!store.can_enqueue_staging(&repository.key, cx));
+        assert!(store.pending_staging.is_empty());
+        let scope = store.file_operation_scope(&repository.key).unwrap();
+        assert!(matches!(
+            store
+                .operation_journal
+                .pending(&scope)
+                .unwrap()
+                .unwrap()
+                .request,
+            OperationRequest::FileBatch { .. }
+        ));
+    });
+    assert_eq!(file_batch_events(&fixture).len(), 1);
+    assert!(staging_events(&fixture).is_empty());
+    std::fs::write(
+        fixture.directory.path().join("staging.jsonl.reconcile"),
+        "ready",
+    )
+    .unwrap();
+    fixture
+        .store
+        .update(cx, |store, cx| store.refresh(&repository.key, cx));
+    cx.condition(&fixture.store, |store, _| {
+        !store.file_operation_running() && !store.file_operation_unresolved(&repository.key)
+    })
+    .await;
+    assert_eq!(file_batch_events(&fixture).len(), 1);
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn staging_all_followed_by_unstage_all_uses_pending_selection(cx: &mut TestAppContext) {
+    let fixture = staging_fixture(cx, "bulk-write-delay").await;
+    let repository = ready(&fixture, cx).await;
+    let (stage, unstage) = fixture.store.update(cx, |store, cx| {
+        let stage = store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx);
+        let unstage = store.run_staging_batch(repository.key.clone(), FileOperation::Unstage, cx);
+        for path in [
+            "a-mixed.txt",
+            "b-unstaged.txt",
+            "c-staged.txt",
+            "d-renamed.txt",
+        ] {
+            assert_eq!(
+                store.pending_staging_operation(&repository.key, path),
+                Some(FileOperation::Unstage)
+            );
+        }
+        (stage, unstage)
+    });
+    let events = fixture.directory.path().join("staging.jsonl");
+    provider_event(events.clone(), "apply-held").await;
+    std::fs::write(events.with_extension("jsonl.release"), "release").unwrap();
+    stage.await.unwrap();
+    unstage.await.unwrap();
+    let repository = ready(&fixture, cx).await;
+    assert!(
+        repository
+            .snapshot
+            .unwrap()
+            .changes
+            .iter()
+            .all(|change| change.staged_status.is_none())
+    );
+    let applied = file_batch_events(&fixture);
+    assert_eq!(applied.len(), 2);
+    assert_eq!(applied[1]["paths"].as_array().unwrap().len(), 4);
+    let events = std::fs::read_to_string(events)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let start = events
+        .iter()
+        .position(|event| event["method"] == "vcs/prepareFileBatch")
+        .unwrap();
+    let end = events
+        .iter()
+        .rposition(|event| event["event"] == "file-batch-applied")
+        .unwrap();
+    assert!(
+        !events[start..end].iter().any(|event| matches!(
+            event["method"].as_str(),
+            Some("vcs/snapshot" | "vcs/repositoryState")
+        )),
+        "Queued staging writes must not rescan the repository between commands"
+    );
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn staging_provider_replacement_clears_pending_overlay(cx: &mut TestAppContext) {
+    let fixture = staging_fixture(cx, "bulk-write-delay").await;
+    let repository = ready(&fixture, cx).await;
+    let task = fixture.store.update(cx, |store, cx| {
+        store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
+    });
+    provider_event(fixture.directory.path().join("staging.jsonl"), "apply-held").await;
+    FixtureExtension::new("staging", fixture.directory.path(), "bulk-write").register(cx);
+    assert!(task.await.is_err());
+    fixture
+        .store
+        .read_with(cx, |store, _| assert!(store.pending_staging.is_empty()));
+    ready(&fixture, cx).await;
+    assert_eq!(file_batch_events(&fixture).len(), 1);
+    assert!(staging_events(&fixture).is_empty());
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn staging_without_working_purpose_reconciles_completed_overlay(cx: &mut TestAppContext) {
+    let fixture = fixture(cx, false).await;
+    trust(&fixture, cx);
+    FixtureExtension::new("legacy-staging", fixture.directory.path(), "writable").register(cx);
+    let repository = ready(&fixture, cx).await;
+    assert!(
+        repository
+            .descriptor
+            .baselines
+            .iter()
+            .all(|baseline| baseline.purpose.is_none())
+    );
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_file_operation(
+                repository.key.clone(),
+                "src/example.txt".into(),
+                FileOperation::Stage,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    ready(&fixture, cx).await;
+    assert!(fixture.store.read_with(cx, |store, _| {
+        store
+            .pending_staging_operation(&repository.key, "src/example.txt")
+            .is_none()
+    }));
+    stop(&fixture, cx).await;
+}
+
+#[gpui::test]
+async fn staging_without_working_purpose_allows_external_index_changes(cx: &mut TestAppContext) {
+    let fixture = staging_fixture(cx, "bulk-write").await;
+    let repository = ready(&fixture, cx).await;
+    let connection = fixture.store.update(cx, |store, _| {
+        let repository = store.repositories.get_mut(&repository.key).unwrap();
+        for baseline in &mut repository.view.descriptor.baselines {
+            baseline.purpose = None;
+        }
+        repository.connection.clone()
+    });
+    fixture
+        .store
+        .update(cx, |store, cx| {
+            store.run_file_operation(
+                repository.key.clone(),
+                "b-unstaged.txt".into(),
+                FileOperation::Stage,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+    let refreshed = ready(&fixture, cx).await;
+    assert!(
+        refreshed
+            .snapshot
+            .unwrap()
+            .changes
+            .iter()
+            .find(|change| change.path == "b-unstaged.txt")
+            .unwrap()
+            .staged_status
+            .is_some()
+    );
+    assert!(fixture.store.read_with(cx, |store, _| {
+        store
+            .pending_staging_operation(&repository.key, "b-unstaged.txt")
+            .is_none()
+    }));
+    let paths = vec!["b-unstaged.txt".to_owned()];
+    let prepared = connection
+        .prepare_file_batch(
+            repository.key.repository_id.clone(),
+            paths.clone(),
+            FileOperation::Unstage,
+        )
+        .await
+        .unwrap();
+    connection
+        .apply_file_batch(
+            repository.key.repository_id.clone(),
+            paths,
+            FileOperation::Unstage,
+            prepared.operation_token,
+        )
+        .await
+        .unwrap();
+    fixture
+        .store
+        .update(cx, |store, cx| store.refresh(&repository.key, cx));
+    let refreshed = ready(&fixture, cx).await;
+    assert!(
+        refreshed
+            .snapshot
+            .unwrap()
+            .changes
+            .iter()
+            .find(|change| change.path == "b-unstaged.txt")
+            .unwrap()
+            .staged_status
+            .is_none()
+    );
+    assert!(fixture.store.read_with(cx, |store, _| {
+        store
+            .pending_staging_operation(&repository.key, "b-unstaged.txt")
+            .is_none()
+    }));
+    stop(&fixture, cx).await;
+}
 #[gpui::test]
 async fn staging_batch_uses_working_state_and_deduplicates_renames(cx: &mut TestAppContext) {
     let fixture = staging_fixture(cx, "staging-batch").await;
@@ -1313,68 +1753,39 @@ async fn staging_batch_checks_all_dirty_buffers_before_first_write(cx: &mut Test
 }
 
 #[gpui::test]
-async fn staging_batch_rejects_superseded_working_snapshot_with_new_paths(cx: &mut TestAppContext) {
-    let fixture = staging_fixture(cx, "staging-batch-freshness").await;
+async fn staging_batch_freezes_displayed_paths_before_new_snapshot(cx: &mut TestAppContext) {
+    let fixture = staging_fixture(cx, "bulk-write").await;
     let repository = ready(&fixture, cx).await;
-    let cached = repository.snapshot.unwrap();
-    assert!(
-        !cached
-            .changes
-            .iter()
-            .any(|change| change.path == "b-unstaged.txt")
-    );
-    std::fs::write(
-        fixture.directory.path().join("staging.jsonl.fresh"),
-        "fresh",
-    )
-    .unwrap();
     let task = fixture.store.update(cx, |store, cx| {
-        store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
-    });
-    provider_event(
-        fixture.directory.path().join("staging.jsonl"),
-        "fresh-snapshot-held",
-    )
-    .await;
-    fixture.store.update(cx, |store, cx| {
-        drop(store.load_comparison(repository.key.clone(), "working".into(), cx));
-    });
-    std::fs::write(
-        fixture.directory.path().join("staging.jsonl.release"),
-        "release",
-    )
-    .unwrap();
-    let error = task.await.unwrap_err();
-    assert!(format!("{error:#}").contains("superseded"));
-    assert!(staging_events(&fixture).is_empty());
-    assert!(
-        !fixture
-            .store
-            .read_with(cx, |store, _| store.file_operation_running())
-    );
-    let fresh = fixture
-        .store
-        .update(cx, |store, cx| {
-            store.load_comparison(repository.key.clone(), "working".into(), cx)
-        })
-        .await
-        .unwrap();
-    assert_eq!(cached.revision_id, fresh.revision_id);
-    assert_eq!(cached.current_revision_id, fresh.current_revision_id);
-    assert!(
-        fresh
+        let full = store.repositories[&repository.key]
+            .view
+            .snapshot
+            .clone()
+            .unwrap();
+        let mut displayed = full.as_ref().clone();
+        displayed
             .changes
-            .iter()
-            .any(|change| change.path == "b-unstaged.txt")
+            .retain(|change| change.path != "b-unstaged.txt");
+        store
+            .repositories
+            .get_mut(&repository.key)
+            .unwrap()
+            .view
+            .snapshot = Some(Arc::new(displayed));
+        let task = store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx);
+        store
+            .repositories
+            .get_mut(&repository.key)
+            .unwrap()
+            .view
+            .snapshot = Some(full);
+        task
+    });
+    task.await.unwrap();
+    assert_eq!(
+        file_batch_events(&fixture)[0]["paths"],
+        json!(["a-mixed.txt", "d-renamed.txt"])
     );
-    fixture
-        .store
-        .update(cx, |store, cx| {
-            store.run_staging_batch(repository.key.clone(), FileOperation::Stage, cx)
-        })
-        .await
-        .unwrap();
-    assert_eq!(staging_events(&fixture).len(), 3);
     stop(&fixture, cx).await;
 }
 
@@ -1417,7 +1828,7 @@ async fn staging_batch_refuses_other_store_operation_and_other_scope_journal(
         })
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("Another project"));
+    assert!(error.to_string().contains("running"));
     assert!(staging_events(&fixture).is_empty());
     std::fs::write(
         fixture.directory.path().join("staging.jsonl.release"),
@@ -1603,18 +2014,11 @@ async fn staging_batch_blocks_prepared_writes_and_survives_closed_waiter(cx: &mu
     .await;
     assert_eq!(
         snapshot_count(),
-        snapshots_before + 1,
-        "Only the batch's fresh preflight may query status while it owns the checkout"
+        snapshots_before,
+        "Staging uses loaded changes and does not query status while it owns the checkout"
     );
     let blocked = fixture.store.update(cx, |store, cx| {
         vec![
-            store.run_staging_batch(repository.key.clone(), FileOperation::Unstage, cx),
-            store.run_file_operation(
-                repository.key.clone(),
-                "c-staged.txt".into(),
-                FileOperation::Unstage,
-                cx,
-            ),
             store.apply_prepared_file_operation(prepared, cx),
             store.apply_prepared_repository_operation(prepared_repository, cx),
         ]
@@ -1675,7 +2079,7 @@ async fn staging_batch_blocks_prepared_writes_and_survives_closed_waiter(cx: &mu
     ready(&fixture, cx).await;
     assert_eq!(
         snapshot_count(),
-        snapshots_before + 2,
+        snapshots_before + 1,
         "Exactly one full refresh follows the batch"
     );
     fixture.store.read_with(cx, |store, _| {
@@ -1811,9 +2215,7 @@ async fn file_operations_preserve_scope_and_refuse_dirty_conflicted_and_git_file
 }
 
 #[gpui::test]
-async fn file_operation_rechecks_buffer_after_prepare_and_rejects_double_dispatch(
-    cx: &mut TestAppContext,
-) {
+async fn file_operation_rechecks_buffer_after_prepare_and_queues_staging(cx: &mut TestAppContext) {
     let fixture = fixture(cx, false).await;
     trust(&fixture, cx);
     FixtureExtension::new(
@@ -1848,12 +2250,17 @@ async fn file_operation_rechecks_buffer_after_prepare_and_rejects_double_dispatc
             cx,
         )
     });
-    assert!(duplicate.await.unwrap_err().to_string().contains("running"));
+    assert_eq!(
+        fixture.store.read_with(cx, |store, _| store
+            .pending_staging_operation(&repository.key, "src/example.txt")),
+        Some(FileOperation::Stage)
+    );
     buffer.update(cx, |buffer, cx| {
         buffer.edit([(0..0, "edited during prepare\n")], None, cx)
     });
     std::fs::write(events_path.with_extension("jsonl.release"), "release").unwrap();
     assert!(task.await.unwrap_err().to_string().contains("unsaved"));
+    assert!(duplicate.await.unwrap_err().to_string().contains("unsaved"));
     fixture.store.read_with(cx, |store, _| {
         assert!(!store.file_operation_running());
         assert!(store.pending_file_operations.is_empty());

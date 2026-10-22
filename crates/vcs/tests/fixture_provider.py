@@ -30,6 +30,10 @@ responsive to cancellation and shutdown while waiting.
 `discard-pending` records its disk effect, then waits for FILE.release before replying.
 `persistent-write-unknown` persists synthetic state across fixture restarts and
 rejects reconcile until FILE.reconcile exists.
+`bulk-write` advertises file batches and uses the staging-batch file set.
+`bulk-write-error` returns notApplied; `bulk-write-ambiguous` loses the apply reply.
+`bulk-write-delay` applies once, then waits for FILE.release before acknowledging.
+`bulk-write-unknown` persists the batch and rejects reconcile until FILE.reconcile exists.
 """
 import argparse
 import json
@@ -73,6 +77,9 @@ WORKFLOW_SCENARIOS = {"file-workflow", "file-workflow-stale", "file-workflow-bad
 SCENARIOS += tuple(sorted(WORKFLOW_SCENARIOS))
 WRITABLE_SCENARIOS.update(WORKFLOW_SCENARIOS)
 BATCH_SCENARIOS = {"staging-batch", "staging-batch-failure", "staging-batch-pending", "staging-batch-freshness"}
+BULK_SCENARIOS = {"bulk-write", "bulk-write-error", "bulk-write-delay", "bulk-write-unknown",
+                  "bulk-write-ambiguous", "bulk-write-missing-paths", "bulk-write-invalid-paths"}
+BATCH_SCENARIOS.update(BULK_SCENARIOS)
 SCENARIOS += tuple(sorted(BATCH_SCENARIOS))
 WRITABLE_SCENARIOS.update(BATCH_SCENARIOS)
 SEND_LOCK = threading.Lock()
@@ -152,6 +159,7 @@ def main():
     snapshot_contents = {}
     file_states = {}
     operations = {}
+    file_batches = {}
     apply_count = 0
     repository_operations = {}
     repository_branch = "main"
@@ -207,16 +215,18 @@ def main():
         file_states.update({"a-mixed.txt": ("index", "working"), "b-unstaged.txt": ("head", "working"),
                             "c-staged.txt": ("working", "working"), "d-renamed.txt": ("head", "working")})
     saved_operations = Path(str(args.events) + ".operations.json") if args.events else None
-    if args.scenario in ("persistent-write-unknown", "repository-unknown") and saved_operations and saved_operations.is_file():
+    if args.scenario in ("persistent-write-unknown", "repository-unknown", "bulk-write-unknown") and saved_operations and saved_operations.is_file():
         saved = json.loads(saved_operations.read_text())
         file_states, operations, apply_count = saved["files"], saved["operations"], saved["count"]
+        file_batches = saved.get("fileBatches", {})
         repository_operations = saved.get("repositoryOperations", {})
         repository_branch, repository_head, repository_commits = saved.get("repository", ["main", "head", 0])
 
     def persist_operations():
-        if args.scenario in ("persistent-write-unknown", "repository-unknown") and saved_operations:
+        if args.scenario in ("persistent-write-unknown", "repository-unknown", "bulk-write-unknown") and saved_operations:
             temporary = saved_operations.with_suffix(".tmp")
             temporary.write_text(json.dumps({"files": file_states, "operations": operations, "count": apply_count,
+                                             "fileBatches": file_batches,
                                              "repositoryOperations": repository_operations,
                                              "repository": [repository_branch, repository_head, repository_commits]}))
             temporary.replace(saved_operations)
@@ -308,6 +318,8 @@ def main():
                 capabilities = {"readOnly": False, "fileOperations": ["stage"]}
             if args.scenario in REPOSITORY_SCENARIOS:
                 capabilities["repositoryOperations"] = ["commit", "switchBranch"]
+            if args.scenario in BULK_SCENARIOS:
+                capabilities["batchFileOperations"] = ["stage", "unstage"]
             if args.scenario in CHECKOUT_SCENARIOS:
                 version = 2
                 if args.scenario == "checkout-read-only":
@@ -466,6 +478,72 @@ def main():
             reply(identifier, content)
             if args.scenario == "reply-eof":
                 return 0
+        elif method in ("vcs/prepareFileBatch", "vcs/applyFileBatch", "vcs/reconcileFileBatch"):
+            paths, operation = params.get("paths"), params.get("operation")
+            if args.scenario not in BULK_SCENARIOS:
+                reply(identifier, error={"code": -32601, "message": "File batches unavailable"})
+                continue
+            if (params.get("repositoryId") != "fixture-repository" or not isinstance(paths, list)
+                    or not 1 <= len(paths) <= 1024 or not all(isinstance(path, str) and path for path in paths)
+                    or len(set(paths)) != len(paths) or operation not in ("stage", "unstage")):
+                reply(identifier, error={"code": -32602, "message": "Invalid file batch"})
+                continue
+            affected = paths + (["old.txt"] if "d-renamed.txt" in paths and "old.txt" not in paths else [])
+            state = {path: file_state(path) for path in affected}
+            if method == "vcs/prepareFileBatch":
+                token = f"fixture:batch:{len(file_batches) + 1}"
+                file_batches[token] = {"paths": paths, "operation": operation, "before": state,
+                                       "after": None, "terminal": None}
+                persist_operations()
+                if args.scenario == "bulk-write-missing-paths":
+                    affected = affected[1:]
+                elif args.scenario == "bulk-write-invalid-paths":
+                    affected = affected + ["../outside"]
+                reply(identifier, {"operationToken": token, "affectedPaths": affected})
+                continue
+            prepared = file_batches.get(params.get("operationToken"))
+            if prepared is None or prepared["paths"] != paths or prepared["operation"] != operation:
+                reply(identifier, error={"code": -32018, "message": "Unknown or mismatched file batch token"})
+                continue
+            if method == "vcs/reconcileFileBatch" and args.scenario == "bulk-write-unknown":
+                if not Path(str(args.events) + ".reconcile").is_file():
+                    reply(identifier, error={"code": -32046, "message": "Reconciliation unavailable",
+                                             "data": {"kind": "outcomeUnknown"}})
+                    continue
+            if prepared["terminal"] is not None:
+                if method == "vcs/applyFileBatch":
+                    reply(identifier, error={"code": -32049, "message": "Batch token consumed"})
+                else:
+                    reply(identifier, {"outcome": prepared["terminal"]})
+                continue
+            if prepared["after"] == state:
+                outcome = "applied"
+            elif prepared["after"] is not None or prepared["before"] != state:
+                outcome = "conflict"
+            elif method == "vcs/reconcileFileBatch" or args.scenario == "bulk-write-error":
+                outcome = "notApplied"
+            else:
+                for path in paths:
+                    _, index, disk = file_state(path)
+                    file_states[path] = (disk if operation == "stage" else "head", disk)
+                prepared["after"] = {path: file_state(path) for path in affected}
+                prepared["terminal"] = "applied"
+                apply_count += 1
+                persist_operations()
+                record("file-batch-applied", paths=paths, operation=operation, count=apply_count)
+                if args.scenario == "bulk-write-delay":
+                    record("apply-held", id=identifier, paths=paths)
+                    threading.Thread(target=release_reply,
+                                     args=(identifier, {"outcome": "applied"}, "apply-released"), daemon=True).start()
+                    continue
+                if args.scenario in ("bulk-write-ambiguous", "bulk-write-unknown"):
+                    reply(identifier, error={"code": -32045, "message": "Batch acknowledgement lost",
+                                             "data": {"kind": "outcomeUnknown"}})
+                    continue
+                outcome = "applied"
+            prepared["terminal"] = outcome
+            persist_operations()
+            reply(identifier, {"outcome": outcome})
         elif method in ("vcs/prepareFileOperation", "vcs/applyFileOperation",
                         "vcs/reconcileFileOperation"):
             if args.scenario not in WRITABLE_SCENARIOS:

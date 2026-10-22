@@ -4,8 +4,8 @@ use crate::{
     MAX_MESSAGE_BYTES, OperationProgress, PROTOCOL_VERSION, PreparedCheckoutOperation,
     PreparedFileOperation, PreparedRepositoryOperation, ProviderCapabilities, ProviderError,
     ProviderInfo, RepositoryDescriptor, RepositoryOperation, RepositoryState,
-    SUPPORTED_PROTOCOL_VERSIONS, Snapshot, validate_history_request, validate_operation_token,
-    validate_path, validate_revision_id,
+    SUPPORTED_PROTOCOL_VERSIONS, Snapshot, validate_file_batch_paths, validate_history_request,
+    validate_operation_token, validate_path, validate_revision_id,
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use collections::HashMap;
@@ -510,6 +510,78 @@ impl ProviderConnection {
             json!({"repositoryId": repository_id, "path": path, "operation": operation, "operationToken": operation_token}),
             REQUEST_TIMEOUT,
         ).await
+    }
+
+    pub async fn prepare_file_batch(
+        &self,
+        repository_id: String,
+        paths: Vec<String>,
+        operation: FileOperation,
+    ) -> Result<PreparedFileOperation> {
+        let params = self.file_batch_params(&repository_id, &paths, operation, None)?;
+        let prepared: PreparedFileOperation = self
+            .request("vcs/prepareFileBatch", params, REQUEST_TIMEOUT)
+            .await?;
+        prepared.validate()?;
+        ensure!(
+            prepared
+                .affected_paths
+                .as_ref()
+                .is_some_and(|affected| { paths.iter().all(|path| affected.contains(path)) }),
+            "Prepared file batch omitted selected paths"
+        );
+        Ok(prepared)
+    }
+
+    /// An error leaves the whole batch outcome unknown. Reconcile the same token before retrying.
+    pub async fn apply_file_batch(
+        &self,
+        repository_id: String,
+        paths: Vec<String>,
+        operation: FileOperation,
+        operation_token: String,
+    ) -> Result<FileOperationResult> {
+        let params =
+            self.file_batch_params(&repository_id, &paths, operation, Some(&operation_token))?;
+        self.request("vcs/applyFileBatch", params, REQUEST_TIMEOUT)
+            .await
+    }
+
+    pub async fn reconcile_file_batch(
+        &self,
+        repository_id: String,
+        paths: Vec<String>,
+        operation: FileOperation,
+        operation_token: String,
+    ) -> Result<FileOperationResult> {
+        let params =
+            self.file_batch_params(&repository_id, &paths, operation, Some(&operation_token))?;
+        self.request("vcs/reconcileFileBatch", params, REQUEST_TIMEOUT)
+            .await
+    }
+
+    fn file_batch_params(
+        &self,
+        repository_id: &str,
+        paths: &[String],
+        operation: FileOperation,
+        token: Option<&str>,
+    ) -> Result<Value> {
+        self.ensure_initialized()?;
+        ensure!(!repository_id.is_empty(), "empty VCS repository id");
+        validate_file_batch_paths(paths)?;
+        ensure!(
+            self.capabilities()
+                .is_some_and(|capabilities| capabilities.supports_batch_file_operation(operation)),
+            "VCS provider does not support this file batch operation"
+        );
+        let mut params =
+            json!({"repositoryId": repository_id, "paths": paths, "operation": operation});
+        if let Some(token) = token {
+            validate_operation_token(token)?;
+            params["operationToken"] = token.into();
+        }
+        Ok(params)
     }
 
     pub async fn repository_state(&self, repository_id: String) -> Result<RepositoryState> {

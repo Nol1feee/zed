@@ -6,6 +6,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[1, 2];
 pub const MAX_OPERATION_TOKEN_BYTES: usize = 4096;
 pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_FILE_BATCH_PATHS: usize = 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,6 +34,8 @@ pub struct ProviderCapabilities {
     #[serde(default)]
     pub file_operations: Vec<FileOperation>,
     #[serde(default)]
+    pub batch_file_operations: Vec<FileOperation>,
+    #[serde(default)]
     pub repository_operations: Vec<RepositoryOperationKind>,
     #[serde(default)]
     pub checkout_catalog: bool,
@@ -43,6 +46,12 @@ pub struct ProviderCapabilities {
 impl ProviderCapabilities {
     pub fn supports_file_operation(&self, operation: FileOperation) -> bool {
         !self.read_only && self.file_operations.contains(&operation)
+    }
+
+    pub fn supports_batch_file_operation(&self, operation: FileOperation) -> bool {
+        matches!(operation, FileOperation::Stage | FileOperation::Unstage)
+            && self.supports_file_operation(operation)
+            && self.batch_file_operations.contains(&operation)
     }
 
     pub fn supports_repository_operation(&self, operation: RepositoryOperationKind) -> bool {
@@ -450,6 +459,14 @@ pub fn validate_paths(paths: &[String]) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_file_batch_paths(paths: &[String]) -> Result<()> {
+    ensure!(
+        !paths.is_empty() && paths.len() <= MAX_FILE_BATCH_PATHS,
+        "VCS file batch must contain between 1 and {MAX_FILE_BATCH_PATHS} paths"
+    );
+    validate_paths(paths)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PreparedFileOperation {
@@ -517,6 +534,7 @@ impl InitializeResult {
             self.protocol_version != 1
                 || (self.capabilities.read_only
                     && self.capabilities.file_operations.is_empty()
+                    && self.capabilities.batch_file_operations.is_empty()
                     && self.capabilities.repository_operations.is_empty()
                     && self.capabilities.checkout_operations.is_empty()),
             "VCS protocol 1 requires a read-only provider without write operations"
@@ -524,9 +542,17 @@ impl InitializeResult {
         ensure!(
             !self.capabilities.read_only
                 || (self.capabilities.file_operations.is_empty()
+                    && self.capabilities.batch_file_operations.is_empty()
                     && self.capabilities.repository_operations.is_empty()
                     && self.capabilities.checkout_operations.is_empty()),
             "read-only VCS providers cannot advertise write operations"
+        );
+        ensure!(
+            self.capabilities
+                .batch_file_operations
+                .iter()
+                .all(|operation| self.capabilities.supports_batch_file_operation(*operation)),
+            "VCS file batches require the corresponding stage or unstage file capability"
         );
         Ok(())
     }
@@ -1258,6 +1284,48 @@ mod tests {
         result.protocol_version = 1;
         assert!(result.validate().is_err());
         result.protocol_version = 3;
+        assert!(result.validate().is_err());
+    }
+
+    #[test]
+    fn file_batches_require_matching_file_capabilities_and_protocol_two() {
+        let mut result: InitializeResult = serde_json::from_value(serde_json::json!({
+            "protocolVersion": 2, "serverInfo": {"name": "fixture", "version": "1"},
+            "capabilities": {"readOnly": false, "fileOperations": ["stage", "unstage"]}
+        }))
+        .unwrap();
+        result.validate().unwrap();
+        assert!(
+            !result
+                .capabilities
+                .supports_batch_file_operation(FileOperation::Stage)
+        );
+        result.capabilities.batch_file_operations = vec![FileOperation::Stage];
+        result.validate().unwrap();
+        assert!(
+            result
+                .capabilities
+                .supports_batch_file_operation(FileOperation::Stage)
+        );
+        assert!(
+            !result
+                .capabilities
+                .supports_batch_file_operation(FileOperation::Unstage)
+        );
+        result.capabilities.batch_file_operations = vec![FileOperation::Discard];
+        result
+            .capabilities
+            .file_operations
+            .push(FileOperation::Discard);
+        assert!(result.validate().is_err());
+        result.capabilities.batch_file_operations = vec![FileOperation::Stage];
+        result.capabilities.file_operations.clear();
+        assert!(result.validate().is_err());
+        result.capabilities.file_operations = vec![FileOperation::Stage];
+        result.capabilities.read_only = true;
+        assert!(result.validate().is_err());
+        result.capabilities.read_only = false;
+        result.protocol_version = 1;
         assert!(result.validate().is_err());
     }
 

@@ -354,6 +354,39 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn file_batch_recovery_blocks_the_entire_checkout(cx: &mut TestAppContext) {
+        let fs = fs::FakeFs::new(cx.background_executor.clone());
+        let path = PathBuf::from("/state/batch.json");
+        let journal = OperationJournal::new(fs.clone(), path.clone());
+        journal.load().await.unwrap();
+        let batch = PendingOperation {
+            token: "batch-token".into(),
+            request: OperationRequest::FileBatch {
+                paths: vec!["new.txt".into()],
+                operation: FileOperation::Stage,
+                affected_paths: vec!["new.txt".into(), "old.txt".into()],
+            },
+        };
+        drop(journal.record(scope(), batch).await.unwrap());
+        let mut other = scope();
+        other.scope_uri = "file:///checkout/another-project".into();
+        assert!(journal.blocking(&other, false).unwrap().is_some());
+        assert!(journal.record(other, pending()).await.is_err());
+        let recovered = OperationJournal::new(fs, path);
+        recovered.load().await.unwrap();
+        assert!(matches!(
+            recovered.pending(&scope()).unwrap().unwrap().request,
+            OperationRequest::FileBatch { .. }
+        ));
+        let invalid = OperationRequest::FileBatch {
+            paths: vec!["selected.txt".into()],
+            operation: FileOperation::Stage,
+            affected_paths: vec!["another.txt".into()],
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[gpui::test]
     async fn active_owner_blocks_recovery_and_drop_preserves_durable_intent(
         cx: &mut TestAppContext,
     ) {

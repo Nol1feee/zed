@@ -478,8 +478,8 @@ pub(crate) fn staging_unavailable_reason(
         return Some("Source-control provider is unavailable.".into());
     };
     let store = store.read(cx);
-    if busy || store.file_operation_running() {
-        return Some("Another source-control operation is running.".into());
+    if busy || !store.can_enqueue_staging(&target.repository, cx) {
+        return Some("Another source-control operation is running or needs reconciliation.".into());
     }
     let repository = store
         .repositories()
@@ -520,6 +520,7 @@ pub(crate) fn staging_unavailable_reason(
 pub(crate) fn staging_state_for_target(
     target: &FileTarget,
     repository: Option<&VcsRepositorySnapshot>,
+    pending: Option<FileOperation>,
 ) -> ToggleState {
     let purpose = repository
         .and_then(|repository| {
@@ -530,7 +531,7 @@ pub(crate) fn staging_state_for_target(
                 .find(|baseline| baseline.id == target.baseline)
         })
         .and_then(|baseline| baseline.purpose);
-    match purpose {
+    let state = match purpose {
         Some(ComparisonPurpose::Staged) => ToggleState::Selected,
         Some(ComparisonPurpose::Unstaged) => ToggleState::Unselected,
         _ => staging_state(
@@ -539,6 +540,15 @@ pub(crate) fn staging_state_for_target(
                 .and_then(|repository| repository.repository_state.as_ref())
                 .map_or(&[][..], |state| state.staged_paths.as_slice()),
         ),
+    };
+    pending_staging_state(state, pending)
+}
+
+fn pending_staging_state(state: ToggleState, pending: Option<FileOperation>) -> ToggleState {
+    match pending {
+        Some(FileOperation::Stage) => ToggleState::Selected,
+        Some(FileOperation::Unstage) => ToggleState::Unselected,
+        _ => state,
     }
 }
 
@@ -579,7 +589,12 @@ pub(crate) fn file_context_menu(
             )
         })
         .unwrap_or_default();
-    let state = staging_state_for_target(target, repository.as_ref());
+    let pending = store.and_then(|store| {
+        store
+            .read(cx)
+            .pending_staging_operation(&target.repository, &target.change.path)
+    });
+    let state = staging_state_for_target(target, repository.as_ref(), pending);
     let operation = staging_operation(state);
     let entry = |label: SharedString, action, reason: Option<SharedString>| {
         let handler = handler.clone();
@@ -860,6 +875,11 @@ impl VcsPanel {
             settings.sort_by,
             settings.tree_view,
             &mut self.expanded_directories,
+            |key, path| {
+                self.store
+                    .as_ref()
+                    .and_then(|store| store.read(cx).pending_staging_operation(key, path))
+            },
         );
         self.selected = selected
             .and_then(|selected| {
@@ -1456,16 +1476,11 @@ impl VcsPanel {
         let Some(store) = self.store.as_ref().map(|store| store.read(cx)) else {
             return Some("Source-control provider is unavailable.");
         };
-        if self.preparing_operation || store.file_operation_running() {
-            return Some("Another source-control operation is running.");
+        if self.preparing_operation || !store.can_enqueue_staging(repository, cx) {
+            return Some("Another source-control operation is running or needs reconciliation.");
         }
         if self.project.read(cx).is_read_only(cx) {
             return Some("You do not have write access to this project.");
-        }
-        if store.file_operation_unresolved(repository)
-            || store.repository_operation_unresolved(repository)
-        {
-            return Some("Refresh source control to reconcile the previous operation.");
         }
         if !store.file_operations(repository).contains(&operation) {
             return Some("The provider does not support this action.");
@@ -1493,7 +1508,10 @@ impl VcsPanel {
                 .as_ref()
                 .map_or(&[][..], |state| state.staged_paths.as_slice());
             let has_targets = changes.changes.iter().any(|change| {
-                let state = staging_state(change, staged_paths);
+                let state = pending_staging_state(
+                    staging_state(change, staged_paths),
+                    store.pending_staging_operation(repository, &change.path),
+                );
                 match operation {
                     FileOperation::Stage => state != ToggleState::Selected,
                     FileOperation::Unstage => state != ToggleState::Unselected,
@@ -2040,7 +2058,8 @@ impl VcsPanel {
             .and_then(|repository| repository.repository_state)
             .map(|state| state.staged_paths.clone())
             .unwrap_or_default();
-        self.run_file_operation(staging_operation(row.staging_state(&staged_paths)), cx);
+        let state = self.row_staging_state(row, &staged_paths, cx);
+        self.run_file_operation(staging_operation(state), cx);
     }
 
     pub(crate) fn unsupported_action(&mut self, cx: &mut Context<Self>) {
@@ -2138,6 +2157,15 @@ impl VcsPanel {
             .anchor(Anchor::TopRight)
     }
 
+    fn row_staging_state(&self, row: &Row, staged_paths: &[String], cx: &App) -> ToggleState {
+        let pending = self.store.as_ref().and_then(|store| {
+            store
+                .read(cx)
+                .pending_staging_operation(&row.repository, &row.path)
+        });
+        pending_staging_state(row.staging_state(staged_paths), pending)
+    }
+
     fn render_actions_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let panel = cx.entity();
         let staged_paths = self
@@ -2149,8 +2177,8 @@ impl VcsPanel {
             && self
                 .rows
                 .iter()
-                .filter_map(|row| row.change.as_ref())
-                .all(|change| staging_state(change, &staged_paths) == ToggleState::Selected);
+                .filter(|row| row.change.is_some())
+                .all(|row| self.row_staging_state(row, &staged_paths, cx) == ToggleState::Selected);
         let title = if unstage { "Unstage All" } else { "Stage All" };
         let operation = if unstage {
             FileOperation::Unstage
@@ -2329,7 +2357,7 @@ impl VcsPanel {
                                     && child.presentation.section == row.presentation.section
                                     && child.path.starts_with(&prefix)
                             })
-                            .map(|child| child.staging_state(&staged_paths)),
+                            .map(|child| self.row_staging_state(child, &staged_paths, cx)),
                     );
                     return git_panel::status_row(
                         ("vcs-directory", index).into(),
@@ -2382,8 +2410,8 @@ impl VcsPanel {
                         .take_while(|row| {
                             row.change.is_some() || row.presentation.directory.is_some()
                         })
-                        .filter_map(|row| row.change.as_ref())
-                        .map(|change| staging_state(change, &staged_paths))
+                        .filter(|row| row.change.is_some())
+                        .map(|row| self.row_staging_state(row, &staged_paths, cx))
                         .collect::<Vec<_>>();
                     let section_state = if row.presentation.section == Some(Section::Staged) {
                         ToggleState::Selected
@@ -2442,7 +2470,7 @@ impl VcsPanel {
                     .and_then(|repository| repository.repository_state)
                     .map(|state| state.staged_paths.clone())
                     .unwrap_or_default();
-                let state = row.staging_state(&staged_paths);
+                let state = self.row_staging_state(&row, &staged_paths, cx);
                 let operation = staging_operation(state);
                 let unavailable = staging_unavailable_reason(
                     &target,
@@ -2633,6 +2661,7 @@ fn rows_for_repositories(
     sort_by: GitPanelSortBy,
     tree_view: bool,
     expanded_directories: &mut collections::HashMap<TreeKey, bool>,
+    pending: impl Fn(&VcsRepositoryId, &str) -> Option<FileOperation>,
 ) -> Vec<Row> {
     let mut rows = Vec::new();
     for (repository, changes) in repositories {
@@ -2675,10 +2704,16 @@ fn rows_for_repositories(
                         Section::Tracked => !presentation_status(change).is_created(),
                         Section::New => presentation_status(change).is_created(),
                         Section::Staged => {
-                            staging_state(change, staged_paths) != ToggleState::Unselected
+                            pending_staging_state(
+                                staging_state(change, staged_paths),
+                                pending(&repository.key, &change.path),
+                            ) != ToggleState::Unselected
                         }
                         Section::Unstaged => {
-                            staging_state(change, staged_paths) != ToggleState::Selected
+                            pending_staging_state(
+                                staging_state(change, staged_paths),
+                                pending(&repository.key, &change.path),
+                            ) != ToggleState::Selected
                         }
                         Section::Conflict => false,
                     }
@@ -3118,6 +3153,7 @@ mod tests {
             GitPanelSortBy::Path,
             false,
             &mut expanded,
+            |_, _| None,
         );
         for path in ["created.rs", "scratch.rs"] {
             assert_eq!(
@@ -3145,6 +3181,7 @@ mod tests {
             GitPanelSortBy::Path,
             false,
             &mut expanded,
+            |_, _| None,
         );
         let mixed_rows = rows
             .iter()
@@ -3155,6 +3192,31 @@ mod tests {
         assert_eq!(mixed_rows[1].baseline(&repository), "disk-view");
         assert_eq!(mixed_rows[0].staging_state(&[]), ToggleState::Selected);
         assert_eq!(mixed_rows[1].staging_state(&[]), ToggleState::Unselected);
+        let pending_rows = rows_for_repositories(
+            &repositories,
+            GitPanelGroupBy::Staging,
+            GitPanelSortBy::Path,
+            false,
+            &mut expanded,
+            |_, path| (path == "a/nested/z.rs").then_some(FileOperation::Stage),
+        );
+        let pending_mixed_rows = pending_rows
+            .iter()
+            .filter(|row| row.path == "a/nested/z.rs")
+            .collect::<Vec<_>>();
+        assert_eq!(pending_mixed_rows.len(), 1);
+        assert_eq!(
+            pending_mixed_rows[0].presentation.section,
+            Some(Section::Staged)
+        );
+        assert_eq!(
+            pending_staging_state(ToggleState::Unselected, Some(FileOperation::Stage)),
+            ToggleState::Selected
+        );
+        assert_eq!(
+            pending_staging_state(ToggleState::Selected, Some(FileOperation::Unstage)),
+            ToggleState::Unselected
+        );
         for (row, expected) in [
             (mixed_rows[0], FileOperation::Unstage),
             (mixed_rows[1], FileOperation::Stage),
@@ -3165,7 +3227,7 @@ mod tests {
                 change: row.change.clone().expect("change"),
             };
             assert_eq!(
-                staging_operation(staging_state_for_target(&target, Some(&repository))),
+                staging_operation(staging_state_for_target(&target, Some(&repository), None)),
                 expected
             );
             assert_eq!(
@@ -3190,6 +3252,7 @@ mod tests {
             GitPanelSortBy::Name,
             false,
             &mut expanded,
+            |_, _| None,
         );
         assert_eq!(
             rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
@@ -3201,6 +3264,7 @@ mod tests {
             GitPanelSortBy::Path,
             true,
             &mut expanded,
+            |_, _| None,
         );
         assert_eq!(rows[0].label, "a/nested");
         assert_eq!(
@@ -3225,6 +3289,7 @@ mod tests {
             GitPanelSortBy::Path,
             true,
             &mut expanded,
+            |_, _| None,
         );
         assert!(
             rows.iter()

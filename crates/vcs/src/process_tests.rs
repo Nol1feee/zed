@@ -1245,6 +1245,193 @@ async fn file_operation_inputs_and_prepared_tokens_are_validated(cx: &mut TestAp
 }
 
 #[gpui::test]
+async fn file_batches_validate_capability_paths_and_prepared_targets(cx: &mut TestAppContext) {
+    let legacy = fixture("writable", cx);
+    bounded(legacy.connection.initialize(), cx).await.unwrap();
+    assert!(
+        bounded(
+            legacy.connection.prepare_file_batch(
+                "fixture-repository".into(),
+                vec!["a-mixed.txt".into()],
+                FileOperation::Stage,
+            ),
+            cx
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        !events(&legacy)
+            .iter()
+            .any(|event| event["method"] == "vcs/prepareFileBatch")
+    );
+    bounded(legacy.connection.shutdown(), cx).await.unwrap();
+
+    let bulk = fixture("bulk-write", cx);
+    bounded(bulk.connection.initialize(), cx).await.unwrap();
+    for paths in [
+        vec![],
+        vec!["../outside".into()],
+        vec!["a.txt".into(), "a.txt".into()],
+        (0..=crate::MAX_FILE_BATCH_PATHS)
+            .map(|index| format!("file-{index}"))
+            .collect(),
+    ] {
+        assert!(
+            bounded(
+                bulk.connection.prepare_file_batch(
+                    "fixture-repository".into(),
+                    paths,
+                    FileOperation::Stage,
+                ),
+                cx
+            )
+            .await
+            .is_err()
+        );
+    }
+    for (repository, operation) in [
+        ("", FileOperation::Stage),
+        ("fixture-repository", FileOperation::Discard),
+    ] {
+        assert!(
+            bounded(
+                bulk.connection.prepare_file_batch(
+                    repository.into(),
+                    vec!["a.txt".into()],
+                    operation,
+                ),
+                cx
+            )
+            .await
+            .is_err()
+        );
+    }
+    assert!(
+        !events(&bulk)
+            .iter()
+            .any(|event| event["method"] == "vcs/prepareFileBatch")
+    );
+    bounded(bulk.connection.shutdown(), cx).await.unwrap();
+
+    for scenario in ["bulk-write-missing-paths", "bulk-write-invalid-paths"] {
+        let invalid = fixture(scenario, cx);
+        bounded(invalid.connection.initialize(), cx).await.unwrap();
+        assert!(
+            bounded(
+                invalid.connection.prepare_file_batch(
+                    "fixture-repository".into(),
+                    vec!["a.txt".into(), "b.txt".into()],
+                    FileOperation::Stage,
+                ),
+                cx
+            )
+            .await
+            .is_err()
+        );
+        bounded(invalid.connection.shutdown(), cx).await.unwrap();
+    }
+}
+
+#[gpui::test]
+async fn file_batches_bind_all_paths_and_reconcile_without_reapplying(cx: &mut TestAppContext) {
+    for scenario in ["bulk-write", "bulk-write-ambiguous", "bulk-write-error"] {
+        let fixture = fixture(scenario, cx);
+        bounded(fixture.connection.initialize(), cx).await.unwrap();
+        let paths = vec!["a-mixed.txt".into(), "d-renamed.txt".into()];
+        let prepared = bounded(
+            fixture.connection.prepare_file_batch(
+                "fixture-repository".into(),
+                paths.clone(),
+                FileOperation::Stage,
+            ),
+            cx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prepared.affected_paths.unwrap(),
+            ["a-mixed.txt", "d-renamed.txt", "old.txt"]
+        );
+        assert!(
+            bounded(
+                fixture.connection.apply_file_batch(
+                    "fixture-repository".into(),
+                    vec!["a-mixed.txt".into()],
+                    FileOperation::Stage,
+                    prepared.operation_token.clone(),
+                ),
+                cx
+            )
+            .await
+            .is_err()
+        );
+        let applied = bounded(
+            fixture.connection.apply_file_batch(
+                "fixture-repository".into(),
+                paths.clone(),
+                FileOperation::Stage,
+                prepared.operation_token.clone(),
+            ),
+            cx,
+        )
+        .await;
+        if scenario == "bulk-write-ambiguous" {
+            assert!(applied.is_err());
+        } else {
+            assert_eq!(
+                applied.unwrap().outcome,
+                if scenario == "bulk-write-error" {
+                    FileOperationOutcome::NotApplied
+                } else {
+                    FileOperationOutcome::Applied
+                }
+            );
+        }
+        let reconciled = bounded(
+            fixture.connection.reconcile_file_batch(
+                "fixture-repository".into(),
+                paths.clone(),
+                FileOperation::Stage,
+                prepared.operation_token.clone(),
+            ),
+            cx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            reconciled.outcome,
+            if scenario == "bulk-write-error" {
+                FileOperationOutcome::NotApplied
+            } else {
+                FileOperationOutcome::Applied
+            }
+        );
+        assert!(
+            bounded(
+                fixture.connection.apply_file_batch(
+                    "fixture-repository".into(),
+                    paths,
+                    FileOperation::Stage,
+                    prepared.operation_token,
+                ),
+                cx
+            )
+            .await
+            .is_err()
+        );
+        bounded(fixture.connection.shutdown(), cx).await.unwrap();
+        assert_eq!(
+            events(&fixture)
+                .iter()
+                .filter(|event| event["event"] == "file-batch-applied")
+                .count(),
+            usize::from(scenario != "bulk-write-error")
+        );
+    }
+}
+
+#[gpui::test]
 async fn checkout_catalog_and_write_capabilities_are_independent(cx: &mut TestAppContext) {
     for scenario in ["normal", "checkout-read-only"] {
         let fixture = fixture(scenario, cx);

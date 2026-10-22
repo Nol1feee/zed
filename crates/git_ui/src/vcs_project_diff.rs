@@ -342,6 +342,8 @@ impl VcsProjectDiff {
                                     "Source-control repository is no longer available.".into(),
                                 );
                             }
+                            let editor = this.editor.read(cx).rhs_editor().clone();
+                            editor.update(cx, |_, cx| cx.notify());
                             cx.notify();
                         }
                         _ => {}
@@ -902,7 +904,10 @@ impl editor::Addon for VcsDiffAddon {
             .repositories()
             .into_iter()
             .find(|repository| repository.key == target.repository)?;
-        let state = staging_state_for_target(&target, Some(&repository));
+        let pending = store
+            .read(cx)
+            .pending_staging_operation(&target.repository, &target.change.path);
+        let state = staging_state_for_target(&target, Some(&repository), pending);
         let operation = if state == ToggleState::Selected {
             FileOperation::Unstage
         } else {

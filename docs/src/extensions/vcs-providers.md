@@ -323,20 +323,62 @@ establishes its outcome.
 
 ### Stage All and Unstage All {#stage-all-and-unstage-all}
 
-Stage All and Unstage All compose the provider's existing `stage` and `unstage`
-file capabilities; they do not require a separate batch protocol method. Zed loads
-a fresh Working comparison and fixes a list of unique paths within the selected
-repository scope, regardless of the displayed comparison. Partially staged files
-can participate in either action. A rename and its source are handled together
-as one file operation.
+Stage All and Unstage All use the provider's `stage` and `unstage` file
+capabilities. Zed fixes a list of unique paths from the loaded Working comparison
+and pending staging intents within the selected repository scope. It loads that
+comparison first only when it is unavailable. Partially staged files can
+participate in either action. A rename and its source are handled together.
+
+Like Git staging, a checkbox immediately reflects the latest requested state
+while index writes run in a serialized queue. Other staging controls remain
+available; adjacent queued requests in the same direction can share one write.
+Completed pending state remains visible until a fresh snapshot arrives, so an
+older response cannot undo a later click. Other mutations stay blocked while
+staging is in progress.
 
 Before the first write, Zed checks every candidate's capabilities, ownership,
 file metadata, and open buffers. An unsupported candidate, unsaved edit, or disk
-conflict rejects the batch before any file is modified. Zed then prepares and
-applies each file sequentially, using the same durable journal and reconciliation
-rules as selected-file operations.
+conflict rejects the batch before any file is modified.
 
-The batch stops at the first error. The error reports how many file operations
+A protocol 2 provider can opt into one operation for the entire selection with
+`batchFileOperations: ["stage", "unstage"]`. This capability defaults to an empty
+list and requires `readOnly: false` and the corresponding entries in
+`fileOperations`. It does not grant commit or branch permissions. Only `stage`
+and `unstage` are allowed.
+
+| Method                   | Params                               | Result                                      |
+| ------------------------ | ------------------------------------ | ------------------------------------------- |
+| `vcs/prepareFileBatch`   | `repositoryId`, `paths`, `operation` | `{operationToken, affectedPaths, summary?}` |
+| `vcs/applyFileBatch`     | Same fields plus `operationToken`    | `{outcome}`                                 |
+| `vcs/reconcileFileBatch` | Same fields plus `operationToken`    | `{outcome}`                                 |
+
+`paths` contains 1–1024 unique, scope-relative selected paths. The provider must
+return every selected path and any rename partner in `affectedPaths`; Zed rejects
+paths outside that exact set of permitted targets. Preparation is read-only and
+binds one durable token to the repository, scope, complete path list, operation,
+and provider-defined preconditions. Stage and Unstage can use current file
+contents at execution time, without reading file blobs during preparation.
+Apply must revalidate the checkout and every target before writing, preserve
+working files, and verify the resulting index state. The provider should execute
+one native staging command for the selection.
+
+Zed journals one token before dispatching a batch. `applied` confirms the entire
+batch, `notApplied` confirms that none of it was applied, and `conflict` means the
+observed state no longer matches the prepared operation, including a partial
+result. An apply error is ambiguous: Zed reconciles the same complete request and
+token, never retries apply or switches to individual file operations. A failed
+reconciliation leaves the journal entry unresolved across restarts. The existing
+token-consumption and recovery rules apply to the whole batch. An unknown
+outcome stops the queue until reconciliation. A known failure removes the failed
+pending state and remains visible; independently queued user requests can still
+run after their own validation.
+
+Providers without this capability retain the sequential selected-file workflow.
+They receive only the existing singular RPCs; bulk paths are never added to a
+singular request. For this fallback, Zed prepares and applies each file using the
+same durable journal and reconciliation rules as selected-file operations.
+
+The sequential fallback stops at the first error. The error reports how many file operations
 were confirmed, the current path when one was started, and how many were not
 started. Confirmed operations remain applied; Zed does not automatically roll
 them back or resume the remaining batch. Recovery reconciles individual recorded
