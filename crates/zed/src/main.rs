@@ -1590,10 +1590,13 @@ pub(crate) async fn restorable_workspace_locations(
     cx: &mut AsyncApp,
     app_state: &Arc<AppState>,
 ) -> Option<Vec<SessionWorkspace>> {
-    let (mut restore_behavior, db) = cx.update(|cx| {
+    let (mut restore_behavior, db, excluded_markers) = cx.update(|cx| {
         (
             WorkspaceSettings::get(None, cx).restore_on_startup,
             workspace::WorkspaceDb::global(cx),
+            project::WorktreeSettings::get_global(cx)
+                .git_repository_exclusion_markers
+                .clone(),
         )
     });
 
@@ -1618,7 +1621,7 @@ pub(crate) async fn restorable_workspace_locations(
 
     match restore_behavior {
         workspace::RestoreOnStartupBehavior::LastWorkspace => {
-            workspace::last_opened_workspace_location(&db, app_state.fs.as_ref())
+            workspace::last_opened_workspace_location(&db, app_state.fs.as_ref(), &excluded_markers)
                 .await
                 .map(|(workspace_id, location, paths)| {
                     vec![SessionWorkspace {

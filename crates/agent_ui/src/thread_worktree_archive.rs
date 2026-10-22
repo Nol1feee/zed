@@ -205,6 +205,28 @@ pub fn build_root_plan(
     })
 }
 
+async fn check_archive_provider_ownership(root: &RootPlan, cx: &mut AsyncApp) -> Result<()> {
+    let checks = cx.update(|cx| {
+        root.affected_projects
+            .iter()
+            .filter_map(|affected| {
+                let project = affected.project.read(cx);
+                project.vcs_store().map(|store| {
+                    store
+                        .read(cx)
+                        .check_git_destructive_operation(root.root_path.clone().into(), cx)
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    for check in checks {
+        check
+            .await
+            .context("Git worktree archive is unavailable for an external VCS checkout")?;
+    }
+    Ok(())
+}
+
 /// Removes a worktree from all affected projects and deletes it from disk
 /// via `git worktree remove`.
 ///
@@ -214,6 +236,7 @@ pub fn build_root_plan(
 /// delete the worktree directory. If the git removal fails, the worktree
 /// is re-added to each project via [`rollback_root`].
 pub async fn remove_root(root: RootPlan, cx: &mut AsyncApp) -> Result<()> {
+    check_archive_provider_ownership(&root, cx).await?;
     verify_created_by_zed(&root, cx).await?;
 
     let release_tasks: Vec<_> = root
@@ -317,9 +340,8 @@ async fn remove_root_after_worktree_removal(
         find_or_create_repository(&root.main_repo_path, root.remote_connection.as_ref(), cx)
             .await?;
 
-    // `Repository::remove_worktree` with `force = true` deletes the working
-    // directory before running `git worktree remove --force`, so there's no
-    // need to touch the filesystem here. For remote projects that cleanup
+    // `Repository::remove_worktree` owns backend removal and any remaining
+    // directory cleanup, so there is no direct filesystem fallback here. For remote projects that cleanup
     // runs on the headless server via the `GitRemoveWorktree` RPC, which is
     // the only code path with access to the remote machine's filesystem.
     let receiver = repo.update(cx, |repo: &mut Repository, _cx| {
@@ -497,6 +519,7 @@ async fn rollback_root(root: &RootPlan, cx: &mut AsyncApp) {
 ///
 /// On success, returns the archived worktree DB row ID for rollback.
 pub async fn persist_worktree_state(root: &RootPlan, cx: &mut AsyncApp) -> Result<i64> {
+    check_archive_provider_ownership(root, cx).await?;
     let worktree_repo = root.worktree_repo.clone();
 
     let original_commit_hash = worktree_repo
@@ -651,14 +674,28 @@ pub async fn restore_worktree_via_git(
         find_or_create_repository(&row.main_repo_path, remote_connection, cx).await?;
 
     let worktree_path = &row.worktree_path;
+    main_repo
+        .read_with(cx, |repo, cx| {
+            repo.check_worktree_operation(worktree_path.clone(), cx)
+        })
+        .await
+        .context("Git archive restore is unavailable for an external VCS checkout")?;
     let app_state = current_app_state(cx).context("no app state available")?;
     let already_exists = app_state.fs.metadata(worktree_path).await?.is_some();
 
     let created_new_worktree = if already_exists {
-        let is_git_worktree =
-            resolve_git_worktree_to_main_repo(app_state.fs.as_ref(), worktree_path)
-                .await
-                .is_some();
+        let excluded_markers = cx.update(|cx| {
+            project::WorktreeSettings::get_global(cx)
+                .git_repository_exclusion_markers
+                .clone()
+        });
+        let is_git_worktree = resolve_git_worktree_to_main_repo(
+            app_state.fs.as_ref(),
+            worktree_path,
+            &excluded_markers,
+        )
+        .await
+        .is_some();
 
         if !is_git_worktree {
             let rx = main_repo.update(cx, |repo, _cx| repo.repair_worktrees());
@@ -1727,7 +1764,7 @@ mod tests {
         );
         let error_message = format!("{:#}", result.unwrap_err());
         assert!(
-            error_message.contains("failed to delete worktree directory"),
+            error_message.contains("simulated remove_dir failure"),
             "error should mention the directory deletion failure, got: {error_message}"
         );
 

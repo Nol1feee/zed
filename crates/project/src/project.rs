@@ -22,6 +22,7 @@ pub mod telemetry_snapshot;
 pub mod terminals;
 pub mod toolchain_store;
 pub mod trusted_worktrees;
+pub mod vcs_store;
 pub mod worktree_store;
 
 mod environment;
@@ -151,7 +152,7 @@ use worktree::{CreatedEntry, Snapshot, Traversal};
 pub use worktree::{
     Entry, EntryKind, FS_WATCH_LATENCY, File, LocalWorktree, PathChange, ProjectEntryId,
     UpdatedEntriesSet, UpdatedGitRepositoriesSet, Worktree, WorktreeId, WorktreeSettings,
-    discover_root_repo_common_dir,
+    discover_root_repo_common_dir, is_git_repository_excluded,
 };
 use worktree_store::{WorktreeStore, WorktreeStoreEvent};
 
@@ -235,6 +236,7 @@ pub struct Project {
     // todo lw explain the client_state x remote_client matrix, its super confusing
     client_state: ProjectClientState,
     git_store: Entity<GitStore>,
+    vcs_store: Option<Entity<vcs_store::VcsStore>>,
     collaborators: HashMap<proto::PeerId, Collaborator>,
     client_subscriptions: Vec<client::Subscription>,
     worktree_store: Entity<WorktreeStore>,
@@ -1281,6 +1283,7 @@ impl Project {
         DapStore::init(&client, cx);
         BreakpointStore::init(&client);
         context_server_store::init(cx);
+        vcs_store::init(cx);
     }
 
     pub fn local(
@@ -1386,6 +1389,17 @@ impl Project {
             });
             git_store.update(cx, |git_store, _| git_store.set_project(weak_self.clone()));
 
+            let vcs_store = cx.new(|cx| {
+                vcs_store::VcsStore::new(
+                    weak_self.clone(),
+                    worktree_store.clone(),
+                    git_store.clone(),
+                    environment.clone(),
+                    fs.clone(),
+                    cx,
+                )
+            });
+
             let task_store = cx.new(|cx| {
                 TaskStore::local(
                     buffer_store.downgrade(),
@@ -1451,6 +1465,7 @@ impl Project {
                 join_project_response_message_id: 0,
                 client_state: ProjectClientState::Local,
                 git_store,
+                vcs_store: Some(vcs_store),
                 client_subscriptions: Vec::new(),
                 _subscriptions: vec![cx.on_release(Self::release)],
                 active_entry: None,
@@ -1681,6 +1696,7 @@ impl Project {
                 join_project_response_message_id: 0,
                 client_state: ProjectClientState::Local,
                 git_store,
+                vcs_store: None,
                 agent_server_store,
                 client_subscriptions: Vec::new(),
                 _subscriptions: vec![
@@ -2003,6 +2019,7 @@ impl Project {
                 breakpoint_store: breakpoint_store.clone(),
                 dap_store: dap_store.clone(),
                 git_store: git_store.clone(),
+                vcs_store: None,
                 agent_server_store,
                 buffers_needing_diff: Default::default(),
                 git_diff_debouncer: DebouncedDelay::new(),
@@ -3438,6 +3455,13 @@ impl Project {
         worktree_ranges: Vec<Range<Anchor>>,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        if unstaged_diff
+            .read(cx)
+            .operations()
+            .is_some_and(|operations| !operations.supports_staging())
+        {
+            return Err(anyhow!("This source-control diff does not support staging"));
+        }
         if self.is_disconnected(cx) {
             return Err(anyhow!(ErrorCode::Disconnected));
         }
@@ -3456,6 +3480,15 @@ impl Project {
         worktree_ranges: Vec<Range<Anchor>>,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        if uncommitted_diff
+            .read(cx)
+            .operations()
+            .is_some_and(|operations| !operations.supports_unstaging())
+        {
+            return Err(anyhow!(
+                "This source-control diff does not support unstaging"
+            ));
+        }
         if self.is_disconnected(cx) {
             return Err(anyhow!(ErrorCode::Disconnected));
         }
@@ -3473,6 +3506,15 @@ impl Project {
         index_ranges: Vec<Range<Anchor>>,
         cx: &mut Context<Self>,
     ) -> Result<()> {
+        if staged_diff
+            .read(cx)
+            .operations()
+            .is_some_and(|operations| !operations.supports_unstaging())
+        {
+            return Err(anyhow!(
+                "This source-control diff does not support unstaging"
+            ));
+        }
         if self.is_disconnected(cx) {
             return Err(anyhow!(ErrorCode::Disconnected));
         }
@@ -5649,6 +5691,23 @@ impl Project {
         })
     }
 
+    pub fn has_provider_blame(&self, buffer: &Entity<Buffer>, cx: &App) -> bool {
+        self.vcs_store
+            .as_ref()
+            .is_some_and(|store| store.read(cx).has_provider_blame(buffer, cx))
+    }
+
+    pub fn blame_provider_buffer(
+        &self,
+        buffer: &Entity<Buffer>,
+        cx: &mut App,
+    ) -> Task<Result<Option<Arc<vcs::Blame>>>> {
+        let Some(store) = &self.vcs_store else {
+            return Task::ready(Ok(None));
+        };
+        store.update(cx, |store, cx| store.blame_buffer(buffer, cx))
+    }
+
     pub fn get_permalink_to_line(
         &self,
         buffer: &Entity<Buffer>,
@@ -6714,6 +6773,18 @@ impl Project {
         fallback_branch_name: String,
         cx: &App,
     ) -> Task<Result<()>> {
+        if let Some(store) = &self.vcs_store {
+            let ownership = store.read(cx).check_git_initialization(path.clone(), cx);
+            let git_store = self.git_store.clone();
+            return cx.spawn(async move |cx| {
+                ownership.await?;
+                git_store
+                    .read_with(cx, |store, cx| {
+                        store.git_init(path, fallback_branch_name, cx)
+                    })
+                    .await
+            });
+        }
         self.git_store
             .read(cx)
             .git_init(path, fallback_branch_name, cx)
@@ -6729,6 +6800,25 @@ impl Project {
 
     pub fn git_store(&self) -> &Entity<GitStore> {
         &self.git_store
+    }
+
+    pub fn vcs_store(&self) -> Option<&Entity<vcs_store::VcsStore>> {
+        self.vcs_store.as_ref()
+    }
+
+    pub fn open_source_control_diff(
+        &self,
+        buffer: Entity<Buffer>,
+        cx: &mut App,
+    ) -> Task<Result<Entity<BufferDiff>>> {
+        if let Some(store) = &self.vcs_store
+            && let Some(path) = buffer.read(cx).project_path(cx)
+            && store.read(cx).owns_project_path(&path, cx)
+        {
+            return store.update(cx, |store, cx| store.open_buffer_diff(buffer, cx));
+        }
+        self.git_store
+            .update(cx, |store, cx| store.open_display_diff(buffer, cx))
     }
 
     pub fn agent_server_store(&self) -> &Entity<AgentServerStore> {

@@ -2705,6 +2705,31 @@ impl Sidebar {
                         .cloned()
                         .or_else(|| open_workspaces.first().cloned());
 
+                    if let Some(workspace) = base_workspace.as_ref().filter(|workspace| {
+                        workspace
+                            .read(cx)
+                            .project()
+                            .read(cx)
+                            .vcs_store()
+                            .is_some_and(|store| {
+                                let store = store.read(cx);
+                                store.repositories().iter().any(|repository| {
+                                    store.checkout_catalog_available(&repository.key)
+                                })
+                            })
+                    }) {
+                        let workspace = workspace.clone();
+                        menu = menu
+                            .separator()
+                            .entry("Checkouts…", None, move |window, cx| {
+                                workspace.update(cx, |workspace, cx| {
+                                    git_ui_core::vcs_checkout_picker::show(
+                                        workspace, None, window, cx,
+                                    );
+                                });
+                            });
+                    }
+
                     // Only offer worktree creation when the base project can
                     // actually create one; otherwise the submenu would expand to
                     // nothing. Mirrors the picker's `creation_blocked_reason`.

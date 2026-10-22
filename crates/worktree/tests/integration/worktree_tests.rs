@@ -6,6 +6,7 @@ use fs::{FakeFs, Fs, PathEventKind, RealFs, RemoveOptions};
 use git::{DOT_GIT, GITIGNORE, REPO_EXCLUDE};
 use gpui::{
     AppContext as _, BackgroundExecutor, BorrowAppContext, Context, Entity, Task, TestAppContext,
+    UpdateGlobal as _,
 };
 use parking_lot::Mutex;
 use postage::stream::Stream;
@@ -4195,6 +4196,255 @@ async fn test_repository_above_root(executor: BackgroundExecutor, cx: &mut TestA
         worktree.as_local().unwrap().repositories()
     });
     pretty_assertions::assert_eq!(repos, [Path::new(path!("/root")).into()]);
+}
+
+#[gpui::test]
+async fn test_git_exclusion_preserves_nested_repositories(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .git
+                    .get_or_insert_default()
+                    .excluded_repository_markers = Some(vec![".compatibility-vcs".into()]);
+            });
+        });
+    });
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            ".git": {},
+            "external": {
+                ".git": {".compatibility-vcs": ""},
+                "project": {"file.txt": "external", "nested": {".git": {}, "file.txt": "Git"}}
+            },
+            "metadata": {"linked": {".compatibility-vcs": "", "commondir": ".."}},
+            "linked": {
+                ".git": format!("gitdir: {}\n", path!("/root/metadata/linked")),
+                "project": {"file.txt": "external", "nested": {".git": {}, "file.txt": "Git"}}
+            }
+        }),
+    )
+    .await;
+    for (index, (root, nested)) in [
+        (
+            path!("/root/external"),
+            path!("/root/external/project/nested"),
+        ),
+        (
+            path!("/root/external/project"),
+            path!("/root/external/project/nested"),
+        ),
+        (path!("/root/linked"), path!("/root/linked/project/nested")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let tree = Worktree::local(
+            Path::new(root),
+            true,
+            fs.clone(),
+            Arc::default(),
+            true,
+            WorktreeId::from_proto(index as u64),
+            &mut cx.to_async(),
+        )
+        .await
+        .unwrap();
+        tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+            .await;
+        tree.read_with(cx, |tree, _| {
+            assert_eq!(tree.snapshot().root_repo_common_dir(), None);
+            assert_eq!(
+                tree.as_local().unwrap().repositories(),
+                [Arc::<Path>::from(Path::new(nested))]
+            );
+        });
+    }
+}
+
+#[gpui::test]
+async fn test_git_exclusion_marker_event_removes_only_matching_repository(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings
+                    .git
+                    .get_or_insert_default()
+                    .excluded_repository_markers = Some(vec![".compatibility-vcs".into()]);
+            });
+        });
+    });
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            ".git": {}, "nested": {".git": {}, "file.txt": "Git"}
+        }),
+    )
+    .await;
+    let tree = Worktree::local(
+        Path::new(path!("/root")),
+        true,
+        fs.clone(),
+        Arc::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+        .await;
+    assert_eq!(
+        tree.read_with(cx, |tree, _| tree.as_local().unwrap().repositories().len()),
+        2
+    );
+    fs.insert_file(path!("/root/.git/.compatibility-vcs"), Vec::new())
+        .await;
+    tree.flush_fs_events(cx).await;
+    tree.read_with(cx, |tree, _| {
+        assert_eq!(tree.snapshot().root_repo_common_dir(), None);
+        assert_eq!(
+            tree.as_local().unwrap().repositories(),
+            [Arc::<Path>::from(Path::new(path!("/root/nested")))]
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_git_exclusion_markers_are_local_to_linked_gitdir(cx: &mut TestAppContext) {
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/root"),
+        json!({
+            ".git": {
+                ".compatibility-vcs": "",
+                "worktrees": {
+                    "external": {".compatibility-vcs": "", "commondir": "../.."},
+                    "genuine": {"commondir": "../.."}
+                }
+            },
+            "external": {".git": format!("gitdir: {}\n", path!("/root/.git/worktrees/external"))},
+            "genuine": {".git": format!("gitdir: {}\n", path!("/root/.git/worktrees/genuine"))}
+        }),
+    )
+    .await;
+    let markers = vec![".compatibility-vcs".to_owned()];
+    assert_eq!(
+        worktree::discover_root_repo_common_dir(
+            Path::new(path!("/root/external")),
+            fs.as_ref(),
+            &markers,
+        )
+        .await,
+        None
+    );
+    assert_eq!(
+        worktree::discover_root_repo_common_dir(
+            Path::new(path!("/root/genuine")),
+            fs.as_ref(),
+            &markers,
+        )
+        .await,
+        Some(Arc::<Path>::from(Path::new(path!("/root/.git"))))
+    );
+    assert_eq!(
+        worktree::discover_root_repo_common_dir(
+            Path::new(path!("/root/external")),
+            fs.as_ref(),
+            &[],
+        )
+        .await,
+        Some(Arc::<Path>::from(Path::new(path!("/root/.git"))))
+    );
+}
+
+#[gpui::test]
+async fn test_git_exclusion_watches_linked_marker_and_recovers_on_settings_change(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let set_markers = |cx: &mut TestAppContext, markers: Vec<String>| {
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .git
+                        .get_or_insert_default()
+                        .excluded_repository_markers = Some(markers);
+                });
+            })
+        });
+    };
+    set_markers(cx, vec!["bridge.lock".into()]);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree(
+        path!("/metadata"),
+        json!({
+            "linked": {"bridge.lock": "", "commondir": "../common"}, "common": {}
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        path!("/external"),
+        json!({
+            ".git": format!("gitdir: {}\n", path!("/metadata/linked")),
+            "project": {"file.txt": "external"}
+        }),
+    )
+    .await;
+    let tree = Worktree::local(
+        Path::new(path!("/external/project")),
+        true,
+        fs.clone(),
+        Arc::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+        .await;
+    let assert_excluded = |cx: &mut TestAppContext, excluded: bool| {
+        tree.read_with(cx, |tree, _| {
+            let local = tree.as_local().unwrap();
+            assert_eq!(local.repositories().is_empty(), excluded);
+            assert_eq!(
+                local
+                    .excluded_git_repository_for_path(Path::new(path!(
+                        "/external/project/file.txt"
+                    )))
+                    .is_some(),
+                excluded
+            );
+        });
+    };
+    assert_excluded(cx, true);
+    fs.remove_file(
+        Path::new(path!("/metadata/linked/bridge.lock")),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    tree.flush_fs_events(cx).await;
+    assert_excluded(cx, false);
+    fs.insert_file(path!("/metadata/linked/bridge.lock"), Vec::new())
+        .await;
+    tree.flush_fs_events(cx).await;
+    assert_excluded(cx, true);
+    set_markers(cx, Vec::new());
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+        .await;
+    assert_excluded(cx, false);
+    set_markers(cx, vec!["bridge.lock".into()]);
+    tree.read_with(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+        .await;
+    assert_excluded(cx, true);
 }
 
 #[gpui::test]

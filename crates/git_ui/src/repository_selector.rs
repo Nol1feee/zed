@@ -1,10 +1,11 @@
-use crate::git_status_icon;
+use crate::{git_panel::GitPanel, git_status_icon};
 use git::status::{FileStatus, StatusCode, TrackedStatus, UnmergedStatus, UnmergedStatusCode};
 use gpui::{App, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Task, WeakEntity};
 use picker::{Picker, PickerDelegate, PickerEditorPosition};
-use project::{Project, git_store::Repository};
+use project::{Project, git_store::Repository, vcs_store::VcsRepositorySnapshot};
 use std::sync::Arc;
 use ui::{ListItem, ListItemSpacing, prelude::*};
+use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
 
 pub fn register(workspace: &mut Workspace) {
@@ -18,9 +19,35 @@ pub fn open(
     cx: &mut Context<Workspace>,
 ) {
     let project = workspace.project().clone();
+    let panel = workspace
+        .panel::<GitPanel>(cx)
+        .map(|panel| panel.downgrade());
     workspace.toggle_modal(window, cx, |window, cx| {
-        RepositorySelector::new(project, rems(34.), window, cx)
+        RepositorySelector::new(project, panel, rems(34.), window, cx)
     })
+}
+
+#[derive(Clone)]
+enum RepositoryEntry {
+    Git(Entity<Repository>),
+    External(VcsRepositorySnapshot),
+}
+
+impl RepositoryEntry {
+    fn display_name(&self, cx: &App) -> String {
+        match self {
+            Self::Git(repository) => repository.read(cx).display_name().to_string(),
+            Self::External(repository) => repository.descriptor.display_name.clone(),
+        }
+    }
+
+    fn matches(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Git(left), Self::Git(right)) => left == right,
+            (Self::External(left), Self::External(right)) => left.key == right.key,
+            _ => false,
+        }
+    }
 }
 
 pub struct RepositorySelector {
@@ -29,246 +56,185 @@ pub struct RepositorySelector {
 
 impl RepositorySelector {
     pub fn new(
-        project_handle: Entity<Project>,
+        project: Entity<Project>,
+        panel: Option<WeakEntity<GitPanel>>,
         width: Rems,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let git_store = project_handle.read(cx).git_store().clone();
-        let repository_entries = git_store.update(cx, |git_store, _cx| {
-            let mut repos: Vec<_> = git_store.repositories().values().cloned().collect();
-
-            repos.sort_by(|a, b| {
-                a.read(_cx)
-                    .display_name()
-                    .to_lowercase()
-                    .cmp(&b.read(_cx).display_name().to_lowercase())
-            });
-
-            repos
-        });
-        let filtered_repositories = repository_entries.clone();
-
-        let active_repository = git_store.read(cx).active_repository();
+        let project = project.read(cx);
+        let git_store = project.git_store().read(cx);
+        let mut repository_entries = git_store
+            .repositories()
+            .values()
+            .cloned()
+            .map(RepositoryEntry::Git)
+            .collect::<Vec<_>>();
+        if panel.is_some() {
+            repository_entries.extend(
+                project
+                    .vcs_store()
+                    .into_iter()
+                    .flat_map(|store| store.read(cx).repositories())
+                    .map(RepositoryEntry::External),
+            );
+        }
+        repository_entries.sort_by_key(|repository| repository.display_name(cx).to_lowercase());
+        let panel_entity = panel.as_ref().and_then(WeakEntity::upgrade);
+        let external_selected = panel_entity
+            .as_ref()
+            .is_some_and(|panel| panel.read(cx).uses_vcs_panel(cx));
+        let selected_vcs = panel_entity
+            .as_ref()
+            .and_then(|panel| panel.read(cx).selected_vcs_repository(cx));
+        let active_repository = if let Some(key) = selected_vcs {
+            repository_entries.iter().find(|entry| matches!(entry, RepositoryEntry::External(repository) if repository.key == key)).cloned()
+        } else if external_selected {
+            None
+        } else {
+            git_store.active_repository().map(RepositoryEntry::Git)
+        };
         let selected_index = active_repository
             .as_ref()
-            .and_then(|active| filtered_repositories.iter().position(|repo| repo == active))
+            .and_then(|active| {
+                repository_entries
+                    .iter()
+                    .position(|entry| entry.matches(active))
+            })
             .unwrap_or(0);
         let delegate = RepositorySelectorDelegate {
             repository_selector: cx.entity().downgrade(),
+            panel,
+            filtered_repositories: repository_entries.clone(),
             repository_entries,
-            filtered_repositories,
             active_repository,
             selected_index,
         };
-
         let picker = cx.new(|cx| {
             Picker::uniform_list(delegate, window, cx)
                 .initial_width(width)
                 .show_scrollbar(true)
         });
-
-        RepositorySelector { picker }
+        Self { picker }
     }
 }
 
-//pub(crate) fn filtered_repository_entries(
-//    git_store: &GitStore,
-//    cx: &App,
-//) -> Vec<Entity<Repository>> {
-//    let repositories = git_store
-//        .repositories()
-//        .values()
-//        .sorted_by_key(|repo| {
-//            let repo = repo.read(cx);
-//            (
-//                repo.dot_git_abs_path.clone(),
-//                repo.worktree_abs_path.clone(),
-//            )
-//        })
-//        .collect::<Vec<&Entity<Repository>>>();
-//
-//    repositories
-//        .chunk_by(|a, b| a.read(cx).dot_git_abs_path == b.read(cx).dot_git_abs_path)
-//        .flat_map(|chunk| {
-//            let has_non_single_file_worktree = chunk
-//                .iter()
-//                .any(|repo| !repo.read(cx).is_from_single_file_worktree);
-//            chunk.iter().filter(move |repo| {
-//                // Remove any entry that comes from a single file worktree and represents a repository that is also represented by a non-single-file worktree.
-//                !repo.read(cx).is_from_single_file_worktree || !has_non_single_file_worktree
-//            })
-//        })
-//        .map(|&repo| repo.clone())
-//        .collect()
-//}
-
 impl EventEmitter<DismissEvent> for RepositorySelector {}
-
 impl Focusable for RepositorySelector {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.picker.focus_handle(cx)
     }
 }
-
 impl Render for RepositorySelector {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .key_context("GitRepositorySelector")
             .child(self.picker.clone())
     }
 }
-
 impl ModalView for RepositorySelector {}
 
 pub struct RepositorySelectorDelegate {
     repository_selector: WeakEntity<RepositorySelector>,
-    repository_entries: Vec<Entity<Repository>>,
-    filtered_repositories: Vec<Entity<Repository>>,
-    active_repository: Option<Entity<Repository>>,
+    panel: Option<WeakEntity<GitPanel>>,
+    repository_entries: Vec<RepositoryEntry>,
+    filtered_repositories: Vec<RepositoryEntry>,
+    active_repository: Option<RepositoryEntry>,
     selected_index: usize,
 }
 
-impl RepositorySelectorDelegate {
-    pub fn update_repository_entries(&mut self, all_repositories: Vec<Entity<Repository>>) {
-        self.repository_entries = all_repositories.clone();
-        self.filtered_repositories = all_repositories;
+impl PickerDelegate for RepositorySelectorDelegate {
+    type ListItem = ListItem;
+    fn name() -> &'static str {
+        "repository selector"
+    }
+    fn match_count(&self) -> usize {
+        self.filtered_repositories.len()
+    }
+    fn selected_index(&self) -> usize {
+        self.selected_index
+    }
+    fn set_selected_index(&mut self, index: usize, _: &mut Window, cx: &mut Context<Picker<Self>>) {
+        self.selected_index = index.min(self.filtered_repositories.len().saturating_sub(1));
+        cx.notify();
+    }
+    fn placeholder_text(&self, _: &mut Window, _: &mut App) -> Arc<str> {
+        "Select a repository...".into()
+    }
+    fn editor_position(&self) -> PickerEditorPosition {
+        PickerEditorPosition::End
+    }
+    fn update_matches(
+        &mut self,
+        query: String,
+        _: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        let query = query.to_lowercase();
+        self.filtered_repositories = self
+            .repository_entries
+            .iter()
+            .filter(|entry| entry.display_name(cx).to_lowercase().contains(&query))
+            .cloned()
+            .collect();
         self.selected_index = self
             .active_repository
             .as_ref()
             .and_then(|active| {
                 self.filtered_repositories
                     .iter()
-                    .position(|repo| repo == active)
+                    .position(|entry| entry.matches(active))
             })
             .unwrap_or(0);
-    }
-}
-
-impl PickerDelegate for RepositorySelectorDelegate {
-    type ListItem = ListItem;
-
-    fn name() -> &'static str {
-        "repository selector"
-    }
-
-    fn match_count(&self) -> usize {
-        self.filtered_repositories.len()
-    }
-
-    fn selected_index(&self) -> usize {
-        self.selected_index
-    }
-
-    fn set_selected_index(
-        &mut self,
-        ix: usize,
-        _window: &mut Window,
-        cx: &mut Context<Picker<Self>>,
-    ) {
-        self.selected_index = ix.min(self.filtered_repositories.len().saturating_sub(1));
         cx.notify();
+        Task::ready(())
     }
-
-    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Select a repository...".into()
-    }
-
-    fn editor_position(&self) -> PickerEditorPosition {
-        PickerEditorPosition::End
-    }
-
-    fn update_matches(
-        &mut self,
-        query: String,
-        window: &mut Window,
-        cx: &mut Context<Picker<Self>>,
-    ) -> Task<()> {
-        let all_repositories = self.repository_entries.clone();
-
-        let repo_names: Vec<(Entity<Repository>, String)> = all_repositories
-            .iter()
-            .map(|repo| (repo.clone(), repo.read(cx).display_name().to_lowercase()))
-            .collect();
-
-        cx.spawn_in(window, async move |this, cx| {
-            let filtered_repositories = cx
-                .background_spawn(async move {
-                    if query.is_empty() {
-                        all_repositories
-                    } else {
-                        let query_lower = query.to_lowercase();
-                        repo_names
-                            .into_iter()
-                            .filter(|(_, display_name)| display_name.contains(&query_lower))
-                            .map(|(repo, _)| repo)
-                            .collect()
-                    }
-                })
-                .await;
-
-            this.update_in(cx, |this, window, cx| {
-                let mut sorted_repositories = filtered_repositories;
-                sorted_repositories.sort_by(|a, b| {
-                    a.read(cx)
-                        .display_name()
-                        .to_lowercase()
-                        .cmp(&b.read(cx).display_name().to_lowercase())
-                });
-                let selected_index = this
-                    .delegate
-                    .active_repository
-                    .as_ref()
-                    .and_then(|active| sorted_repositories.iter().position(|repo| repo == active))
-                    .unwrap_or(0);
-                this.delegate.filtered_repositories = sorted_repositories;
-                this.delegate.set_selected_index(selected_index, window, cx);
-                cx.notify();
-            })
-            .ok();
-        })
-    }
-
-    fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        let Some(selected_repo) = self.filtered_repositories.get(self.selected_index) else {
+    fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
+        let Some(selected) = self.filtered_repositories.get(self.selected_index).cloned() else {
             return;
         };
-        selected_repo.update(cx, |selected_repo, cx| {
-            selected_repo.set_as_active_repository(cx)
-        });
+        match selected {
+            RepositoryEntry::Git(repository) => {
+                repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+                if let Some(panel) = self.panel.as_ref().and_then(WeakEntity::upgrade) {
+                    panel.update(cx, |panel, cx| panel.select_git_repository(window, cx));
+                }
+            }
+            RepositoryEntry::External(repository) => {
+                if let Some(panel) = self.panel.as_ref().and_then(WeakEntity::upgrade) {
+                    panel.update(cx, |panel, cx| {
+                        panel.select_vcs_repository(repository.key, window, cx)
+                    });
+                }
+            }
+        }
         self.dismissed(window, cx);
     }
-
-    fn dismissed(&mut self, _window: &mut Window, cx: &mut Context<Picker<Self>>) {
+    fn dismissed(&mut self, _: &mut Window, cx: &mut Context<Picker<Self>>) {
         self.repository_selector
-            .update(cx, |_this, cx| cx.emit(DismissEvent))
-            .ok();
+            .update(cx, |_, cx| cx.emit(DismissEvent))
+            .log_err();
     }
-
     fn render_match(
         &self,
-        ix: usize,
+        index: usize,
         selected: bool,
-        _window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        let repo_info = self.filtered_repositories.get(ix)?;
-        let repo = repo_info.read(cx);
-        let display_name = repo.display_name();
-        let summary = repo.status_summary();
+        let entry = self.filtered_repositories.get(index)?;
         let is_active = self
             .active_repository
             .as_ref()
-            .is_some_and(|active| active == repo_info);
-
-        let mut item = ListItem::new(ix)
+            .is_some_and(|active| entry.matches(active));
+        let mut item = ListItem::new(index)
             .inset(true)
             .spacing(ListItemSpacing::Sparse)
             .toggle_state(selected)
             .child(
                 h_flex()
                     .gap_1()
-                    .child(Label::new(display_name))
+                    .child(Label::new(entry.display_name(cx)))
                     .when(is_active, |this| {
                         this.child(
                             Icon::new(IconName::Check)
@@ -277,32 +243,42 @@ impl PickerDelegate for RepositorySelectorDelegate {
                         )
                     }),
             );
-
-        if summary.count > 0 {
-            let status = if summary.conflict > 0 {
-                FileStatus::Unmerged(UnmergedStatus {
-                    first_head: UnmergedStatusCode::Updated,
-                    second_head: UnmergedStatusCode::Updated,
-                })
-            } else if summary.worktree.deleted > 0 || summary.index.deleted > 0 {
-                FileStatus::Tracked(TrackedStatus {
-                    index_status: StatusCode::Deleted,
-                    worktree_status: StatusCode::Unmodified,
-                })
-            } else if summary.worktree.modified > 0 || summary.index.modified > 0 {
-                FileStatus::Tracked(TrackedStatus {
-                    index_status: StatusCode::Modified,
-                    worktree_status: StatusCode::Unmodified,
-                })
-            } else {
-                FileStatus::Tracked(TrackedStatus {
-                    index_status: StatusCode::Added,
-                    worktree_status: StatusCode::Unmodified,
-                })
-            };
-            item = item.end_slot(div().pr_2().child(git_status_icon(status)));
+        match entry {
+            RepositoryEntry::External(repository) => {
+                item = item.end_slot(
+                    Label::new(repository.key.provider_id.to_string())
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                );
+            }
+            RepositoryEntry::Git(repository) => {
+                let summary = repository.read(cx).status_summary();
+                if summary.count > 0 {
+                    let status = if summary.conflict > 0 {
+                        FileStatus::Unmerged(UnmergedStatus {
+                            first_head: UnmergedStatusCode::Updated,
+                            second_head: UnmergedStatusCode::Updated,
+                        })
+                    } else if summary.worktree.deleted > 0 || summary.index.deleted > 0 {
+                        FileStatus::Tracked(TrackedStatus {
+                            index_status: StatusCode::Deleted,
+                            worktree_status: StatusCode::Unmodified,
+                        })
+                    } else if summary.worktree.modified > 0 || summary.index.modified > 0 {
+                        FileStatus::Tracked(TrackedStatus {
+                            index_status: StatusCode::Modified,
+                            worktree_status: StatusCode::Unmodified,
+                        })
+                    } else {
+                        FileStatus::Tracked(TrackedStatus {
+                            index_status: StatusCode::Added,
+                            worktree_status: StatusCode::Unmodified,
+                        })
+                    };
+                    item = item.end_slot(div().pr_2().child(git_status_icon(status)));
+                }
+            }
         }
-
         Some(item)
     }
 }

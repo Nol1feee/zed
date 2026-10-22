@@ -59,11 +59,16 @@ pub mod staged_diff;
 pub mod stash_picker;
 pub mod text_diff_view;
 pub mod unstaged_diff;
+pub mod vcs_file_history;
+pub mod vcs_panel;
+mod vcs_project_diff;
 
 pub use blame_ui::GitBlameStatus;
 pub use conflict_view::MergeConflictIndicator;
 
 pub fn init(cx: &mut App) {
+    vcs_panel::init(cx);
+    git_ui_core::vcs_checkout_picker::init(cx);
     editor::set_blame_renderer(blame_ui::GitBlameRenderer, cx);
     commit_view::init(cx);
     git_graph::init(cx);
@@ -133,6 +138,37 @@ pub fn init(cx: &mut App) {
         );
 
         workspace.register_action(|workspace, _: &zed_actions::git::Worktree, window, cx| {
+            if external_vcs_selected(workspace, cx) {
+                let selected = workspace
+                    .panel::<GitPanel>(cx)
+                    .and_then(|panel| panel.read(cx).selected_vcs_repository(cx));
+                let available = selected.as_ref().is_some_and(|key| {
+                    workspace
+                        .project()
+                        .read(cx)
+                        .vcs_store()
+                        .is_some_and(|store| store.read(cx).checkout_catalog_available(key))
+                });
+                if available {
+                    git_ui_core::vcs_checkout_picker::show(workspace, selected, window, cx);
+                } else {
+                    reject_external_vcs_action(workspace, cx);
+                }
+                return;
+            }
+            let project = workspace.project().read(cx);
+            if project.repositories(cx).is_empty()
+                && project.vcs_store().is_some_and(|store| {
+                    let store = store.read(cx);
+                    store
+                        .repositories()
+                        .iter()
+                        .any(|repository| store.checkout_catalog_available(&repository.key))
+                })
+            {
+                git_ui_core::vcs_checkout_picker::show(workspace, None, window, cx);
+                return;
+            }
             let focused_dock = workspace.focused_dock_position(window, cx);
             let project = workspace.project().clone();
             let workspace_handle = workspace.weak_handle();
@@ -186,6 +222,9 @@ pub fn init(cx: &mut App) {
         if !project.is_via_collab() {
             workspace.register_action(
                 |workspace, _: &zed_actions::git::CreatePullRequest, window, cx| {
+                    if reject_external_vcs_action(workspace, cx) {
+                        return;
+                    }
                     if let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) {
                         panel.update(cx, |panel, cx| {
                             panel.create_pull_request(window, cx);
@@ -194,6 +233,9 @@ pub fn init(cx: &mut App) {
                 },
             );
             workspace.register_action(|workspace, _: &git::Fetch, window, cx| {
+                if reject_external_vcs_action(workspace, cx) {
+                    return;
+                }
                 let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                     return;
                 };
@@ -202,6 +244,9 @@ pub fn init(cx: &mut App) {
                 });
             });
             workspace.register_action(|workspace, _: &git::FetchFrom, window, cx| {
+                if reject_external_vcs_action(workspace, cx) {
+                    return;
+                }
                 let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                     return;
                 };
@@ -210,6 +255,9 @@ pub fn init(cx: &mut App) {
                 });
             });
             workspace.register_action(|workspace, _: &git::Push, window, cx| {
+                if reject_external_vcs_action(workspace, cx) {
+                    return;
+                }
                 let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                     return;
                 };
@@ -218,6 +266,9 @@ pub fn init(cx: &mut App) {
                 });
             });
             workspace.register_action(|workspace, _: &git::PushTo, window, cx| {
+                if reject_external_vcs_action(workspace, cx) {
+                    return;
+                }
                 let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                     return;
                 };
@@ -226,6 +277,9 @@ pub fn init(cx: &mut App) {
                 });
             });
             workspace.register_action(|workspace, _: &git::ForcePush, window, cx| {
+                if reject_external_vcs_action(workspace, cx) {
+                    return;
+                }
                 let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                     return;
                 };
@@ -234,6 +288,9 @@ pub fn init(cx: &mut App) {
                 });
             });
             workspace.register_action(|workspace, _: &git::Pull, window, cx| {
+                if reject_external_vcs_action(workspace, cx) {
+                    return;
+                }
                 let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                     return;
                 };
@@ -242,6 +299,9 @@ pub fn init(cx: &mut App) {
                 });
             });
             workspace.register_action(|workspace, _: &git::PullRebase, window, cx| {
+                if reject_external_vcs_action(workspace, cx) {
+                    return;
+                }
                 let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                     return;
                 };
@@ -251,6 +311,9 @@ pub fn init(cx: &mut App) {
             });
         }
         workspace.register_action(|workspace, action: &git::StashAll, window, cx| {
+            if reject_external_vcs_action(workspace, cx) {
+                return;
+            }
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                 return;
             };
@@ -259,6 +322,9 @@ pub fn init(cx: &mut App) {
             });
         });
         workspace.register_action(|workspace, action: &git::StashStaged, window, cx| {
+            if reject_external_vcs_action(workspace, cx) {
+                return;
+            }
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                 return;
             };
@@ -267,6 +333,9 @@ pub fn init(cx: &mut App) {
             });
         });
         workspace.register_action(|workspace, action: &git::StashTracked, window, cx| {
+            if reject_external_vcs_action(workspace, cx) {
+                return;
+            }
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                 return;
             };
@@ -275,6 +344,9 @@ pub fn init(cx: &mut App) {
             });
         });
         workspace.register_action(|workspace, action: &git::StashPop, window, cx| {
+            if reject_external_vcs_action(workspace, cx) {
+                return;
+            }
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                 return;
             };
@@ -283,6 +355,9 @@ pub fn init(cx: &mut App) {
             });
         });
         workspace.register_action(|workspace, action: &git::StashApply, window, cx| {
+            if reject_external_vcs_action(workspace, cx) {
+                return;
+            }
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                 return;
             };
@@ -307,6 +382,9 @@ pub fn init(cx: &mut App) {
             });
         });
         workspace.register_action(|workspace, _: &git::Uncommit, window, cx| {
+            if reject_external_vcs_action(workspace, cx) {
+                return;
+            }
             let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
                 return;
             };
@@ -372,6 +450,30 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+pub(crate) fn external_vcs_selected(workspace: &Workspace, cx: &App) -> bool {
+    workspace
+        .panel::<GitPanel>(cx)
+        .is_some_and(|panel| panel.read(cx).uses_vcs_panel(cx))
+}
+
+pub(crate) fn reject_external_vcs_action(
+    workspace: &mut Workspace,
+    cx: &mut Context<Workspace>,
+) -> bool {
+    if !external_vcs_selected(workspace, cx) {
+        return false;
+    }
+    struct UnsupportedExternalVcsAction;
+    workspace.show_toast(
+        Toast::new(
+            NotificationId::unique::<UnsupportedExternalVcsAction>(),
+            "This action is not supported by the selected source-control provider.",
+        ),
+        cx,
+    );
+    true
+}
+
 fn open_file_diff(
     entry: GitStatusEntry,
     repository: Entity<Repository>,
@@ -418,6 +520,9 @@ fn open_modified_files(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    if reject_external_vcs_action(workspace, cx) {
+        return;
+    }
     let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
         return;
     };
@@ -646,6 +751,9 @@ fn rename_current_branch(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    if reject_external_vcs_action(workspace, cx) {
+        return;
+    }
     let Some(panel) = workspace.panel::<git_panel::GitPanel>(cx) else {
         return;
     };
@@ -670,6 +778,9 @@ fn rename_current_branch(
 }
 
 fn create_tag_at_head(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
+    if reject_external_vcs_action(workspace, cx) {
+        return;
+    }
     let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
         return;
     };
@@ -699,6 +810,9 @@ pub(crate) fn create_tag_at_commit(
 }
 
 fn copy_branch_name(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
+    if reject_external_vcs_action(workspace, cx) {
+        return;
+    }
     let Some(panel) = workspace.panel::<GitPanel>(cx) else {
         return;
     };
@@ -931,6 +1045,9 @@ fn show_ref_picker(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    if reject_external_vcs_action(workspace, cx) {
+        return;
+    }
     let Some(repo) = workspace.project().read(cx).active_repository(cx) else {
         return;
     };

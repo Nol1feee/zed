@@ -31361,6 +31361,312 @@ async fn test_multibuffer_in_navigation_history(cx: &mut TestAppContext) {
     });
 }
 
+struct ReadOnlySourceControlTestOperations;
+
+impl buffer_diff::DiffOperations for ReadOnlySourceControlTestOperations {
+    fn supports_staging(&self) -> bool {
+        false
+    }
+    fn supports_unstaging(&self) -> bool {
+        false
+    }
+    fn supports_restore(&self) -> bool {
+        false
+    }
+    fn stage(
+        &self,
+        _: Entity<BufferDiff>,
+        _: Option<Entity<Buffer>>,
+        _: Vec<Range<text::Anchor>>,
+        _: &mut App,
+    ) {
+        panic!("read-only stage operation was invoked");
+    }
+    fn unstage(
+        &self,
+        _: Entity<BufferDiff>,
+        _: Option<Entity<Buffer>>,
+        _: Vec<Range<text::Anchor>>,
+        _: &mut App,
+    ) {
+        panic!("read-only unstage operation was invoked");
+    }
+}
+
+#[gpui::test]
+async fn test_read_only_source_control_gutter_is_painted_in_normal_editor(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let fs = FakeFs::new(cx.executor());
+    let saved = "line one\nworking tree edit\nline three\n";
+    let baseline = "line one\nbaseline working line\nline three\n";
+    fs.insert_tree(path!("/external"), json!({"file.txt": saved}))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/external").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/external/file.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let diff = cx.new(|cx| {
+        let mut diff = BufferDiff::new(&buffer.read(cx).text_snapshot(), None, None, cx);
+        diff.set_operations(Arc::new(ReadOnlySourceControlTestOperations));
+        diff
+    });
+    let current = buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+    diff.update(cx, |diff, cx| {
+        diff.set_base_text(Some(baseline.into()), current, cx)
+    })
+    .await;
+    let multi_buffer = cx.new(|cx| {
+        let mut multi_buffer = MultiBuffer::singleton(buffer.clone(), cx);
+        multi_buffer.add_diff(diff.clone(), cx);
+        multi_buffer
+    });
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), multi_buffer, window, cx)
+    });
+    cx.run_until_parked();
+    let assert_painted_gutter = |expected_rows: Range<DisplayRow>, cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear(cx);
+            let editor = editor.read(cx);
+            assert!(editor.buffer.read(cx).is_singleton());
+            assert!(!editor.buffer.read(cx).all_diff_hunks_expanded());
+            let position_map = editor
+                .last_position_map
+                .as_ref()
+                .expect("painted normal editor");
+            let [
+                (
+                    DisplayDiffHunk::Unfolded {
+                        display_row_range,
+                        status,
+                        ..
+                    },
+                    Some(hitbox),
+                ),
+            ] = position_map.display_hunks.as_slice()
+            else {
+                panic!("expected one rendered gutter hunk with a hitbox");
+            };
+            assert_eq!(display_row_range, &expected_rows);
+            assert_eq!(status.kind, DiffHunkStatusKind::Modified);
+            assert!(hitbox.size.width > px(0.) && hitbox.size.height > px(0.));
+            assert_eq!(
+                hitbox.bounds.intersect(&position_map.gutter_hitbox.bounds),
+                hitbox.bounds
+            );
+            let bounds = hitbox.bounds.scale(window.scale_factor());
+            let color = cx
+                .theme()
+                .colors()
+                .editor_background
+                .blend(cx.theme().colors().version_control_modified);
+            assert!(
+                window.painted_quads().iter().any(|quad| {
+                    quad.bounds.intersect(&quad.content_mask.bounds) == bounds
+                        && (quad.background == color.into() || quad.border_color == color)
+                }),
+                "native scene must contain the visible gutter marker"
+            );
+        });
+    };
+    assert_painted_gutter(DisplayRow(1)..DisplayRow(2), cx);
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit(
+            [(
+                "line one\n".len().."line one\nworking tree edit\n".len(),
+                "unsaved first\nunsaved second\n",
+            )],
+            None,
+            cx,
+        );
+    });
+    let current = buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+    diff.update(cx, |diff, cx| {
+        diff.set_base_text(Some(baseline.into()), current, cx)
+    })
+    .await;
+    cx.run_until_parked();
+    assert_painted_gutter(DisplayRow(1)..DisplayRow(3), cx);
+    assert!(buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+    assert_eq!(
+        fs.load(path!("/external/file.txt").as_ref()).await.unwrap(),
+        saved
+    );
+    assert!(
+        fs.metadata(path!("/external/.git").as_ref())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[gpui::test]
+async fn test_read_only_source_control_staging_actions_do_not_save(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/external"), json!({"file.txt": "on disk\n"}))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/external").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/external/file.txt"), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..8, "unsaved\n")], None, cx);
+    });
+    let diff = cx.new(|cx| {
+        let snapshot = buffer.read(cx).snapshot();
+        let mut diff = BufferDiff::new(&snapshot.text, None, None, cx);
+        diff.set_operations(Arc::new(ReadOnlySourceControlTestOperations));
+        diff
+    });
+    let snapshot = buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+    diff.update(cx, |diff, cx| {
+        diff.set_base_text(Some("baseline\n".into()), snapshot, cx)
+    })
+    .await;
+    let multi_buffer = cx.new(|cx| {
+        let mut multi_buffer = MultiBuffer::singleton(buffer.clone(), cx);
+        multi_buffer.add_diff(diff, cx);
+        multi_buffer
+    });
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), multi_buffer, window, cx)
+    });
+    cx.run_until_parked();
+    macro_rules! try_action {
+        ($action:expr) => {{
+            editor.update_in(cx, |editor, window, cx| {
+                editor.focus_handle(cx).focus(window, cx);
+                editor.select_all(&SelectAll, window, cx);
+            });
+            cx.dispatch_action($action);
+            cx.run_until_parked();
+            assert_eq!(
+                fs.load(path!("/external/file.txt").as_ref()).await.unwrap(),
+                "on disk\n"
+            );
+            assert!(buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+            assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), "unsaved\n");
+        }};
+    }
+    try_action!(::git::ToggleStaged);
+    try_action!(::git::StageAndNext);
+    try_action!(::git::UnstageAndNext);
+}
+
+#[gpui::test]
+async fn test_mixed_source_control_selection_only_saves_and_stages_git(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/git"), json!({".git": {}, "file.txt": "git disk\n"}))
+        .await;
+    fs.insert_tree(path!("/external"), json!({"file.txt": "external disk\n"}))
+        .await;
+    fs.set_head_and_index_for_repo(
+        path!("/git/.git").as_ref(),
+        &[("file.txt", "git baseline\n".into())],
+    );
+    let project = Project::test(
+        fs.clone(),
+        [path!("/git").as_ref(), path!("/external").as_ref()],
+        cx,
+    )
+    .await;
+    project
+        .update(cx, |project, cx| project.git_scans_complete(cx))
+        .await;
+    let git_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/git/file.txt"), cx)
+        })
+        .await
+        .unwrap();
+    let external_buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/external/file.txt"), cx)
+        })
+        .await
+        .unwrap();
+    git_buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..9, "git unsaved\n")], None, cx);
+    });
+    external_buffer.update(cx, |buffer, cx| {
+        buffer.edit([(0..14, "external unsaved\n")], None, cx);
+    });
+    let git_diff = project
+        .update(cx, |project, cx| {
+            project.open_uncommitted_diff(git_buffer.clone(), cx)
+        })
+        .await
+        .unwrap();
+    let external_diff = cx.new(|cx| {
+        let snapshot = external_buffer.read(cx).snapshot();
+        let mut diff = BufferDiff::new(&snapshot.text, None, None, cx);
+        diff.set_operations(Arc::new(ReadOnlySourceControlTestOperations));
+        diff
+    });
+    let snapshot = external_buffer.read_with(cx, |buffer, _| buffer.text_snapshot());
+    external_diff
+        .update(cx, |diff, cx| {
+            diff.set_base_text(Some("external baseline\n".into()), snapshot, cx)
+        })
+        .await;
+    let multi_buffer = cx.new(|cx| {
+        let mut multi_buffer = MultiBuffer::new(ReadWrite);
+        for (index, buffer) in [&git_buffer, &external_buffer].into_iter().enumerate() {
+            let snapshot = buffer.read(cx).snapshot();
+            multi_buffer.set_excerpts_for_path(
+                PathKey::with_sort_prefix(
+                    index as u64,
+                    buffer.read(cx).file().unwrap().path().clone(),
+                ),
+                buffer.clone(),
+                vec![Point::zero()..snapshot.max_point()],
+                2,
+                cx,
+            );
+        }
+        multi_buffer.add_diff(git_diff, cx);
+        multi_buffer.add_diff(external_diff, cx);
+        multi_buffer
+    });
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), multi_buffer, window, cx)
+    });
+    cx.run_until_parked();
+    editor.update_in(cx, |editor, window, cx| {
+        editor.focus_handle(cx).focus(window, cx);
+        editor.select_all(&SelectAll, window, cx);
+    });
+    cx.dispatch_action(::git::StageAndNext);
+    cx.run_until_parked();
+    assert_eq!(
+        fs.load(path!("/external/file.txt").as_ref()).await.unwrap(),
+        "external disk\n"
+    );
+    assert!(external_buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
+    assert_eq!(
+        fs.load(path!("/git/file.txt").as_ref()).await.unwrap(),
+        "git unsaved\n"
+    );
+    let index = fs
+        .with_git_state(path!("/git/.git").as_ref(), false, |state| {
+            state.index_contents.clone()
+        })
+        .unwrap();
+    assert_eq!(
+        index.get(&::git::repository::repo_path("file.txt")),
+        Some(&b"git unsaved\n".to_vec())
+    );
+}
+
 #[gpui::test]
 async fn test_merge_base_diff_hunks_are_read_only(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
@@ -40378,7 +40684,7 @@ async fn test_hide_pending_blame_popover_when_modal_opens(cx: &mut TestAppContex
         );
         editor.show_blame_popover(
             buffer_id,
-            &::git::blame::BlameEntry {
+            &crate::DisplayBlameEntry::Git(::git::blame::BlameEntry {
                 sha: "1b1b1b".parse().unwrap(),
                 range: 0..1,
                 original_line_number: 0,
@@ -40394,7 +40700,7 @@ async fn test_hide_pending_blame_popover_when_modal_opens(cx: &mut TestAppContex
                 previous: None,
                 filename: String::new(),
                 boundary: false,
-            },
+            }),
             gpui::point(gpui::px(0.), gpui::px(0.)),
             false,
             cx,

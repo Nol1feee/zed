@@ -631,6 +631,11 @@ impl std::fmt::Debug for ContextServerCommand {
 #[with_fallible_options]
 #[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom)]
 pub struct GitSettings {
+    /// Literal marker names inside a repository's Git directory that exclude it
+    /// from Git integration. Linked worktrees use their own Git directory.
+    ///
+    /// Default: []
+    pub excluded_repository_markers: Option<Vec<String>>,
     /// Whether or not to enable git integration.
     ///
     /// Default: true

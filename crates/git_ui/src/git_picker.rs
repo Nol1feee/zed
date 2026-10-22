@@ -509,6 +509,35 @@ fn open_with_tab(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    if crate::external_vcs_selected(workspace, cx) {
+        let selected = workspace
+            .panel::<crate::git_panel::GitPanel>(cx)
+            .and_then(|panel| {
+                let repository = panel.read(cx).selected_vcs_repository(cx)?;
+                Some((panel.downgrade(), repository))
+            });
+        if tab == GitPickerTab::Branches
+            && let Some((git_panel, repository)) = selected
+        {
+            window.defer(cx, move |window, cx| {
+                let Some(git_panel) = git_panel.upgrade() else {
+                    return;
+                };
+                let panel = git_panel.read(cx);
+                if panel.selected_vcs_repository(cx).as_ref() != Some(&repository) {
+                    return;
+                }
+                let vcs_panel = panel.vcs_panel();
+                vcs_panel.update(cx, |panel, cx| {
+                    panel.switch_branch(&crate::vcs_panel::SwitchBranch, window, cx);
+                });
+            });
+        } else {
+            crate::reject_external_vcs_action(workspace, cx);
+        }
+        return;
+    }
+
     let workspace_handle = workspace.weak_handle();
     let repository = workspace.project().read(cx).active_repository(cx);
 

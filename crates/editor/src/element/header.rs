@@ -625,6 +625,81 @@ pub(crate) fn header_jump_data(
     }
 }
 
+fn buffer_header_path(
+    buffer: &language::BufferSnapshot,
+    multibuffer: &multi_buffer::MultiBufferSnapshot,
+    include_root: bool,
+    cx: &App,
+) -> (Option<util::paths::PathStyle>, Option<String>) {
+    if let Some(file) = buffer.file() {
+        return (
+            Some(file.path_style(cx)),
+            buffer.resolve_file_path(include_root, cx),
+        );
+    }
+    // Deleted diff buffers have no backing File; their explicit excerpt path is display-only.
+    let path = multibuffer
+        .path_for_buffer(buffer.remote_id())
+        .filter(|key| key.sort_prefix.is_some() && !key.path.is_empty())
+        .map(|key| key.path.as_unix_str().to_owned());
+    (path.as_ref().map(|_| util::paths::PathStyle::Unix), path)
+}
+
+#[cfg(test)]
+#[gpui::test]
+fn deleted_diff_header_uses_explicit_path_without_backing_file(cx: &mut App) {
+    use gpui::AppContext as _;
+    use language::{Buffer, Capability, Point};
+    use multi_buffer::PathKey;
+    use util::{paths::PathStyle, rel_path::RelPath};
+
+    let buffer = cx.new(|cx| {
+        let mut buffer = Buffer::local("", cx);
+        buffer.set_capability(Capability::ReadOnly, cx);
+        buffer
+    });
+    let multibuffer = cx.new(|cx| {
+        let mut multibuffer = MultiBuffer::new(Capability::ReadOnly);
+        multibuffer.set_excerpts_for_path(
+            PathKey::with_sort_prefix(
+                0,
+                RelPath::from_unix_str("nested/deleted.txt")
+                    .unwrap()
+                    .into_arc(),
+            ),
+            buffer.clone(),
+            [Point::zero()..Point::zero()],
+            0,
+            cx,
+        );
+        multibuffer
+    });
+    let snapshot = multibuffer.read(cx).snapshot(cx);
+    let buffer_snapshot = buffer.read(cx).snapshot();
+    assert_eq!(
+        buffer_header_path(&buffer_snapshot, &snapshot, false, cx),
+        (Some(PathStyle::Unix), Some("nested/deleted.txt".into()))
+    );
+    assert!(buffer.read(cx).file().is_none());
+    assert_eq!(buffer.read(cx).capability(), Capability::ReadOnly);
+
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_excerpts_for_path(
+            PathKey::for_buffer(&buffer, cx),
+            buffer.clone(),
+            [Point::zero()..Point::zero()],
+            0,
+            cx,
+        );
+    });
+    let snapshot = multibuffer.read(cx).snapshot(cx);
+    assert_eq!(
+        buffer_header_path(&buffer_snapshot, &snapshot, false, cx),
+        (None, None),
+        "ordinary untitled buffers must not display their numeric buffer id"
+    );
+}
+
 pub(crate) fn render_buffer_header(
     editor: &Entity<Editor>,
     for_excerpt: &ExcerptBoundaryInfo,
@@ -681,9 +756,9 @@ pub(crate) fn render_buffer_header(
         .map(|project| project.read(cx).visible_worktrees(cx).count() > 1)
         .unwrap_or_default();
     let file = buffer.file();
-    let can_open_excerpts = file.is_none_or(|file| file.can_open());
-    let path_style = file.map(|file| file.path_style(cx));
-    let relative_path = buffer.resolve_file_path(include_root, cx);
+    let (path_style, relative_path) =
+        buffer_header_path(buffer, &multibuffer_snapshot, include_root, cx);
+    let can_open_excerpts = file.map_or(relative_path.is_none(), |file| file.can_open());
     let (parent_path, filename) = match (&relative_path, path_style) {
         (Some(path), Some(path_style)) => {
             match path_style

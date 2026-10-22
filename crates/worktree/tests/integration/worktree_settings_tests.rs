@@ -9,6 +9,7 @@ use worktree::*;
 
 fn make_settings_with_read_only(patterns: &[&str]) -> WorktreeSettings {
     WorktreeSettings {
+        git_repository_exclusion_markers: Vec::new(),
         prevent_sharing_in_public_channels: false,
         file_scan_exclusions: PathMatcher::default(),
         file_scan_inclusions: PathMatcher::default(),
@@ -23,6 +24,33 @@ fn make_settings_with_read_only(patterns: &[&str]) -> WorktreeSettings {
         scan_symlinks: Default::default(),
         file_scan_depth: None,
     }
+}
+
+#[test]
+fn git_repository_exclusion_markers_are_literal_basenames() {
+    zlog::init_test();
+    let mut content = SettingsContent::parse_json_with_comments(&settings::default_settings())
+        .expect("default settings");
+    assert!(
+        WorktreeSettings::from_settings(&content)
+            .git_repository_exclusion_markers
+            .is_empty()
+    );
+    content.git.as_mut().unwrap().excluded_repository_markers = Some(vec![
+        ".compatibility-vcs".into(),
+        "".into(),
+        ".".into(),
+        "..".into(),
+        "../outside".into(),
+        "nested/marker".into(),
+        "nested\\marker".into(),
+        "C:marker".into(),
+        "marker\n".into(),
+    ]);
+    assert_eq!(
+        WorktreeSettings::from_settings(&content).git_repository_exclusion_markers,
+        [".compatibility-vcs"]
+    );
 }
 
 fn settings_with_patterns(setting: &str, patterns: &[&str]) -> WorktreeSettings {

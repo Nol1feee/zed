@@ -1,10 +1,7 @@
 pub(super) mod blame;
 
 use super::*;
-use ::git::{
-    Oid, Restore, blame::BlameEntry, commit::ParsedCommitMessage, repository::RepoPath,
-    status::FileStatus,
-};
+use ::git::{Oid, Restore, commit::ParsedCommitMessage, repository::RepoPath, status::FileStatus};
 use buffer_diff::{BufferDiff, DiffHunkStatus, DiffHunkStatusKind};
 use project::git_store::Repository;
 
@@ -377,7 +374,7 @@ impl Editor {
         self.blame.as_ref()
     }
 
-    pub fn active_git_blame_entry(&self, cx: &mut App) -> Option<BlameEntry> {
+    pub fn active_git_blame_entry(&self, cx: &mut App) -> Option<DisplayBlameEntry> {
         if !self.show_git_blame_inline
             || self.newest_selection_head_on_empty_line(cx)
             || !self.has_blame_entries(cx)
@@ -1598,7 +1595,7 @@ impl Editor {
             .iter()
             .map(|s| s.range())
             .collect();
-        let task = self.save_buffers_for_ranges_if_needed(&ranges, cx);
+        let task = self.save_buffers_for_ranges_if_needed(&ranges, None, cx);
         cx.spawn_in(window, async move |this, cx| {
             task.await?;
             this.update_in(cx, |this, window, cx| {
@@ -1658,6 +1655,9 @@ impl Editor {
             let Some(operations) = hunks.diff.read(cx).operations() else {
                 continue;
             };
+            if !operations.supports_staging() && !operations.supports_unstaging() {
+                continue;
+            }
             let stage = if !operations.supports_unstaging() {
                 true
             } else if !operations.supports_staging() {
@@ -1988,7 +1988,7 @@ impl Editor {
     pub(super) fn show_blame_popover(
         &mut self,
         buffer: BufferId,
-        blame_entry: &BlameEntry,
+        blame_entry: &DisplayBlameEntry,
         position: gpui::Point<Pixels>,
         ignore_timeout: bool,
         cx: &mut Context<Self>,
@@ -2012,17 +2012,19 @@ impl Editor {
                         };
                         let blame = blame.read(cx);
                         let details = blame.details_for_entry(buffer, &blame_entry);
-                        let markdown = cx.new(|cx| {
-                            Markdown::new(
-                                details
-                                    .as_ref()
-                                    .map(|message| message.message.clone())
-                                    .unwrap_or_default(),
-                                None,
-                                None,
-                                cx,
-                            )
-                        });
+                        let message = match &blame_entry {
+                            DisplayBlameEntry::Git(_) => details
+                                .as_ref()
+                                .map(|message| message.message.clone())
+                                .unwrap_or_default(),
+                            DisplayBlameEntry::Provider(commit) => commit
+                                .message
+                                .clone()
+                                .or_else(|| commit.summary.clone())
+                                .unwrap_or_default()
+                                .into(),
+                        };
+                        let markdown = cx.new(|cx| Markdown::new(message, None, None, cx));
                         editor.inline_blame_popover = Some(InlineBlamePopover {
                             position,
                             hide_task: None,
@@ -2090,7 +2092,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let task = self.save_buffers_for_ranges_if_needed(&ranges, cx);
+        let task = self.save_buffers_for_ranges_if_needed(&ranges, Some(stage), cx);
         cx.spawn_in(window, async move |this, cx| {
             task.await?;
             this.update_in(cx, |this, window, cx| {
@@ -2182,6 +2184,7 @@ impl Editor {
     fn save_buffers_for_ranges_if_needed(
         &mut self,
         ranges: &[Range<Anchor>],
+        stage: Option<bool>,
         cx: &mut Context<Editor>,
     ) -> Task<Result<()>> {
         let multibuffer = self.buffer.read(cx);
@@ -2194,6 +2197,18 @@ impl Editor {
 
         let mut buffers = HashSet::default();
         for buffer_id in buffer_ids {
+            let can_stage = multibuffer.diff_for(buffer_id).is_some_and(|diff| {
+                diff.read(cx)
+                    .operations()
+                    .is_some_and(|operations| match stage {
+                        Some(true) => operations.supports_staging(),
+                        Some(false) => operations.supports_unstaging(),
+                        None => operations.supports_staging() || operations.supports_unstaging(),
+                    })
+            });
+            if !can_stage {
+                continue;
+            }
             if let Some(buffer_entity) = multibuffer.buffer(buffer_id) {
                 let buffer = buffer_entity.read(cx);
                 if buffer.file().is_some_and(|file| file.disk_state().exists()) && buffer.is_dirty()
@@ -2249,6 +2264,16 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Option<()> {
         let (blame_entry, repo) = self.blame_entry_at_cursor(window, cx)?;
+        if let DisplayBlameEntry::Provider(commit) = &blame_entry {
+            if let Some(url) = &commit.commit_url {
+                cx.open_url(url);
+            }
+            return None;
+        }
+        let DisplayBlameEntry::Git(blame_entry) = blame_entry else {
+            return None;
+        };
+        let repo = repo?;
         let renderer = cx.global::<GlobalBlameRenderer>().0.clone();
         let workspace = self.workspace()?.downgrade();
         renderer.open_blame_commit(blame_entry, repo, workspace, window, cx);
@@ -2259,7 +2284,7 @@ impl Editor {
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<(BlameEntry, Entity<Repository>)> {
+    ) -> Option<(DisplayBlameEntry, Option<Entity<Repository>>)> {
         let blame = self.blame.clone()?;
         let snapshot = self.snapshot(window, cx);
         let cursor = self
@@ -2281,7 +2306,7 @@ impl Editor {
                     .next()
             })
             .flatten()?;
-        let repository = blame.read(cx).repository(cx, buffer.remote_id())?;
+        let repository = blame.read(cx).repository(cx, buffer.remote_id());
         Some((blame_entry, repository))
     }
 
@@ -2291,6 +2316,10 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Option<(RepoPath, Oid, Entity<Repository>)> {
         let (blame_entry, repository) = self.blame_entry_at_cursor(window, cx)?;
+        let DisplayBlameEntry::Git(blame_entry) = blame_entry else {
+            return None;
+        };
+        let repository = repository?;
         let highlighted_sha = self
             .blame
             .as_ref()
@@ -2305,6 +2334,10 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Option<(RepoPath, Oid, Entity<Repository>)> {
         let (blame_entry, repository) = self.blame_entry_at_cursor(window, cx)?;
+        let DisplayBlameEntry::Git(blame_entry) = blame_entry else {
+            return None;
+        };
+        let repository = repository?;
         let (revision, path) = blame_entry.previous_revision_target()?;
         Some((path, revision, repository))
     }
@@ -3242,14 +3275,11 @@ impl Editor {
     ) -> Task<()> {
         let mut tasks = Vec::new();
         project.update(cx, |project, cx| {
-            let git_store = project.git_store().clone();
-            git_store.update(cx, |git_store, cx| {
-                for buffer in buffers {
-                    if project::File::from_dyn(buffer.read(cx).file()).is_some() {
-                        tasks.push(git_store.open_display_diff(buffer, cx));
-                    }
+            for buffer in buffers {
+                if project::File::from_dyn(buffer.read(cx).file()).is_some() {
+                    tasks.push(project.open_source_control_diff(buffer, cx));
                 }
-            });
+            }
         });
 
         let editor = cx.entity();

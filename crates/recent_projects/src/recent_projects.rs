@@ -123,9 +123,10 @@ pub async fn get_recent_projects(
     limit: Option<usize>,
     fs: Arc<dyn fs::Fs>,
     db: &WorkspaceDb,
+    excluded_markers: &[String],
 ) -> Vec<RecentProjectEntry> {
     let workspaces = db
-        .recent_project_workspaces(fs.as_ref())
+        .recent_project_workspaces(fs.as_ref(), excluded_markers)
         .await
         .unwrap_or_default();
 
@@ -664,10 +665,13 @@ impl RecentProjects {
         // We do not want to block the UI on a potentially lengthy call to DB, so we're gonna swap
         // out workspace locations once the future runs to completion.
         let db = WorkspaceDb::global(cx);
+        let excluded_markers = project::WorktreeSettings::get_global(cx)
+            .git_repository_exclusion_markers
+            .clone();
         cx.spawn_in(window, async move |this, cx| {
             let Some(fs) = fs else { return };
             let workspaces = db
-                .recent_project_workspaces(fs.as_ref())
+                .recent_project_workspaces(fs.as_ref(), &excluded_markers)
                 .await
                 .log_err()
                 .unwrap_or_default();
@@ -2338,15 +2342,22 @@ impl RecentProjectsDelegate {
                 .upgrade()
                 .map(|ws| ws.read(cx).app_state().fs.clone());
             let db = WorkspaceDb::global(cx);
+            let excluded_markers = project::WorktreeSettings::get_global(cx)
+                .git_repository_exclusion_markers
+                .clone();
             cx.spawn_in(window, async move |this, cx| {
                 let Some(fs) = fs else { return };
                 let deleted_workspace_ids = db
-                    .delete_recent_workspace_group(&recent_workspace)
+                    .delete_recent_workspace_group(
+                        &recent_workspace,
+                        fs.as_ref(),
+                        &excluded_markers,
+                    )
                     .await
                     .log_err()
                     .unwrap_or_default();
                 let workspaces = db
-                    .recent_project_workspaces(fs.as_ref())
+                    .recent_project_workspaces(fs.as_ref(), &excluded_markers)
                     .await
                     .unwrap_or_default();
                 this.update_in(cx, move |picker, window, cx| {

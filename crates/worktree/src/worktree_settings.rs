@@ -8,6 +8,7 @@ use util::{
 
 #[derive(Clone, PartialEq, Eq, RegisterSetting)]
 pub struct WorktreeSettings {
+    pub git_repository_exclusion_markers: Vec<String>,
     /// Whether to prevent this project from being shared in public channels.
     pub prevent_sharing_in_public_channels: bool,
     pub file_scan_exclusions: PathMatcher,
@@ -68,6 +69,25 @@ impl Settings for WorktreeSettings {
             file_scan_inclusion_matchers(file_scan_inclusions);
 
         Self {
+            git_repository_exclusion_markers: content
+                .git
+                .as_ref()
+                .and_then(|git| git.excluded_repository_markers.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|marker| {
+                    let valid = !marker.is_empty()
+                        && !matches!(marker.as_str(), "." | "..")
+                        && !marker.contains(['/', '\\', ':'])
+                        && !marker.chars().any(char::is_control);
+                    if !valid {
+                        log::error!(
+                            "git.excluded_repository_markers requires literal basenames: {marker:?}"
+                        );
+                    }
+                    valid
+                })
+                .collect(),
             prevent_sharing_in_public_channels: worktree.prevent_sharing_in_public_channels,
             file_scan_exclusions: valid_path_matchers(file_scan_exclusions, "file_scan_exclusions"),
             parent_dir_scan_inclusions,

@@ -260,10 +260,13 @@ impl WelcomePage {
                 .upgrade()
                 .map(|ws| ws.read(cx).app_state().fs.clone());
             let db = WorkspaceDb::global(cx);
+            let excluded_markers = project::WorktreeSettings::get_global(cx)
+                .git_repository_exclusion_markers
+                .clone();
             cx.spawn_in(window, async move |this: WeakEntity<Self>, cx| {
                 let Some(fs) = fs else { return };
                 let workspaces = db
-                    .recent_project_workspaces(fs.as_ref())
+                    .recent_project_workspaces(fs.as_ref(), &excluded_markers)
                     .await
                     .log_err()
                     .unwrap_or_default();

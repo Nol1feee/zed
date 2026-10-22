@@ -12,6 +12,7 @@ use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, Hsla, Pixels, ScrollHandle, SharedString,
     Subscription, Task, TextStyle, WeakEntity, Window,
 };
+use imara_diff::{Algorithm, Diff, InternedInput, sources::lines};
 use itertools::Itertools;
 use language::{Bias, Buffer, BufferSnapshot, Edit};
 use markdown::Markdown;
@@ -19,6 +20,7 @@ use multi_buffer::{MultiBuffer, RowInfo};
 use project::{
     Project, ProjectItem as _,
     git_store::{GitStoreEvent, Repository},
+    vcs_store::VcsStoreEvent,
 };
 use smallvec::SmallVec;
 use std::{sync::Arc, time::Duration};
@@ -26,10 +28,32 @@ use sum_tree::SumTree;
 use text::BufferId;
 use workspace::Workspace;
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum DisplayBlameEntry {
+    Git(BlameEntry),
+    Provider(Arc<vcs::BlameCommit>),
+}
+
+impl DisplayBlameEntry {
+    pub fn author(&self) -> Option<&str> {
+        match self {
+            Self::Git(entry) => entry.author.as_deref(),
+            Self::Provider(commit) => commit.author.as_deref(),
+        }
+    }
+
+    pub fn revision_id(&self) -> String {
+        match self {
+            Self::Git(entry) => entry.sha.to_string(),
+            Self::Provider(commit) => commit.revision_id.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct GitBlameEntry {
     pub rows: u32,
-    pub blame: Option<BlameEntry>,
+    pub blame: Option<DisplayBlameEntry>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -73,6 +97,11 @@ struct GitBlameBuffer {
     commit_tag_names: HashMap<Oid, Vec<SharedString>>,
 }
 
+enum GeneratedBlame {
+    Git(Blame),
+    Provider(Arc<vcs::Blame>),
+}
+
 /// Determines where the blame data comes from and whether it is kept up to date.
 enum GitBlameKind {
     /// Blame of the working copy of every buffer in the multibuffer, computed
@@ -104,6 +133,7 @@ pub struct GitBlame {
     regenerate_on_edit_task: Task<Result<()>>,
     _regenerate_subscriptions: Vec<Subscription>,
     kind: GitBlameKind,
+    generation: u64,
 }
 
 pub trait BlameRenderer {
@@ -166,6 +196,39 @@ pub trait BlameRenderer {
         _: &mut Window,
         _: &mut App,
     ) {
+    }
+
+    fn render_provider_blame_entry(
+        &self,
+        _: &TextStyle,
+        _: Arc<vcs::BlameCommit>,
+        _: Entity<Editor>,
+        _: usize,
+        _: Hsla,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Option<AnyElement> {
+        None
+    }
+
+    fn render_provider_inline_blame_entry(
+        &self,
+        _: &TextStyle,
+        _: Arc<vcs::BlameCommit>,
+        _: &mut App,
+    ) -> Option<AnyElement> {
+        None
+    }
+
+    fn render_provider_blame_entry_popover(
+        &self,
+        _: Arc<vcs::BlameCommit>,
+        _: ScrollHandle,
+        _: Entity<Markdown>,
+        _: &mut Window,
+        _: &mut App,
+    ) -> Option<AnyElement> {
+        None
     }
 }
 
@@ -287,6 +350,34 @@ impl GitBlame {
                 _ => {}
             });
 
+        let mut subscriptions = vec![
+            multi_buffer_subscription,
+            project_subscription,
+            git_store_subscription,
+        ];
+        if let Some(vcs_store) = project.read(cx).vcs_store().cloned() {
+            subscriptions.push(cx.subscribe(&vcs_store, |this, _, event, cx| {
+                if let VcsStoreEvent::BlameChanged { worktree_id } = event {
+                    let affected = this.multi_buffer.upgrade().is_some_and(|multi_buffer| {
+                        multi_buffer.read(cx).all_buffers().iter().any(|buffer| {
+                            buffer
+                                .read(cx)
+                                .project_path(cx)
+                                .is_some_and(|path| path.worktree_id == *worktree_id)
+                        })
+                    });
+                    if affected {
+                        // Invalidate displayed data immediately, including while blurred.
+                        this.buffers.clear();
+                        this.generation += 1;
+                        this.task = Task::ready(Ok(()));
+                        this.generate(cx);
+                        cx.notify();
+                    }
+                }
+            }));
+        }
+
         let mut this = Self {
             project,
             multi_buffer: multi_buffer.downgrade(),
@@ -296,12 +387,9 @@ impl GitBlame {
             changed_while_blurred: false,
             task: Task::ready(Ok(())),
             regenerate_on_edit_task: Task::ready(Ok(())),
-            _regenerate_subscriptions: vec![
-                multi_buffer_subscription,
-                project_subscription,
-                git_store_subscription,
-            ],
+            _regenerate_subscriptions: subscriptions,
             kind: GitBlameKind::Live,
+            generation: 0,
         };
         this.generate(cx);
         this
@@ -355,6 +443,7 @@ impl GitBlame {
                 repository,
                 highlighted_sha,
             },
+            generation: 0,
         }
     }
 
@@ -390,8 +479,11 @@ impl GitBlame {
     pub fn details_for_entry(
         &self,
         buffer: BufferId,
-        entry: &BlameEntry,
+        entry: &DisplayBlameEntry,
     ) -> Option<ParsedCommitMessage> {
+        let DisplayBlameEntry::Git(entry) = entry else {
+            return None;
+        };
         self.buffers
             .get(&buffer)?
             .commit_details
@@ -399,7 +491,14 @@ impl GitBlame {
             .cloned()
     }
 
-    pub fn tag_names_for_entry(&self, buffer: BufferId, entry: &BlameEntry) -> Vec<SharedString> {
+    pub fn tag_names_for_entry(
+        &self,
+        buffer: BufferId,
+        entry: &DisplayBlameEntry,
+    ) -> Vec<SharedString> {
+        let DisplayBlameEntry::Git(entry) = entry else {
+            return Vec::new();
+        };
         self.buffers
             .get(&buffer)
             .and_then(|buffer| buffer.commit_tag_names.get(&entry.sha))
@@ -411,7 +510,7 @@ impl GitBlame {
         &'a mut self,
         rows: &'a [RowInfo],
         cx: &'a mut App,
-    ) -> impl Iterator<Item = Option<(BufferId, BlameEntry)>> + use<'a> {
+    ) -> impl Iterator<Item = Option<(BufferId, DisplayBlameEntry)>> + use<'a> {
         rows.iter().map(move |info| {
             let buffer_id = info.buffer_id?;
             self.sync(cx, buffer_id);
@@ -432,7 +531,7 @@ impl GitBlame {
                 let author_len = entry
                     .blame
                     .as_ref()
-                    .and_then(|entry| entry.author.as_ref())
+                    .and_then(|entry| entry.author())
                     .map(|author| author.len());
                 if let Some(author_len) = author_len
                     && author_len > max_author_length
@@ -626,6 +725,8 @@ impl GitBlame {
             })
             .unwrap_or_default();
         let project = self.project.downgrade();
+        self.generation += 1;
+        let generation = self.generation;
 
         self.task = cx.spawn(async move |this, cx| {
             let mut all_results = Vec::new();
@@ -654,16 +755,28 @@ impl GitBlame {
                                 .as_ref()
                                 .and_then(|(repo, _)| repo.read(cx).default_remote_url());
 
-                            let blame_buffer = if repository.is_some() {
+                            let blame_buffer = repository.as_ref().map(|_| {
                                 project.update(cx, |project, cx| {
                                     project.blame_buffer(&buffer, None, cx)
                                 })
+                            });
+                            let provider_blame = if repository.is_none() {
+                                Some(project.update(cx, |project, cx| {
+                                    project.blame_provider_buffer(&buffer, cx)
+                                }))
                             } else {
-                                Task::ready(Ok(None))
+                                None
                             };
 
                             Ok(async move {
-                                (id, snapshot, buffer_edits, blame_buffer.await, remote_url)
+                                let blame = if let Some(blame) = blame_buffer {
+                                    blame.await.map(|blame| blame.map(GeneratedBlame::Git))
+                                } else if let Some(blame) = provider_blame {
+                                    blame.await.map(|blame| blame.map(GeneratedBlame::Provider))
+                                } else {
+                                    Ok(None)
+                                };
+                                (id, snapshot, buffer_edits, blame, remote_url)
                             })
                         })
                         .collect::<Result<Vec<_>>>()
@@ -678,11 +791,11 @@ impl GitBlame {
                             let mut errors = vec![];
                             for (id, snapshot, buffer_edits, blame, remote_url) in blame {
                                 match blame {
-                                    Ok(Some(Blame {
+                                    Ok(Some(GeneratedBlame::Git(Blame {
                                         entries,
                                         messages,
                                         tag_names,
-                                    })) => {
+                                    }))) => {
                                         let entries = build_blame_entry_sum_tree(
                                             entries,
                                             snapshot.max_point().row,
@@ -701,6 +814,21 @@ impl GitBlame {
                                             Some(entries),
                                             commit_details,
                                             commit_tag_names,
+                                        ));
+                                    }
+                                    Ok(Some(GeneratedBlame::Provider(blame))) => {
+                                        let entries = build_provider_blame_entry_sum_tree(
+                                            &blame,
+                                            &snapshot.text(),
+                                            snapshot.max_point().row,
+                                        );
+                                        res.push((
+                                            id,
+                                            snapshot,
+                                            buffer_edits,
+                                            Some(entries),
+                                            Default::default(),
+                                            Default::default(),
                                         ));
                                     }
                                     Ok(None) => res.push((
@@ -723,6 +851,9 @@ impl GitBlame {
             }
 
             this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
                 this.buffers.clear();
                 for (id, snapshot, buffer_edits, entries, commit_details, commit_tag_names) in
                     all_results
@@ -821,24 +952,118 @@ fn parse_commit_details(
 }
 
 fn build_blame_entry_sum_tree(entries: Vec<BlameEntry>, max_row: u32) -> SumTree<GitBlameEntry> {
+    build_display_blame_entry_sum_tree(
+        entries
+            .into_iter()
+            .map(|entry| (entry.range.clone(), DisplayBlameEntry::Git(entry))),
+        max_row,
+    )
+}
+
+fn build_provider_blame_entry_sum_tree(
+    blame: &vcs::Blame,
+    content: &str,
+    max_row: u32,
+) -> SumTree<GitBlameEntry> {
+    let commits: HashMap<_, _> = blame
+        .commits
+        .iter()
+        .map(|commit| (commit.revision_id.as_str(), Arc::new(commit.clone())))
+        .collect();
+    let committed_content =
+        text::LineEnding::normalize_cow(std::borrow::Cow::Borrowed(blame.content.as_str()));
+    // A lone CR becomes a new editor row, while provider ranges count LF-delimited rows.
+    let mut normalized_row = 0;
+    let normalized_rows: Vec<_> = std::iter::once(0)
+        .chain(blame.content.split_inclusive('\n').map(|line| {
+            normalized_row += 1 + line.bytes().filter(|byte| *byte == b'\r').count() as u32
+                - u32::from(line.ends_with("\r\n"));
+            normalized_row
+        }))
+        .collect();
+    let normalized_entries: Vec<_> = blame
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            Some((
+                *normalized_rows.get(entry.start_line as usize)?
+                    ..*normalized_rows.get(entry.end_line as usize)?,
+                entry.commit_id.as_str(),
+            ))
+        })
+        .collect();
+    let input = InternedInput::new(lines(committed_content.as_ref()), lines(content));
+    let mut diff = Diff::compute(Algorithm::Histogram, &input);
+    diff.postprocess_lines(&input);
+    let mut entries = Vec::new();
+    let mut old_row = 0;
+    let mut new_row = 0;
+    let mut entry_index = 0;
+    for (old_end, new_end, next_old, next_new) in diff
+        .hunks()
+        .map(|hunk| {
+            (
+                hunk.before.start,
+                hunk.after.start,
+                hunk.before.end,
+                hunk.after.end,
+            )
+        })
+        .chain(std::iter::once((
+            input.before.len() as u32,
+            input.after.len() as u32,
+            0,
+            0,
+        )))
+    {
+        while let Some((range, commit_id)) = normalized_entries.get(entry_index) {
+            if range.start >= old_end {
+                break;
+            }
+            let start = range.start.max(old_row);
+            let end = range.end.min(old_end);
+            if start < end
+                && let Some(commit) = commits.get(commit_id)
+            {
+                entries.push((
+                    new_row + start - old_row..new_row + end - old_row,
+                    DisplayBlameEntry::Provider(commit.clone()),
+                ));
+            }
+            if range.end > old_end {
+                break;
+            }
+            entry_index += 1;
+        }
+        debug_assert_eq!(old_end - old_row, new_end - new_row);
+        old_row = next_old;
+        new_row = next_new;
+    }
+    build_display_blame_entry_sum_tree(entries.into_iter(), max_row)
+}
+
+fn build_display_blame_entry_sum_tree(
+    entries: impl Iterator<Item = (std::ops::Range<u32>, DisplayBlameEntry)>,
+    max_row: u32,
+) -> SumTree<GitBlameEntry> {
     let mut current_row = 0;
     let mut entries = SumTree::from_iter(
-        entries.into_iter().flat_map(|entry| {
+        entries.flat_map(|(range, entry)| {
             let mut entries = SmallVec::<[GitBlameEntry; 2]>::new();
 
-            if entry.range.start > current_row {
-                let skipped_rows = entry.range.start - current_row;
+            if range.start > current_row {
+                let skipped_rows = range.start - current_row;
                 entries.push(GitBlameEntry {
                     rows: skipped_rows,
                     blame: None,
                 });
             }
             entries.push(GitBlameEntry {
-                rows: entry.range.len() as u32,
-                blame: Some(entry.clone()),
+                rows: range.len() as u32,
+                blame: Some(entry),
             });
 
-            current_row = entry.range.end;
+            current_row = range.end;
             entries
         }),
         (),
@@ -906,7 +1131,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
                 .into_iter()
-                .map(|it| Some((buffer_id, it?)))
+                .map(|it| Some((buffer_id, DisplayBlameEntry::Git(it?))))
                 .collect::<Vec<_>>()
         );
     }
@@ -920,6 +1145,196 @@ mod tests {
 
             crate::init(cx);
         });
+    }
+
+    fn provider_blame() -> vcs::Blame {
+        vcs::Blame {
+            revision_id: "revision:head".into(),
+            content: "alpha\r\nbeta\r\ngamma\r\n".into(),
+            entries: vec![
+                vcs::BlameEntry {
+                    start_line: 0,
+                    end_line: 1,
+                    commit_id: "change:first".into(),
+                },
+                vcs::BlameEntry {
+                    start_line: 1,
+                    end_line: 3,
+                    commit_id: "change:second".into(),
+                },
+            ],
+            commits: ["change:first", "change:second"]
+                .into_iter()
+                .map(|revision_id| vcs::BlameCommit {
+                    revision_id: revision_id.into(),
+                    author: Some("Example Author".into()),
+                    author_time: Some(1_700_000_000),
+                    summary: Some("Example change".into()),
+                    message: Some("Example change\n\nDetails".into()),
+                    commit_url: Some(format!("https://example.com/commit/{revision_id}")),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_provider_blame_maps_initial_unsaved_changes() {
+        let mut blame = provider_blame();
+        for (content, expected) in [
+            (
+                "alpha\nbeta\ngamma\n",
+                vec![
+                    Some("change:first"),
+                    Some("change:second"),
+                    Some("change:second"),
+                    None,
+                ],
+            ),
+            (
+                "inserted\nalpha\nmodified\ngamma\n",
+                vec![
+                    None,
+                    Some("change:first"),
+                    None,
+                    Some("change:second"),
+                    None,
+                ],
+            ),
+            ("gamma\n", vec![Some("change:second"), None]),
+            ("", vec![None]),
+        ] {
+            let entries = build_provider_blame_entry_sum_tree(
+                &blame,
+                content,
+                content.bytes().filter(|byte| *byte == b'\n').count() as u32,
+            );
+            let actual: Vec<_> = entries
+                .iter()
+                .flat_map(|entry| {
+                    std::iter::repeat_n(
+                        entry.blame.as_ref().map(DisplayBlameEntry::revision_id),
+                        entry.rows as usize,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                actual,
+                expected
+                    .into_iter()
+                    .map(|revision| revision.map(str::to_owned))
+                    .collect::<Vec<_>>()
+            );
+        }
+        blame.content = "alpha\rbeta\ngamma\n".into();
+        blame.entries.last_mut().unwrap().end_line = 2;
+        let entries = build_provider_blame_entry_sum_tree(&blame, "alpha\nbeta\ngamma\n", 3);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| (
+                    entry.rows,
+                    entry.blame.as_ref().map(DisplayBlameEntry::revision_id)
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, Some("change:first".into())),
+                (1, Some("change:second".into())),
+                (1, None)
+            ],
+        );
+    }
+
+    #[gpui::test]
+    async fn test_provider_blame_maps_edits_during_load_and_undo(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({"file.txt": "alpha\nbeta\ngamma\n"}))
+            .await;
+        let project = Project::test(fs, ["/project".as_ref()], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer("/project/file.txt", cx)
+            })
+            .await
+            .unwrap();
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "unsaved\n")], None, cx);
+            buffer.finalize_last_transaction();
+        });
+        let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+        let subscription = buffer.update(cx, |buffer, _| buffer.subscribe());
+        let buffer_id = snapshot.remote_id();
+        let multi_buffer = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
+        let blame = cx.new(|cx| GitBlame::new(multi_buffer.clone(), project, false, false, cx));
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(Point::new(2, 0)..Point::new(2, 0), "later\n")], None, cx);
+            buffer.finalize_last_transaction();
+            assert_eq!(buffer.text(), "unsaved\nalpha\nlater\nbeta\ngamma\n");
+        });
+        blame.update(cx, |blame, _| {
+            blame.buffers.insert(
+                buffer_id,
+                GitBlameBuffer {
+                    entries: build_provider_blame_entry_sum_tree(
+                        &provider_blame(),
+                        &snapshot.text(),
+                        snapshot.max_point().row,
+                    ),
+                    buffer_snapshot: snapshot,
+                    buffer_edits: subscription,
+                    commit_details: HashMap::default(),
+                    commit_tag_names: HashMap::default(),
+                },
+            );
+        });
+        let assert_rows = |expected: &[Option<&str>], cx: &mut gpui::TestAppContext| {
+            blame.update(cx, |blame, cx| {
+                assert!(blame.multi_buffer.upgrade().is_some());
+                let rows: Vec<_> = (0..expected.len() as u32)
+                    .map(|row| RowInfo {
+                        buffer_id: Some(buffer_id),
+                        buffer_row: Some(row),
+                        ..Default::default()
+                    })
+                    .collect();
+                let actual: Vec<_> = blame
+                    .blame_for_rows(&rows, cx)
+                    .map(|entry| entry.map(|(_, entry)| entry.revision_id()))
+                    .collect();
+                assert_eq!(
+                    actual,
+                    expected
+                        .iter()
+                        .map(|revision| revision.map(str::to_owned))
+                        .collect::<Vec<_>>()
+                );
+                blame.check_invariants(cx);
+            });
+        };
+        assert_rows(
+            &[
+                None,
+                Some("change:first"),
+                None,
+                Some("change:second"),
+                Some("change:second"),
+                None,
+            ],
+            cx,
+        );
+        buffer.update(cx, |buffer, cx| {
+            assert!(buffer.undo(cx).is_some());
+        });
+        assert_rows(
+            &[
+                None,
+                Some("change:first"),
+                Some("change:second"),
+                Some("change:second"),
+                None,
+            ],
+            cx,
+        );
     }
 
     #[gpui::test]
@@ -1120,14 +1535,32 @@ mod tests {
                     )
                     .collect::<Vec<_>>(),
                 vec![
-                    Some((buffer_id, blame_entry("1b1b1b", 0..1))),
-                    Some((buffer_id, blame_entry("0d0d0d", 1..2))),
-                    Some((buffer_id, blame_entry("3a3a3a", 2..3))),
+                    Some((
+                        buffer_id,
+                        DisplayBlameEntry::Git(blame_entry("1b1b1b", 0..1))
+                    )),
+                    Some((
+                        buffer_id,
+                        DisplayBlameEntry::Git(blame_entry("0d0d0d", 1..2))
+                    )),
+                    Some((
+                        buffer_id,
+                        DisplayBlameEntry::Git(blame_entry("3a3a3a", 2..3))
+                    )),
                     None,
                     None,
-                    Some((buffer_id, blame_entry("3a3a3a", 5..6))),
-                    Some((buffer_id, blame_entry("0d0d0d", 6..7))),
-                    Some((buffer_id, blame_entry("3a3a3a", 7..8))),
+                    Some((
+                        buffer_id,
+                        DisplayBlameEntry::Git(blame_entry("3a3a3a", 5..6))
+                    )),
+                    Some((
+                        buffer_id,
+                        DisplayBlameEntry::Git(blame_entry("0d0d0d", 6..7))
+                    )),
+                    Some((
+                        buffer_id,
+                        DisplayBlameEntry::Git(blame_entry("3a3a3a", 7..8))
+                    )),
                 ]
             );
             // Subset of lines
@@ -1145,8 +1578,14 @@ mod tests {
                     )
                     .collect::<Vec<_>>(),
                 vec![
-                    Some((buffer_id, blame_entry("0d0d0d", 1..2))),
-                    Some((buffer_id, blame_entry("3a3a3a", 2..3))),
+                    Some((
+                        buffer_id,
+                        DisplayBlameEntry::Git(blame_entry("0d0d0d", 1..2))
+                    )),
+                    Some((
+                        buffer_id,
+                        DisplayBlameEntry::Git(blame_entry("3a3a3a", 2..3))
+                    )),
                     None
                 ]
             );
@@ -1166,7 +1605,14 @@ mod tests {
                         cx
                     )
                     .collect::<Vec<_>>(),
-                vec![Some((buffer_id, blame_entry("0d0d0d", 1..2))), None, None]
+                vec![
+                    Some((
+                        buffer_id,
+                        DisplayBlameEntry::Git(blame_entry("0d0d0d", 1..2))
+                    )),
+                    None,
+                    None
+                ]
             );
         });
     }
@@ -1299,24 +1745,36 @@ mod tests {
             );
             assert_eq!(
                 blame
-                    .details_for_entry(buffer_one_id, &blame_entry("1b1b1b", 0..1))
+                    .details_for_entry(
+                        buffer_one_id,
+                        &DisplayBlameEntry::Git(blame_entry("1b1b1b", 0..1))
+                    )
                     .unwrap()
                     .message,
                 "commit one"
             );
             assert_eq!(
                 blame
-                    .details_for_entry(buffer_two_id, &blame_entry("0d0d0d", 0..2))
+                    .details_for_entry(
+                        buffer_two_id,
+                        &DisplayBlameEntry::Git(blame_entry("0d0d0d", 0..2))
+                    )
                     .unwrap()
                     .message,
                 "commit two"
             );
             assert_eq!(
-                blame.tag_names_for_entry(buffer_one_id, &blame_entry("0d0d0d", 1..2)),
+                blame.tag_names_for_entry(
+                    buffer_one_id,
+                    &DisplayBlameEntry::Git(blame_entry("0d0d0d", 1..2))
+                ),
                 vec![SharedString::from("v1.0.0")]
             );
             assert_eq!(
-                blame.tag_names_for_entry(buffer_two_id, &blame_entry("0d0d0d", 0..2)),
+                blame.tag_names_for_entry(
+                    buffer_two_id,
+                    &DisplayBlameEntry::Git(blame_entry("0d0d0d", 0..2))
+                ),
                 Vec::<SharedString>::new()
             );
         });

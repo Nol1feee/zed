@@ -35,6 +35,9 @@
 //!   UPDATE_BASELINE - Set to update baseline images instead of comparing
 //!   VISUAL_TEST_OUTPUT_DIR - Directory to save test output (default: target/visual_tests)
 
+#[cfg(target_os = "macos")]
+mod vcs_visual_scenario;
+
 // Stub main for non-macOS platforms
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -57,6 +60,9 @@ fn main() {
 
     let update_baseline = std::env::var("UPDATE_BASELINE").is_ok();
 
+    let vcs_scenario = vcs_visual_scenario::Scenario::from_environment()
+        .expect("Invalid external VCS visual scenario");
+
     // Create a temporary directory for test files
     // Canonicalize the path to resolve symlinks (on macOS, /var -> /private/var)
     // which prevents "path does not exist" errors during worktree scanning
@@ -67,13 +73,18 @@ fn main() {
     let canonical_temp = temp_path
         .canonicalize()
         .expect("Failed to canonicalize temp directory");
-    let project_path = canonical_temp.join("project");
-    std::fs::create_dir_all(&project_path).expect("Failed to create project directory");
+    let project_path = if let Some(scenario) = &vcs_scenario {
+        paths::set_custom_data_dir(canonical_temp.join("user-data").to_str().unwrap());
+        scenario.project_path.clone()
+    } else {
+        let project_path = canonical_temp.join("project");
+        std::fs::create_dir_all(&project_path).expect("Failed to create project directory");
+        create_test_files(&project_path);
+        project_path
+    };
 
-    // Create test files in the real filesystem
-    create_test_files(&project_path);
-
-    let test_result = std::panic::catch_unwind(|| run_visual_tests(project_path, update_baseline));
+    let test_result =
+        std::panic::catch_unwind(|| run_visual_tests(project_path, update_baseline, vcs_scenario));
 
     // Note: We don't delete temp_path here because background worktree tasks may still
     // be running. The directory will be cleaned up when the process exits or by the OS.
@@ -81,7 +92,7 @@ fn main() {
     match test_result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            eprintln!("Visual tests failed: {}", e);
+            eprintln!("Visual tests failed: {e:#}");
             std::process::exit(1);
         }
         Err(_) => {
@@ -146,7 +157,11 @@ mod constants {
 use constants::*;
 
 #[cfg(target_os = "macos")]
-fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> {
+fn run_visual_tests(
+    project_path: PathBuf,
+    update_baseline: bool,
+    vcs_scenario: Option<vcs_visual_scenario::Scenario>,
+) -> Result<()> {
     // Create the visual test context with deterministic task scheduling
     // Use real Assets so that SVG icons render properly
     let mut cx = VisualTestAppContext::with_asset_source(
@@ -244,8 +259,16 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         );
     });
 
+    if let Some(scenario) = &vcs_scenario {
+        scenario.register_provider(&app_state, &mut cx)?;
+    }
+
     // Run until all initialization tasks complete
     cx.run_until_parked();
+
+    if let Some(scenario) = vcs_scenario {
+        return scenario.run(&app_state, &mut cx);
+    }
 
     // Open workspace window
     let window_size = size(px(1280.0), px(800.0));
@@ -998,7 +1021,17 @@ fn init_app_state(cx: &mut App) -> Arc<AppState> {
         user_store,
         workspace_store,
         node_runtime: NodeRuntime::unavailable(),
-        build_window_options: |_, _| Default::default(),
+        build_window_options: |_, _| {
+            if std::env::var_os("ZED_VCS_VISUAL_SCENARIO").is_some() {
+                WindowOptions {
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                }
+            } else {
+                Default::default()
+            }
+        },
         session,
     });
     AppState::set_global(app_state.clone(), cx);
