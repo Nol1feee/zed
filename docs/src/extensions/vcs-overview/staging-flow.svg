@@ -1,0 +1,21 @@
+<svg id="staging-diagram" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 488" role="img" aria-labelledby="staging-title staging-desc">
+<title id="staging-title">Как изменилась обработка staging: старый Arc и новый Arc</title>
+<desc id="staging-desc">Оба пути асинхронны. Старый Arc блокировал новые действия UI и менял checkbox после тяжёлой обработки каждого файла. Новый Arc сразу показывает pending намерение, последовательно обрабатывает очередь, объединяет соседние одинаковые операции в batch одного writer и сверяет UI с результатом refresh.</desc>
+<defs><marker id="stage-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto"><path d="M1 1 L7 4 L1 7" fill="none" stroke="#737780" stroke-width="1.4"/></marker></defs>
+<style>#staging-diagram text{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;fill:#252832}#staging-diagram .name{font-size:20px;font-weight:600}#staging-diagram .small{font-size:17px;fill:#656a76}#staging-diagram .wire{fill:none;stroke:#737780;stroke-width:1.5;marker-end:url(#stage-arrow)}</style>
+<rect width="1100" height="488" fill="#fafafa"/>
+<text x="32" y="40" class="name">Старый Arc</text><text x="228" y="40" class="small">async операция, но UI ждёт результат</text>
+<path class="wire" d="M320 114 H420"/><path class="wire" d="M680 114 H780"/>
+<g id="old-click"><rect x="60" y="76" width="260" height="80" rx="4" fill="#fff" stroke="#a8abb5"/><rect x="80" y="100" width="24" height="24" rx="2" fill="none" stroke="#8b909b"/><text x="120" y="108" class="name">Клик</text><text x="120" y="137" class="small">global busy</text></g>
+<g id="old-work"><rect x="420" y="76" width="260" height="80" rx="4" fill="#fff" stroke="#a8abb5"/><text x="440" y="108" class="name">prepare → apply</text><text x="440" y="137" class="small">заново для каждого файла</text></g>
+<g id="old-result"><rect x="780" y="76" width="260" height="80" rx="4" fill="#fff" stroke="#a8abb5"/><text x="800" y="108" class="name">Refresh → checkbox</text><text x="800" y="137" class="small">следующий клик после этого</text></g>
+<text x="60" y="194" class="small">Stage All: N последовательных циклов; тяжёлая подготовка повторяется.</text>
+<line x1="32" y1="224" x2="1068" y2="224" stroke="#d6d7de"/>
+<text x="32" y="268" class="name">Новый Arc</text><text x="228" y="268" class="small">UI принимает намерение сразу; запись остаётся последовательной</text>
+<path class="wire" d="M320 342 H420"/><path class="wire" d="M680 342 H780"/>
+<g id="new-click"><rect x="60" y="304" width="260" height="80" rx="4" fill="#eeebfa" stroke="#7161ad"/><rect x="80" y="328" width="24" height="24" rx="2" fill="#7161ad"/><path d="M85 340 L91 346 L100 334" fill="none" stroke="#fff" stroke-width="2"/><text x="120" y="336" class="name">Клик → pending</text><text x="120" y="365" class="small">последний выбор</text></g>
+<g id="new-work"><rect x="420" y="304" width="260" height="80" rx="4" fill="#e8f1eb" stroke="#557d65"/><text x="440" y="336" class="name">Очередь → batch</text><text x="440" y="365" class="small">один Arc writer</text></g>
+<g id="new-result"><rect x="780" y="304" width="260" height="80" rx="4" fill="#fff" stroke="#a8abb5"/><text x="800" y="336" class="name">Refresh → reconcile</text><text x="800" y="365" class="small">результат сверяется с UI</text></g>
+<text x="60" y="422" class="small">Last intent wins для файла; соседние операции одного типа объединяются.</text>
+<text x="60" y="454" class="small">Stage All: один batch. Проверено 9 CLI-вызовов и для 1, и для 7 файлов.</text>
+</svg>

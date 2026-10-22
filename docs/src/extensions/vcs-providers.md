@@ -5,6 +5,9 @@ description: Experimental external version control providers
 
 # External VCS Providers
 
+For the architecture, current Arc adapter coverage, staging behavior, and remaining
+work, see the [external VCS and Arc overview (Russian)](./vcs-overview.ru.md).
+
 This experimental API lets an extension supply repository discovery, changed files,
 and comparison contents to Zed's native source-control UI. Git keeps its existing
 backend. A provider does not emulate Git or create `.git` metadata.
