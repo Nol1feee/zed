@@ -43,9 +43,9 @@ snapshots. Это не 31 тысяча строк production-кода и не с
 
 ## Архитектура: общий UI, два backend-пути {#architecture}
 
-![Git Panel использует отдельные пути штатного Git и внешнего VCS provider](./vcs-overview/architecture.svg)
+![Git Panel использует отдельные пути штатного Git и внешнего VCS provider](./vcs-overview/architecture.png)
 
-[Открыть PNG-версию схемы](./vcs-overview/architecture.png).
+[Редактируемый SVG схемы](./vcs-overview/architecture.svg).
 
 Сверху находится общий UI. Для Git сохраняются `GitStore / Repository`. Для
 внешней VCS адаптер `VcsPanel` связывает интерфейс с `VcsStore` и typed
@@ -75,9 +75,9 @@ Git CLI shim в VCS-пути нет. Прежняя интеграция Go lang
 
 ## Staging: намерение сразу, запись последовательно {#staging-behavior}
 
-![Старый Arc ждёт запись перед checkbox; новый сразу показывает pending и использует batch одного writer](./vcs-overview/staging-flow.svg)
+![Старый Arc ждёт запись перед checkbox; новый сразу показывает pending и использует batch одного writer](./vcs-overview/staging-flow.png)
 
-[Открыть PNG-версию схемы](./vcs-overview/staging-flow.png).
+[Редактируемый SVG схемы](./vcs-overview/staging-flow.svg).
 
 Старый Arc уже async, но UI ждал запись перед checkbox и держал global busy.
 Prepare/apply повторялись на каждый файл; Stage All выполнял N циклов.
